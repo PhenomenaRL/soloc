@@ -1,0 +1,9 @@
+[package]
+name = "soloc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anise = "0.8.0"
+hifitime = "4.2.3"
+log = "0.4"
