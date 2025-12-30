@@ -8,3 +8,6 @@ anise = "0.8.0"
 hifitime = "4.2.3"
 arrow = "57.1.0"
 log = "0.4"
+
+[dev-dependencies]
+test-log = "0.2.19"
