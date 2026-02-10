@@ -1,3 +1,9 @@
+//! Space-time coordinate data structures and Arrow schema definitions.
+//!
+//! This module provides the [`sts_schema`] for representing satellite or celestial
+//! positions and orientations, along with the [`SpaceTimestampBuilder`] for
+//! efficient, row-oriented ingestion of this data into Arrow [`RecordBatch`]es.
+
 extern crate alloc;
 
 use alloc::boxed::Box;
@@ -9,7 +15,17 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt16Type};
 use arrow::record_batch::RecordBatch;
 
-/// Returns the Arrow schema for the SpaceTimestamp
+/// Returns the canonical Arrow schema for SpaceTimestamp data.
+///
+/// The schema consists of:
+/// * `frame_id`: Dictionary-encoded reference frame (e.g., "EME2000").
+/// * `units_pos`: Dictionary-encoded units for position (e.g., "km").
+/// * `timescale_id`: Dictionary-encoded timescale (e.g., "TDB").
+/// * `estimate_type`: Dictionary-encoded source of data (e.g., "MEASURED").
+/// * `position`: `FixedSizeList(3, Float64)` containing `[x, y, z]`.
+/// * `quaternion`: `FixedSizeList(4, Float64)` containing `[w, x, y, z]`.
+/// * `duration_centuries`: Signed 16-bit integer for large time offsets.
+/// * `duration_ns`: Unsigned 64-bit integer for nanosecond precision within the century.
 pub fn sts_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new(
@@ -47,7 +63,10 @@ pub fn sts_schema() -> SchemaRef {
     ]))
 }
 
-/// A builder for SpaceTimestamp data that follows the sts_schema
+/// An efficient builder for creating [`RecordBatch`]es following the SpaceTimestamp schema.
+///
+/// This builder uses specialized Arrow builders for each column and supports
+/// high-performance sequential appends.
 pub struct SpaceTimestampBuilder {
     frame_id: StringDictionaryBuilder<UInt16Type>,
     units_pos: StringDictionaryBuilder<UInt16Type>,
@@ -60,7 +79,10 @@ pub struct SpaceTimestampBuilder {
 }
 
 impl SpaceTimestampBuilder {
-    /// Creates a new SpaceTimestampBuilder with the specified capacity
+    /// Creates a new builder pre-allocated for the given capacity.
+    ///
+    /// # Arguments
+    /// * `capacity` - The expected number of rows to be ingested before a flush.
     pub fn new(capacity: usize) -> Self {
         Self {
             frame_id: StringDictionaryBuilder::<UInt16Type>::with_capacity(capacity, 10, 100),
@@ -74,12 +96,22 @@ impl SpaceTimestampBuilder {
         }
     }
 
-    /// Returns the number of rows already appended
+    /// Returns the number of rows currently buffered in the builder.
     pub fn len(&self) -> usize {
         self.duration_ns.len()
     }
 
-    /// Appends a single row to the builders
+    /// Appends a single row of space-time data to the internal builders.
+    ///
+    /// # Arguments
+    /// * `frame_id` - The name of the reference frame (e.g., "ICRF").
+    /// * `units_pos` - The units for position coordinates (e.g., "m").
+    /// * `timescale_id` - The timescale for the duration (e.g., "UTC").
+    /// * `estimate_type` - The type of estimation (e.g., "PREDICTED").
+    /// * `position` - An array of `[x, y, z]` coordinates.
+    /// * `quaternion` - An array of `[w, x, y, z]` orientation components.
+    /// * `duration_centuries` - The century component of the timestamp.
+    /// * `duration_ns` - The nanosecond component of the timestamp.
     pub fn append_spacetimestamp(
         &mut self,
         frame_id: &str,
@@ -110,7 +142,13 @@ impl SpaceTimestampBuilder {
         self.duration_ns.append_value(duration_ns);
     }
 
-    /// Flushes the builders into a RecordBatch
+    /// Consumes the buffered data and returns an Arrow [`RecordBatch`].
+    ///
+    /// This operation resets the internal builders, allowing them to be reused
+    /// for the next batch of data.
+    ///
+    /// # Panics
+    /// Panics if the generated columns do not match the provided `schema`.
     pub fn flush(&mut self, schema: SchemaRef) -> RecordBatch {
         RecordBatch::try_new(
             schema,
