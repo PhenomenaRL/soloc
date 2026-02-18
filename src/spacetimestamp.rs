@@ -167,6 +167,21 @@ impl SpaceTimestampBuilder {
     }
 }
 
+/// Exports the [`sts_schema`] to an Arrow IPC file with 0 records.
+///
+/// This is useful for distributing the schema to other languages (Python, C++, etc.)
+/// in a format they can natively understand.
+pub fn export_sts_schema_to_file<P: AsRef<std::path::Path>>(
+    path: P,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = sts_schema();
+    let file = std::fs::File::create(path)?;
+    let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &schema)?;
+    // We finish without adding any record batches to create a 0-record file.
+    writer.finish()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +278,54 @@ mod tests {
             assert_eq!(pos_vals.value(0), (i + 2) as f64);
         }
         info!("Subset verification successful");
+    }
+
+    #[test]
+    fn test_schema_export_and_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        use arrow::ipc::reader::FileReader;
+        use std::fs::File;
+
+        // Create a temporary file path
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join("sts_schema_test.arrow");
+
+        // 1. Export the schema
+        export_sts_schema_to_file(&file_path)?;
+
+        // 2. Load the schema back from the file
+        let file = File::open(&file_path)?;
+        let reader = FileReader::try_new(file, None)?;
+        let loaded_schema = reader.schema();
+
+        // Verify the loaded schema matches our expectations
+        assert_eq!(loaded_schema.fields().len(), 8);
+        assert!(loaded_schema.field_with_name("frame_id").is_ok());
+
+        // 3. Generate data using the loaded schema
+        let mut builder = SpaceTimestampBuilder::new(5);
+        for i in 0..5 {
+            builder.append_spacetimestamp(
+                "ICRF",
+                "m",
+                "UTC",
+                "ESTIMATED",
+                [i as f64; 3],
+                [0.0, 0.0, 0.0, 1.0],
+                0,
+                i as u64,
+            );
+        }
+
+        let batch = builder.flush(loaded_schema);
+
+        // 4. Validate the batch
+        assert_eq!(batch.num_rows(), 5);
+        let timescale_col = batch.column_by_name("timescale_id").unwrap();
+        assert_eq!(timescale_col.len(), 5);
+
+        // Clean up
+        let _ = std::fs::remove_file(file_path);
+
+        Ok(())
     }
 }
