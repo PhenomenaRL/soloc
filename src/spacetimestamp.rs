@@ -9,8 +9,8 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use arrow::array::{
-    Array, ArrayBuilder, FixedSizeListBuilder, Float64Builder, Int16Builder,
-    StringDictionaryBuilder, UInt64Builder,
+    ArrayBuilder, FixedSizeListBuilder, Float64Builder, Int16Builder, StringDictionaryBuilder,
+    UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt16Type};
 use arrow::record_batch::RecordBatch;
