@@ -1,0 +1,16 @@
+[package]
+name = "spacetimestamp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrow = "57.1.0"
+log = "0.4"
+
+[dev-dependencies]
+test-log = "0.2.19"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "spacetimestamp_bench"
+harness = false

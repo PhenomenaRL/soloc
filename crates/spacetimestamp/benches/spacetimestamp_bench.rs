@@ -1,5 +1,5 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use soloc::spacetimestamp::{SpaceTimestampBuilder, export_sts_schema_to_file, sts_schema};
+use spacetimestamp::{SpaceTimestampBuilder, export_sts_schema_to_file, sts_schema};
 use std::fs;
 
 fn bench_schema_definition(c: &mut Criterion) {

@@ -2164,6 +2164,17 @@ dependencies = [
  "criterion",
  "hifitime",
  "log",
+ "spacetimestamp",
+ "test-log",
+]
+
+[[package]]
+name = "spacetimestamp"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "criterion",
+ "log",
  "test-log",
 ]
 

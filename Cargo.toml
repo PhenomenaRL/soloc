@@ -1,18 +1,6 @@
-[package]
-name = "soloc"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-anise = "0.8.0"
-hifitime = "4.2.3"
-arrow = "57.1.0"
-log = "0.4"
-
-[dev-dependencies]
-test-log = "0.2.19"
-criterion = { version = "0.5", features = ["html_reports"] }
-
-[[bench]]
-name = "spacetimestamp_bench"
-harness = false
+[workspace]
+members = [
+    "crates/spacetimestamp",
+    "crates/soloc",
+]
+resolver = "2"

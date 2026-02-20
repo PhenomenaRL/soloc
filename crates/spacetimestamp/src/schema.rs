@@ -9,8 +9,8 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use arrow::array::{
-    ArrayBuilder, FixedSizeListBuilder, Float64Builder, Int16Builder, StringDictionaryBuilder,
-    UInt64Builder,
+    Array, ArrayBuilder, FixedSizeListBuilder, Float64Builder, Int16Builder,
+    StringDictionaryBuilder, StructArray, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt16Type};
 use arrow::record_batch::RecordBatch;
@@ -164,6 +164,25 @@ impl SpaceTimestampBuilder {
             ],
         )
         .expect("should create record batch")
+    }
+
+    /// Consumes the buffered data and returns a [`StructArray`].
+    ///
+    /// This is useful for embedding the SpaceTimestamp data as a single nested
+    /// column within a larger Arrow schema.
+    pub fn finish_as_struct(&mut self) -> StructArray {
+        let fields = sts_schema().fields().clone();
+        let arrays: Vec<Arc<dyn Array>> = vec![
+            Arc::new(self.frame_id.finish()),
+            Arc::new(self.units_pos.finish()),
+            Arc::new(self.timescale_id.finish()),
+            Arc::new(self.estimate_type.finish()),
+            Arc::new(self.position.finish()),
+            Arc::new(self.quaternion.finish()),
+            Arc::new(self.duration_centuries.finish()),
+            Arc::new(self.duration_ns.finish()),
+        ];
+        StructArray::try_new(fields, arrays, None).expect("should create struct array")
     }
 }
 
