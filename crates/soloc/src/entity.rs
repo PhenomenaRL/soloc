@@ -15,7 +15,11 @@ pub fn entity_schema() -> SchemaRef {
         Field::new("entity_id", DataType::UInt64, false),
         Field::new("name", DataType::Utf8, false),
         // Embed the sts_schema fields as a Struct
-        Field::new("pose", DataType::Struct(sts.fields().clone()), false),
+        Field::new(
+            "spacetimestamp",
+            DataType::Struct(sts.fields().clone()),
+            false,
+        ),
         Field::new("mass_kg", DataType::Float64, true),
     ]))
 }
