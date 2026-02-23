@@ -156,6 +156,7 @@ impl FrameRegistry {
 /// * `frame_id`: Dictionary-encoded reference frame (e.g., "ICRF").
 /// * `units_pos`: Dictionary-encoded units for position (e.g., "km").
 /// * `timescale_id`: Dictionary-encoded timescale (e.g., "TDB").
+/// * `source_id`: Dictionary-encoded identifier of the source (e.g., a UUID or "sensor_1").
 /// * `estimate_type`: Dictionary-encoded source of data (e.g., "MEASURED").
 /// * `position`: `FixedSizeList(3, Float64)` containing `[x, y, z]`.
 /// * `quaternion`: `FixedSizeList(4, Float64)` containing `[w, x, y, z]`.
@@ -183,6 +184,11 @@ pub fn sts_schema(registry: Option<&FrameRegistry>) -> SchemaRef {
             ),
             Field::new(
                 "timescale_id",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Field::new(
+                "source_id",
                 DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
                 false,
             ),
@@ -217,6 +223,7 @@ pub struct SpaceTimestampBuilder {
     frame_id: StringDictionaryBuilder<UInt32Type>,
     units_pos: StringDictionaryBuilder<UInt16Type>,
     timescale_id: StringDictionaryBuilder<UInt32Type>,
+    source_id: StringDictionaryBuilder<UInt32Type>,
     estimate_type: StringDictionaryBuilder<UInt16Type>,
     position: FixedSizeListBuilder<Float64Builder>,
     quaternion: FixedSizeListBuilder<Float64Builder>,
@@ -236,6 +243,7 @@ impl SpaceTimestampBuilder {
             frame_id: StringDictionaryBuilder::<UInt32Type>::with_capacity(capacity, 10, 100),
             units_pos: StringDictionaryBuilder::<UInt16Type>::with_capacity(capacity, 10, 100),
             timescale_id: StringDictionaryBuilder::<UInt32Type>::with_capacity(capacity, 10, 100),
+            source_id: StringDictionaryBuilder::<UInt32Type>::with_capacity(capacity, 10, 100),
             estimate_type: StringDictionaryBuilder::<UInt16Type>::with_capacity(capacity, 10, 100),
             position: FixedSizeListBuilder::new(Float64Builder::with_capacity(capacity * 3), 3),
             quaternion: FixedSizeListBuilder::new(Float64Builder::with_capacity(capacity * 4), 4),
@@ -264,6 +272,7 @@ impl SpaceTimestampBuilder {
         frame_id: &str,
         units_pos: &str,
         timescale_id: &str,
+        source_id: &str,
         estimate_type: &str,
         position: [f64; 3],
         quaternion: [f64; 4],
@@ -281,9 +290,21 @@ impl SpaceTimestampBuilder {
             frame_id.to_string()
         };
 
+        let final_source_id = if let Some(ref reg) = self.registry {
+            // Check if it already looks like a UUID or a qualified string
+            if source_id.contains(':') || source_id.len() >= 32 {
+                source_id.to_string()
+            } else {
+                reg.qualify(source_id)
+            }
+        } else {
+            source_id.to_string()
+        };
+
         self.frame_id.append_value(&final_frame_id);
         self.units_pos.append_value(units_pos);
         self.timescale_id.append_value(timescale_id);
+        self.source_id.append_value(&final_source_id);
         self.estimate_type.append_value(estimate_type);
 
         for p in position {
@@ -312,6 +333,7 @@ impl SpaceTimestampBuilder {
                 Arc::new(self.frame_id.finish()),
                 Arc::new(self.units_pos.finish()),
                 Arc::new(self.timescale_id.finish()),
+                Arc::new(self.source_id.finish()),
                 Arc::new(self.estimate_type.finish()),
                 Arc::new(self.position.finish()),
                 Arc::new(self.quaternion.finish()),
@@ -333,6 +355,7 @@ impl SpaceTimestampBuilder {
             Arc::new(self.frame_id.finish()),
             Arc::new(self.units_pos.finish()),
             Arc::new(self.timescale_id.finish()),
+            Arc::new(self.source_id.finish()),
             Arc::new(self.estimate_type.finish()),
             Arc::new(self.position.finish()),
             Arc::new(self.quaternion.finish()),
@@ -377,6 +400,7 @@ mod tests {
                 "ICRF",
                 "m",
                 "TAI",
+                "sensor_1",
                 "MEASURED",
                 [i as f64, i as f64 * 2.0, i as f64 * 3.0],
                 [1.0, 0.0, 0.0, 0.0],
@@ -401,7 +425,7 @@ mod tests {
     #[test]
     fn test_schema_definition() {
         let s = sts_schema(None);
-        assert_eq!(s.fields().len(), 8);
+        assert_eq!(s.fields().len(), 9);
 
         let frame_field = s.field_with_name("frame_id").unwrap();
         match frame_field.data_type() {
@@ -451,6 +475,7 @@ mod tests {
                 "EME2000",
                 "km",
                 "TDB",
+                "sensor_1",
                 "MEASURED",
                 [i as f64, i as f64 * 10.0, i as f64 * 100.0],
                 [1.0, 0.0, 0.0, 0.0],
@@ -504,7 +529,7 @@ mod tests {
         let loaded_schema = reader.schema();
 
         // Verify the loaded schema matches our expectations
-        assert_eq!(loaded_schema.fields().len(), 8);
+        assert_eq!(loaded_schema.fields().len(), 9);
         assert!(loaded_schema.field_with_name("frame_id").is_ok());
 
         // 3. Generate data using the loaded schema
@@ -514,6 +539,7 @@ mod tests {
                 "ICRF",
                 "m",
                 "UTC",
+                "sensor_1",
                 "ESTIMATED",
                 [i as f64; 3],
                 [0.0, 0.0, 0.0, 1.0],
@@ -583,6 +609,7 @@ mod tests {
             "cam",
             "m",
             "TAI",
+            "cam_sensor_1",
             "MEASURED",
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0, 0.0],
@@ -595,6 +622,7 @@ mod tests {
             "ICRF",
             "m",
             "TAI",
+            "cam_sensor_1",
             "ESTIMATED",
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0, 0.0],
