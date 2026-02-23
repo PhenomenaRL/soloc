@@ -12,7 +12,7 @@ use arrow::array::{
     Array, ArrayBuilder, FixedSizeListBuilder, Float64Builder, Int16Builder,
     StringDictionaryBuilder, StructArray, UInt64Builder,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt32Type};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt16Type, UInt32Type};
 use arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -178,7 +178,7 @@ pub fn sts_schema(registry: Option<&FrameRegistry>) -> SchemaRef {
             ),
             Field::new(
                 "units_pos",
-                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
                 false,
             ),
             Field::new(
@@ -188,7 +188,7 @@ pub fn sts_schema(registry: Option<&FrameRegistry>) -> SchemaRef {
             ),
             Field::new(
                 "estimate_type",
-                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
                 false,
             ),
             Field::new(
@@ -215,9 +215,9 @@ pub fn sts_schema(registry: Option<&FrameRegistry>) -> SchemaRef {
 pub struct SpaceTimestampBuilder {
     registry: Option<FrameRegistry>,
     frame_id: StringDictionaryBuilder<UInt32Type>,
-    units_pos: StringDictionaryBuilder<UInt32Type>,
+    units_pos: StringDictionaryBuilder<UInt16Type>,
     timescale_id: StringDictionaryBuilder<UInt32Type>,
-    estimate_type: StringDictionaryBuilder<UInt32Type>,
+    estimate_type: StringDictionaryBuilder<UInt16Type>,
     position: FixedSizeListBuilder<Float64Builder>,
     quaternion: FixedSizeListBuilder<Float64Builder>,
     duration_centuries: Int16Builder,
@@ -234,9 +234,9 @@ impl SpaceTimestampBuilder {
         Self {
             registry,
             frame_id: StringDictionaryBuilder::<UInt32Type>::with_capacity(capacity, 10, 100),
-            units_pos: StringDictionaryBuilder::<UInt32Type>::with_capacity(capacity, 10, 100),
+            units_pos: StringDictionaryBuilder::<UInt16Type>::with_capacity(capacity, 10, 100),
             timescale_id: StringDictionaryBuilder::<UInt32Type>::with_capacity(capacity, 10, 100),
-            estimate_type: StringDictionaryBuilder::<UInt32Type>::with_capacity(capacity, 10, 100),
+            estimate_type: StringDictionaryBuilder::<UInt16Type>::with_capacity(capacity, 10, 100),
             position: FixedSizeListBuilder::new(Float64Builder::with_capacity(capacity * 3), 3),
             quaternion: FixedSizeListBuilder::new(Float64Builder::with_capacity(capacity * 4), 4),
             duration_centuries: Int16Builder::with_capacity(capacity),
