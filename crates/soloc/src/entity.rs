@@ -9,7 +9,7 @@ use std::sync::Arc;
 /// for consistent querying across different entities that share the same
 /// space-time coordinate structure.
 pub fn entity_schema() -> SchemaRef {
-    let sts = sts_schema();
+    let sts = sts_schema(None);
 
     Arc::new(Schema::new(vec![
         Field::new("entity_id", DataType::UInt64, false),
