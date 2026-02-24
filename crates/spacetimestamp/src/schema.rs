@@ -164,11 +164,10 @@ impl FrameRegistry {
 /// * `duration_ns`: Unsigned 64-bit integer for nanosecond precision.
 pub fn sts_schema(registry: Option<&FrameRegistry>) -> SchemaRef {
     let mut metadata = HashMap::new();
-    if let Some(reg) = registry {
-        if let Ok(json) = reg.to_json() {
+    if let Some(reg) = registry
+        && let Ok(json) = reg.to_json() {
             metadata.insert(STS_REGISTRY_METADATA_KEY.to_string(), json);
         }
-    }
 
     Arc::new(
         Schema::new(vec![

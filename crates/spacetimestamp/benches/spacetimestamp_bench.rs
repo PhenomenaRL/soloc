@@ -1,57 +1,44 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use spacetimestamp::{SpaceTimestampBuilder, export_sts_schema_to_file, sts_schema};
-use std::fs;
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use spacetimestamp::schema::{FrameRegistry, SpaceTimestampBuilder};
+use spacetimestamp::validation::validate_spacetimestamp_batch;
 
-fn bench_schema_definition(c: &mut Criterion) {
-    c.bench_function("sts_schema_definition", |b| {
-        b.iter(|| black_box(sts_schema()))
-    });
-}
+fn bench_validation(c: &mut Criterion) {
+    let num_records = 100_000;
+    
+    // Set up a FrameRegistry with a couple of custom frames
+    let mut reg = FrameRegistry::new_with_namespace("bench_robot");
+    reg.add_frame("cam", "ICRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
+    reg.add_frame("arm", "cam", [1.0; 3], [1.0, 0.0, 0.0, 0.0]);
 
-fn bench_recordbatch_generation(c: &mut Criterion) {
-    let schema = sts_schema();
-    let row_count = 1000;
+    let mut builder = SpaceTimestampBuilder::new(num_records, Some(reg));
 
-    c.bench_function("recordbatch_generation_1000_rows", |b| {
-        b.iter(|| {
-            let mut builder = SpaceTimestampBuilder::new(row_count);
-            for i in 0..row_count {
-                builder.append_spacetimestamp(
-                    black_box("EME2000"),
-                    black_box("km"),
-                    black_box("TDB"),
-                    black_box("MEASURED"),
-                    black_box([i as f64, i as f64 * 10.0, i as f64 * 100.0]),
-                    black_box([1.0, 0.0, 0.0, 0.0]),
-                    black_box(0),
-                    black_box(i as u64),
-                );
-            }
-            black_box(builder.flush(schema.clone()))
-        })
-    });
-}
+    // Create a batch of 100,000 records containing a mix of standard and local frames
+    for i in 0..num_records {
+        let frame = if i % 3 == 0 { "ICRF" } else if i % 3 == 1 { "cam" } else { "arm" };
+        let timescale = if i % 2 == 0 { "TAI" } else { "UTC" };
 
-fn bench_schema_export(c: &mut Criterion) {
-    let temp_dir = std::env::temp_dir();
-    let file_path = temp_dir.join("bench_sts_schema.arrow");
-
-    c.bench_function("export_sts_schema_to_file", |b| {
-        b.iter(|| {
-            let _ = export_sts_schema_to_file(black_box(&file_path));
-        })
-    });
-
-    // Cleanup after benchmark
-    if file_path.exists() {
-        let _ = fs::remove_file(file_path);
+        builder.append_spacetimestamp(
+            frame,
+            "m",
+            timescale,
+            "sensor_1",
+            "MEASURED",
+            [i as f64; 3],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            i as u64,
+        );
     }
+
+    let batch = builder.flush();
+
+    // Verify it works outside the loop
+    assert!(validate_spacetimestamp_batch(&batch).is_ok());
+
+    c.bench_function("validate_spacetimestamp_batch (100k rows)", |b| {
+        b.iter(|| validate_spacetimestamp_batch(black_box(&batch)))
+    });
 }
 
-criterion_group!(
-    benches,
-    bench_schema_definition,
-    bench_recordbatch_generation,
-    bench_schema_export
-);
+criterion_group!(benches, bench_validation);
 criterion_main!(benches);

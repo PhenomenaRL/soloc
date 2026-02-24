@@ -117,6 +117,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "anise"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f057c78c09902a74e774def6074ffa5a91816ce6a65d4e37d47dc68adf202c03"
+dependencies = [
+ "bytes",
+ "const_format",
+ "crc32fast",
+ "csv",
+ "der",
+ "hifitime",
+ "hyperdual",
+ "indexmap 2.12.1",
+ "log",
+ "memmap2",
+ "nalgebra",
+ "platform-dirs",
+ "rayon",
+ "regex",
+ "serde",
+ "serde-lexpr",
+ "serde_derive",
+ "serde_dhall",
+ "snafu",
+ "tabled",
+ "ureq",
+ "url",
+ "zerocopy",
+]
+
+[[package]]
 name = "annotate-snippets"
 version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1130,9 +1161,9 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hifitime"
-version = "4.2.3"
+version = "4.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae664976c51b75b30deb25aa778bff665169ca129104fb5f427e7154fc611ad5"
+checksum = "fd986e90b53308b583668349332fcb508cdecb183d18e0170abe3c01e6aeeb60"
 dependencies = [
  "js-sys",
  "lexical-core",
@@ -1169,6 +1200,16 @@ name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
+
+[[package]]
+name = "hyperdual"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49bed4e4958a0d14b552df6ecaf051a3b1252120fddfb38e1d829870e7f3a21a"
+dependencies = [
+ "nalgebra",
+ "num-traits",
+]
 
 [[package]]
 name = "iana-time-zone"
@@ -2217,7 +2258,7 @@ dependencies = [
 name = "soloc"
 version = "0.1.0"
 dependencies = [
- "anise",
+ "anise 0.8.0",
  "arrow",
  "criterion",
  "hifitime",
@@ -2230,8 +2271,10 @@ dependencies = [
 name = "spacetimestamp"
 version = "0.1.0"
 dependencies = [
+ "anise 0.9.4",
  "arrow",
  "criterion",
+ "hifitime",
  "log",
  "serde",
  "serde_json",
