@@ -5,7 +5,6 @@
 //! efficient, row-oriented ingestion of this data into Arrow [`RecordBatch`]es.
 
 pub mod schema;
-pub mod transforms;
 
 // Re-export canonical schema items to the crate root for a clean API.
 pub use crate::schema::{SpaceTimestampBuilder, export_sts_schema_to_file, sts_schema};
