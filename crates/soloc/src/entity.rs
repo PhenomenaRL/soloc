@@ -3,13 +3,35 @@
 //! This module defines the canonical `entity_schema` for representing the state of
 //! dynamic or static objects within the solar system (e.g., planets, robots, sensors).
 //! It embeds the canonical [`sts_schema`] from the `spacetimestamp` crate.
+//!
+//! # Semantics: Target vs. Observer
+//!
+//! When generating `Entity` records, the distinction between the target and the
+//! observer is critical:
+//! * **Target** (`entity_id`): The entity whose state is being described (e.g., "spaceship_a").
+//! * **Observer** (`spacetimestamp.source_id`): The entity or system that generated
+//!   the measurement or prediction (e.g., "spaceship_a" or "telescope_b").
+//!
+//! **Self-Reporting (Telemetry):** When an entity reports its own state, `entity_id`
+//! and `source_id` typically match or share the same root URI.
+//!
+//! **External Observation (Tracking):** When an entity (e.g., a telescope) tracks
+//! another entity, `entity_id` is the target being tracked, while `source_id` is
+//! the telescope. The `frame_id` will often be relative to the `source_id`.
+//!
+//! # Future Validation
+//! In the future, the `soloc` ledger ingestion engine will enforce referential
+//! integrity rules based on these semantics. For example:
+//! 1. **Registered Observer Rule:** `source_id` must be a known, authenticated entity.
+//! 2. **Contextual Validation:** If `entity_id != source_id`, `soloc` will verify that
+//!    the provided `frame_id` exists within the `source_id`'s registered frame graph.
 
 extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use arrow::array::{
-    Array, FixedSizeListBuilder, Float64Builder, StringDictionaryBuilder, StructArray,
+    FixedSizeListBuilder, Float64Builder, StringDictionaryBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt32Type};
 use arrow::record_batch::RecordBatch;
@@ -110,11 +132,11 @@ impl EntityBuilder {
     /// Appends a single row of Entity data to the internal builders.
     ///
     /// # Arguments
-    /// * `entity_id` - The unique URI for this entity (e.g., "urn:soloc:sensor_1").
+    /// * `entity_id` - The unique URI for the target entity (e.g., "urn:soloc:spaceship_a").
     /// * `frame_id` - The reference frame for the pose/velocity.
     /// * `units_pos` - Units for position/velocity/acceleration.
     /// * `timescale_id` - Timescale (e.g., "TAI").
-    /// * `source_id` - The origin of the measurement.
+    /// * `source_id` - The observer or originator of the data (e.g., "urn:soloc:spaceship_a" or "urn:soloc:telescope_b").
     /// * `estimate_type` - Measurement type (e.g., "MEASURED" or "SIMULATED").
     /// * `position` - `[x, y, z]` coordinates.
     /// * `quaternion` - `[w, x, y, z]` orientation.
