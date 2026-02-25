@@ -30,9 +30,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use arrow::array::{
-    FixedSizeListBuilder, Float64Builder, StringDictionaryBuilder,
-};
+use arrow::array::{FixedSizeListBuilder, Float64Builder, StringDictionaryBuilder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt32Type};
 use arrow::record_batch::RecordBatch;
 use spacetimestamp::schema::{FrameRegistry, SpaceTimestampBuilder, sts_schema};
@@ -244,6 +242,7 @@ impl EntityBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::StructArray;
     use spacetimestamp::validation::validate_spacetimestamp_batch;
 
     #[test]
