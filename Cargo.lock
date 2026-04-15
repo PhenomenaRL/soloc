@@ -2276,6 +2276,7 @@ dependencies = [
  "criterion",
  "hifitime",
  "log",
+ "nalgebra",
  "serde",
  "serde_json",
  "test-log",
