@@ -88,36 +88,6 @@ checksum = "4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299"
 
 [[package]]
 name = "anise"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "251d223c4e292141d72964f961000b37199953617e36eee6c651262ee1d57c65"
-dependencies = [
- "bytes",
- "const_format",
- "crc32fast",
- "csv",
- "der",
- "hifitime",
- "indexmap 2.12.1",
- "log",
- "memmap2",
- "nalgebra",
- "platform-dirs",
- "rayon",
- "regex",
- "serde",
- "serde-lexpr",
- "serde_derive",
- "serde_dhall",
- "snafu",
- "tabled",
- "ureq",
- "url",
- "zerocopy",
-]
-
-[[package]]
-name = "anise"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f057c78c09902a74e774def6074ffa5a91816ce6a65d4e37d47dc68adf202c03"
@@ -2258,11 +2228,12 @@ dependencies = [
 name = "soloc"
 version = "0.1.0"
 dependencies = [
- "anise 0.8.0",
+ "anise",
  "arrow",
  "criterion",
  "hifitime",
  "log",
+ "nalgebra",
  "spacetimestamp",
  "test-log",
 ]
@@ -2271,7 +2242,7 @@ dependencies = [
 name = "spacetimestamp"
 version = "0.1.0"
 dependencies = [
- "anise 0.9.4",
+ "anise",
  "arrow",
  "criterion",
  "hifitime",
