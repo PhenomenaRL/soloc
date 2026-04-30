@@ -27,6 +27,7 @@ fn bench_validation(c: &mut Criterion) {
             [1.0, 0.0, 0.0, 0.0],
             0,
             i as u64,
+            None, None,
         );
     }
 

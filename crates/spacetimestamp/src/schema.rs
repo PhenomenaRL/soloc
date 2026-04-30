@@ -147,6 +147,20 @@ impl FrameRegistry {
     }
 }
 
+/// Appends one nullable 6-element covariance entry to a `FixedSizeListBuilder`.
+fn append_optional_cov6(builder: &mut FixedSizeListBuilder<Float64Builder>, value: Option<[f64; 6]>) {
+    match value {
+        Some(v) => {
+            for x in v { builder.values().append_value(x); }
+            builder.append(true);
+        }
+        None => {
+            for _ in 0..6 { builder.values().append_null(); }
+            builder.append(false);
+        }
+    }
+}
+
 /// Returns the canonical Arrow schema for SpaceTimestamp data.
 ///
 /// If a `FrameRegistry` is provided, it is serialized and embedded into the
@@ -162,6 +176,12 @@ impl FrameRegistry {
 /// * `quaternion`: `FixedSizeList(4, Float64)` containing `[w, x, y, z]`.
 /// * `duration_centuries`: Signed 16-bit integer for large time offsets.
 /// * `duration_ns`: Unsigned 64-bit integer for nanosecond precision.
+/// * `position_covariance`: Nullable `FixedSizeList(6, Float64)` — upper triangle of the
+///   3×3 position covariance matrix, row-major: `[σ_xx, σ_xy, σ_xz, σ_yy, σ_yz, σ_zz]`.
+///   Expressed in the same frame and units as `position`. Null when unknown.
+/// * `orientation_covariance`: Nullable `FixedSizeList(6, Float64)` — upper triangle of the
+///   3×3 orientation covariance in the tangent space of SO(3) (axis-angle perturbation),
+///   row-major: `[σ_11, σ_12, σ_13, σ_22, σ_23, σ_33]`. Null when unknown.
 pub fn sts_schema(registry: Option<&FrameRegistry>) -> SchemaRef {
     let mut metadata = HashMap::new();
     if let Some(reg) = registry
@@ -208,6 +228,16 @@ pub fn sts_schema(registry: Option<&FrameRegistry>) -> SchemaRef {
             ),
             Field::new("duration_centuries", DataType::Int16, false),
             Field::new("duration_ns", DataType::UInt64, false),
+            Field::new(
+                "position_covariance",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 6),
+                true,
+            ),
+            Field::new(
+                "orientation_covariance",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 6),
+                true,
+            ),
         ])
         .with_metadata(metadata),
     )
@@ -228,6 +258,8 @@ pub struct SpaceTimestampBuilder {
     quaternion: FixedSizeListBuilder<Float64Builder>,
     duration_centuries: Int16Builder,
     duration_ns: UInt64Builder,
+    position_covariance: FixedSizeListBuilder<Float64Builder>,
+    orientation_covariance: FixedSizeListBuilder<Float64Builder>,
 }
 
 impl SpaceTimestampBuilder {
@@ -248,6 +280,8 @@ impl SpaceTimestampBuilder {
             quaternion: FixedSizeListBuilder::new(Float64Builder::with_capacity(capacity * 4), 4),
             duration_centuries: Int16Builder::with_capacity(capacity),
             duration_ns: UInt64Builder::with_capacity(capacity),
+            position_covariance: FixedSizeListBuilder::new(Float64Builder::with_capacity(capacity * 6), 6),
+            orientation_covariance: FixedSizeListBuilder::new(Float64Builder::with_capacity(capacity * 6), 6),
         }
     }
 
@@ -265,6 +299,11 @@ impl SpaceTimestampBuilder {
     ///
     /// If the provided `frame_id` matches a local name in the builder's `FrameRegistry`,
     /// it will automatically be qualified with the registry's namespace prefix.
+    /// # Covariance convention
+    ///
+    /// Both covariance fields store the **upper triangle, row-major** of the corresponding
+    /// 3×3 symmetric matrix as 6 values: `[σ_11, σ_12, σ_13, σ_22, σ_23, σ_33]`.
+    /// This matches the CCSDS OPM/CDM convention. Pass `None` when uncertainty is unknown.
     #[allow(clippy::too_many_arguments)]
     pub fn append_spacetimestamp(
         &mut self,
@@ -277,6 +316,8 @@ impl SpaceTimestampBuilder {
         quaternion: [f64; 4],
         duration_centuries: i16,
         duration_ns: u64,
+        position_covariance: Option<[f64; 6]>,
+        orientation_covariance: Option<[f64; 6]>,
     ) {
         let final_frame_id = if let Some(ref reg) = self.registry {
             let qualified = reg.qualify(frame_id);
@@ -318,6 +359,9 @@ impl SpaceTimestampBuilder {
 
         self.duration_centuries.append_value(duration_centuries);
         self.duration_ns.append_value(duration_ns);
+
+        append_optional_cov6(&mut self.position_covariance, position_covariance);
+        append_optional_cov6(&mut self.orientation_covariance, orientation_covariance);
     }
 
     /// Consumes the buffered data and returns an Arrow [`RecordBatch`].
@@ -338,6 +382,8 @@ impl SpaceTimestampBuilder {
                 Arc::new(self.quaternion.finish()),
                 Arc::new(self.duration_centuries.finish()),
                 Arc::new(self.duration_ns.finish()),
+                Arc::new(self.position_covariance.finish()),
+                Arc::new(self.orientation_covariance.finish()),
             ],
         )
         .expect("should create record batch")
@@ -360,6 +406,8 @@ impl SpaceTimestampBuilder {
             Arc::new(self.quaternion.finish()),
             Arc::new(self.duration_centuries.finish()),
             Arc::new(self.duration_ns.finish()),
+            Arc::new(self.position_covariance.finish()),
+            Arc::new(self.orientation_covariance.finish()),
         ];
         StructArray::try_new(fields, arrays, None).expect("should create struct array")
     }
@@ -405,6 +453,7 @@ mod tests {
                 [1.0, 0.0, 0.0, 0.0],
                 0,
                 i as u64,
+                None, None,
             );
         }
 
@@ -424,7 +473,7 @@ mod tests {
     #[test]
     fn test_schema_definition() {
         let s = sts_schema(None);
-        assert_eq!(s.fields().len(), 9);
+        assert_eq!(s.fields().len(), 11);
 
         let frame_field = s.field_with_name("frame_id").unwrap();
         match frame_field.data_type() {
@@ -480,6 +529,7 @@ mod tests {
                 [1.0, 0.0, 0.0, 0.0],
                 0,
                 i as u64,
+                None, None,
             );
         }
 
@@ -528,7 +578,7 @@ mod tests {
         let loaded_schema = reader.schema();
 
         // Verify the loaded schema matches our expectations
-        assert_eq!(loaded_schema.fields().len(), 9);
+        assert_eq!(loaded_schema.fields().len(), 11);
         assert!(loaded_schema.field_with_name("frame_id").is_ok());
 
         // 3. Generate data using the loaded schema
@@ -544,6 +594,7 @@ mod tests {
                 [0.0, 0.0, 0.0, 1.0],
                 0,
                 i as u64,
+                None, None,
             );
         }
 
@@ -614,6 +665,7 @@ mod tests {
             [1.0, 0.0, 0.0, 0.0],
             0,
             0,
+            None, None,
         );
 
         // Append using global/external name (should remain "ICRF")
@@ -627,6 +679,7 @@ mod tests {
             [1.0, 0.0, 0.0, 0.0],
             0,
             0,
+            None, None,
         );
 
         let batch = builder.flush();

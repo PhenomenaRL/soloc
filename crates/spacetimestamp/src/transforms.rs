@@ -376,6 +376,10 @@ pub fn transform_batch(
         let pos_out = pos_target * to_target_factor;
         let vel_out = vel_target * to_target_factor;
 
+        // TODO(covariance): transform_batch does not currently propagate position_covariance
+        // or orientation_covariance. Transforming covariance requires applying the rotation
+        // Jacobian: C' = R·C·Rᵀ. Until implemented, covariance is set to null in the output
+        // to avoid silently producing covariance expressed in the wrong frame.
         sts_builder.append_spacetimestamp(
             target_frame_name,
             target_unit,
@@ -386,6 +390,8 @@ pub fn transform_batch(
             [quat_target.w, quat_target.i, quat_target.j, quat_target.k],
             centuries,
             ns,
+            None, // position_covariance — see TODO above
+            None, // orientation_covariance — see TODO above
         );
 
         if let Some(ref mut vb) = velocity_builder {
@@ -472,7 +478,7 @@ mod tests {
         reg.add_frame("cam", "Earth", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
 
         let mut builder = SpaceTimestampBuilder::new(1, Some(reg.clone()));
-        builder.append_spacetimestamp("cam", "m", "TAI", "s", "MEASURED", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0);
+        builder.append_spacetimestamp("cam", "m", "TAI", "s", "MEASURED", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
         let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "m").unwrap();
@@ -492,7 +498,7 @@ mod tests {
         reg.add_frame("cam", "base_link", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
 
         let mut builder = SpaceTimestampBuilder::new(1, Some(reg.clone()));
-        builder.append_spacetimestamp("cam", "m", "TAI", "s", "MEASURED", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0);
+        builder.append_spacetimestamp("cam", "m", "TAI", "s", "MEASURED", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
         let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "m").unwrap();
@@ -523,7 +529,7 @@ mod tests {
             "cam", "m", "TAI", "s", "MEASURED",
             [1.0, 0.0, 0.0],
             [1.0, 0.0, 0.0, 0.0], // identity orientation of the sensor itself
-            0, 0,
+            0, 0, None, None,
         );
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
@@ -552,9 +558,9 @@ mod tests {
 
         let mut builder = SpaceTimestampBuilder::new(2, Some(reg.clone()));
         // Row 0: already in Earth frame at position [5, 0, 0]
-        builder.append_spacetimestamp("Earth", "m", "TAI", "s", "MEASURED", [5.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0);
+        builder.append_spacetimestamp("Earth", "m", "TAI", "s", "MEASURED", [5.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
         // Row 1: in arm frame at [0, 0, 0] → should become [2, 0, 0] in Earth
-        builder.append_spacetimestamp("arm", "m", "TAI", "s", "MEASURED", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0);
+        builder.append_spacetimestamp("arm", "m", "TAI", "s", "MEASURED", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
         let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "m").unwrap();
@@ -571,7 +577,7 @@ mod tests {
     #[test]
     fn test_unit_conversion_m_to_km() {
         let mut builder = SpaceTimestampBuilder::new(1, None);
-        builder.append_spacetimestamp("Earth", "m", "TAI", "s", "MEASURED", [1000.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0);
+        builder.append_spacetimestamp("Earth", "m", "TAI", "s", "MEASURED", [1000.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
 
         let batch = make_sts_batch(&mut builder, None);
         let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "km").unwrap();

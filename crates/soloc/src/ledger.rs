@@ -229,6 +229,7 @@ mod tests {
         builder.append_spacetimestamp(
             "ICRF", "km", "TAI", "src", "MEASURED",
             pos, [1.0, 0.0, 0.0, 0.0], 0, ns,
+            None, None,
         );
         let struct_array = builder.finish_as_struct();
         let sts_ref = sts_schema(None);

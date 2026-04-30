@@ -59,6 +59,7 @@ fn main() -> eframe::Result<()> {
         Some(sc_vel),
         None, None,
         Some(1_000.0),
+        None,
     );
 
     builder.append_entity(
@@ -71,6 +72,7 @@ fn main() -> eframe::Result<()> {
         Some(earth_vel),
         None, None,
         Some(5.972e24),
+        None,
     );
 
     let initial = builder.flush();

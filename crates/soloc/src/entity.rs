@@ -77,6 +77,13 @@ pub fn entity_schema(registry: Option<&FrameRegistry>) -> SchemaRef {
         ),
         // Physical mass
         Field::new("mass_kg", DataType::Float64, true),
+        // Full 6×6 state covariance over [x,y,z,vx,vy,vz] — upper triangle, row-major (21 values).
+        // Null when unknown. For objects without velocity, use position_covariance in spacetimestamp.
+        Field::new(
+            "state_covariance",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 21),
+            true,
+        ),
     ]))
 }
 
@@ -93,6 +100,7 @@ pub struct EntityBuilder {
     angular_velocity: FixedSizeListBuilder<Float64Builder>,
     acceleration: FixedSizeListBuilder<Float64Builder>,
     mass_kg: Float64Builder,
+    state_covariance: FixedSizeListBuilder<Float64Builder>,
 }
 
 impl EntityBuilder {
@@ -114,6 +122,7 @@ impl EntityBuilder {
             ),
             acceleration: FixedSizeListBuilder::new(Float64Builder::with_capacity(capacity * 3), 3),
             mass_kg: Float64Builder::with_capacity(capacity),
+            state_covariance: FixedSizeListBuilder::new(Float64Builder::with_capacity(capacity * 21), 21),
         }
     }
 
@@ -163,6 +172,8 @@ impl EntityBuilder {
         angular_velocity: Option<[f64; 3]>,
         acceleration: Option<[f64; 3]>,
         mass_kg: Option<f64>,
+        // Upper triangle of the 6×6 state covariance over [x,y,z,vx,vy,vz], row-major (21 values).
+        state_covariance: Option<[f64; 21]>,
     ) {
         // Top-level properties
         self.entity_id.append_value(entity_id);
@@ -205,6 +216,17 @@ impl EntityBuilder {
 
         self.mass_kg.append_option(mass_kg);
 
+        match state_covariance {
+            Some(cov) => {
+                for val in cov { self.state_covariance.values().append_value(val); }
+                self.state_covariance.append(true);
+            }
+            None => {
+                for _ in 0..21 { self.state_covariance.values().append_null(); }
+                self.state_covariance.append(false);
+            }
+        }
+
         // Delegate nested spacetimestamp properties
         self.sts_builder.append_spacetimestamp(
             frame_id,
@@ -216,6 +238,7 @@ impl EntityBuilder {
             quaternion,
             duration_centuries,
             duration_ns,
+            None, None,
         );
     }
 
@@ -233,6 +256,7 @@ impl EntityBuilder {
                 Arc::new(self.angular_velocity.finish()),
                 Arc::new(self.acceleration.finish()),
                 Arc::new(self.mass_kg.finish()),
+                Arc::new(self.state_covariance.finish()),
             ],
         )
         .expect("should create record batch")
@@ -248,7 +272,7 @@ mod tests {
     #[test]
     fn test_entity_schema_definition() {
         let schema = entity_schema(None);
-        assert_eq!(schema.fields().len(), 6);
+        assert_eq!(schema.fields().len(), 7);
 
         let entity_id = schema.field_with_name("entity_id").unwrap();
         match entity_id.data_type() {
@@ -286,6 +310,7 @@ mod tests {
             None,
             None,
             Some(5.972e24),
+            None,
         );
 
         // Row 2: IoT Sensor (only has pose, everything else null)
@@ -300,6 +325,7 @@ mod tests {
             [1.0, 0.0, 0.0, 0.0],
             0,
             1000,
+            None,
             None,
             None,
             None,
@@ -337,6 +363,7 @@ mod tests {
             None,
             None,
             Some(5.972e24),
+            None,
         );
         let batch = builder.flush();
 

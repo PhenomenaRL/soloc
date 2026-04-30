@@ -95,6 +95,7 @@ mod tests {
             [1.0, 0.0, 0.0, 0.0],
             0,
             0,
+            None, None,
         );
         let batch = builder.flush();
         assert!(validate_spacetimestamp_batch(&batch).is_ok());
@@ -113,6 +114,7 @@ mod tests {
             [1.0, 0.0, 0.0, 0.0],
             0,
             0,
+            None, None,
         );
         let batch = builder.flush();
         let result = validate_spacetimestamp_batch(&batch);
@@ -133,6 +135,7 @@ mod tests {
             [1.0, 0.0, 0.0, 0.0],
             0,
             0,
+            None, None,
         );
         let batch = builder.flush();
         let result = validate_spacetimestamp_batch(&batch);
@@ -156,6 +159,7 @@ mod tests {
             [1.0, 0.0, 0.0, 0.0],
             0,
             0,
+            None, None,
         );
         let batch = builder.flush();
         assert!(validate_spacetimestamp_batch(&batch).is_ok());

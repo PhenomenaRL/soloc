@@ -209,6 +209,7 @@ pub fn celestial_snapshot(
             None, // angular_velocity
             None, // acceleration
             Some(body.mass_kg()),
+            None, // state_covariance
         );
     }
 

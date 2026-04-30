@@ -234,6 +234,7 @@ mod tests {
             None,
             None,
             Some(1000.0),
+            None,
         );
 
         // Entity 1: a static reference point (no velocity)
@@ -249,6 +250,7 @@ mod tests {
             0,
             0,
             None, // static
+            None,
             None,
             None,
             None,

@@ -280,10 +280,12 @@ mod tests {
         builder.append_spacetimestamp(
             "ICRF", "km", "TAI", "s1", "MEASURED",
             [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0,
+            None, None,
         );
         builder.append_spacetimestamp(
             "ICRF", "km", "TAI", "s1", "MEASURED",
             [2.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 1000,
+            None, None,
         );
         let batch = make_sts_batch(&mut builder, None);
         let result =
@@ -302,16 +304,19 @@ mod tests {
         builder.append_spacetimestamp(
             "ICRF", "km", "TAI", "s", "MEASURED",
             [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0,
+            None, None,
         );
         // Row 1: ns=1000 — inside range, kept
         builder.append_spacetimestamp(
             "ICRF", "km", "TAI", "s", "MEASURED",
             [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 1000,
+            None, None,
         );
         // Row 2: ns=2000 — after range, excluded
         builder.append_spacetimestamp(
             "ICRF", "km", "TAI", "s", "MEASURED",
             [2.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 2000,
+            None, None,
         );
 
         let batch = make_sts_batch(&mut builder, None);
@@ -331,16 +336,19 @@ mod tests {
         builder.append_spacetimestamp(
             "ICRF", "km", "TAI", "s", "MEASURED",
             [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0,
+            None, None,
         );
         // Row 1: [3, 4, 0] → distance 5 from origin (boundary, ≤ radius, kept)
         builder.append_spacetimestamp(
             "ICRF", "km", "TAI", "s", "MEASURED",
             [3.0, 4.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0,
+            None, None,
         );
         // Row 2: [10, 0, 0] — outside
         builder.append_spacetimestamp(
             "ICRF", "km", "TAI", "s", "MEASURED",
             [10.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0,
+            None, None,
         );
 
         let batch = make_sts_batch(&mut builder, None);
@@ -359,10 +367,12 @@ mod tests {
         builder.append_spacetimestamp(
             "ICRF", "km", "TAI", "s", "MEASURED",
             [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0,
+            None, None,
         );
         builder.append_spacetimestamp(
             "IAU_EARTH", "km", "TAI", "s", "MEASURED",
             [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0,
+            None, None,
         );
 
         let batch = make_sts_batch(&mut builder, None);
@@ -388,16 +398,19 @@ mod tests {
         builder.append_spacetimestamp(
             "ICRF", "km", "TAI", "s", "MEASURED",
             [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 500,
+            None, None,
         );
         // Row 1: in time range, outside sphere → dropped
         builder.append_spacetimestamp(
             "ICRF", "km", "TAI", "s", "MEASURED",
             [100.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 500,
+            None, None,
         );
         // Row 2: outside time range, inside sphere → dropped
         builder.append_spacetimestamp(
             "ICRF", "km", "TAI", "s", "MEASURED",
             [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 5000,
+            None, None,
         );
 
         let batch = make_sts_batch(&mut builder, None);

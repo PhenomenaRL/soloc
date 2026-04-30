@@ -381,6 +381,7 @@ impl NBodyPropagator {
                 ang_vel_opt,
                 accel_opt,
                 mass_opt,
+                None, // state_covariance
             );
         }
 
