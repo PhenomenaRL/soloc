@@ -14,3 +14,7 @@ log = "0.4"
 [dev-dependencies]
 test-log = "0.2.19"
 criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "ledger_bench"
+harness = false
