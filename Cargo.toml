@@ -3,5 +3,6 @@ members = [
     "crates/spacetimestamp",
     "crates/soloc",
     "crates/soloc-viz",
+    "crates/soloc-server",
 ]
 resolver = "2"

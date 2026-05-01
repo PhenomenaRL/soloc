@@ -1,0 +1,389 @@
+use std::pin::Pin;
+use std::sync::Arc;
+
+use arrow::ipc::writer::IpcWriteOptions;
+use arrow_flight::error::FlightError;
+use arrow::record_batch::RecordBatch;
+use arrow_flight::{
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaAsIpc, SchemaResult,
+    Ticket,
+    decode::FlightRecordBatchStream,
+    encode::FlightDataEncoderBuilder,
+    flight_service_server::FlightService,
+};
+use futures::{Stream, StreamExt, TryStreamExt};
+use serde::Deserialize;
+use tonic::{Request, Response, Status, Streaming};
+
+use soloc::entity::entity_schema;
+use spacetimestamp::query::SpatiotemporalFilter;
+use spacetimestamp::schema::{FrameRegistry, STS_REGISTRY_METADATA_KEY};
+use spacetimestamp::transforms::transform_batch;
+
+use crate::state::ServerState;
+
+type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send + 'static>>;
+
+#[derive(Deserialize)]
+struct RegisterFrameBody {
+    local_name: String,
+    parent: String,
+    translation: [f64; 3],
+    rotation_quat: [f64; 4],
+}
+
+#[derive(Deserialize)]
+struct RemoveFrameBody {
+    local_name: String,
+}
+
+#[derive(Deserialize)]
+struct ExchangeDescriptor {
+    target_frame: String,
+    #[serde(default = "default_km")]
+    target_units: String,
+    #[serde(default = "default_sts_column")]
+    sts_column: String,
+}
+
+#[derive(Deserialize)]
+struct GetTicket {
+    #[serde(default)]
+    time_range_tai_s: Option<[f64; 2]>,
+    #[serde(default)]
+    spatial_origin: Option<[f64; 3]>,
+    #[serde(default)]
+    spatial_radius: Option<f64>,
+    #[serde(default = "default_sts_column")]
+    sts_column: String,
+}
+
+fn default_km() -> String {
+    "km".to_string()
+}
+fn default_sts_column() -> String {
+    "spacetimestamp".to_string()
+}
+
+pub struct SolocFlightService {
+    pub state: Arc<ServerState>,
+}
+
+impl SolocFlightService {
+    pub fn new(state: Arc<ServerState>) -> Self {
+        Self { state }
+    }
+}
+
+fn unimplemented<T>() -> Result<Response<T>, Status> {
+    Err(Status::unimplemented("not implemented"))
+}
+
+/// Replaces the FrameRegistry embedded in a batch's schema metadata.
+fn inject_registry(batch: &RecordBatch, registry: &FrameRegistry) -> Result<RecordBatch, Status> {
+    let mut metadata = batch.schema().metadata().clone();
+    let json = registry
+        .to_json()
+        .map_err(|e| Status::internal(format!("registry serialization failed: {e}")))?;
+    metadata.insert(STS_REGISTRY_METADATA_KEY.to_string(), json);
+    let new_schema = Arc::new(batch.schema().as_ref().clone().with_metadata(metadata));
+    RecordBatch::try_new(new_schema, batch.columns().to_vec())
+        .map_err(|e| Status::internal(format!("failed to patch batch schema: {e}")))
+}
+
+/// Merges the server registry with any registry embedded in the batch, injects the result,
+/// then calls transform_batch.
+fn transform_with_server_registry(
+    state: &ServerState,
+    batch: &RecordBatch,
+    desc: &ExchangeDescriptor,
+) -> Result<RecordBatch, Status> {
+    let batch_registry = batch
+        .schema()
+        .metadata()
+        .get(STS_REGISTRY_METADATA_KEY)
+        .and_then(|json| FrameRegistry::from_json(json).ok());
+
+    let server_reg = state
+        .registry
+        .read()
+        .map_err(|_| Status::internal("registry lock poisoned"))?;
+
+    let merged = match batch_registry {
+        Some(ref batch_reg) => server_reg
+            .merge(batch_reg)
+            .map_err(|e| Status::internal(format!("registry merge failed: {e}")))?,
+        None => server_reg.clone(),
+    };
+    drop(server_reg);
+
+    let patched = inject_registry(batch, &merged)?;
+    transform_batch(
+        &patched,
+        &desc.sts_column,
+        &desc.target_frame,
+        &state.almanac,
+        &desc.target_units,
+    )
+    .map_err(|e| Status::internal(format!("transform failed: {e}")))
+}
+
+#[tonic::async_trait]
+impl FlightService for SolocFlightService {
+    type HandshakeStream = BoxStream<Result<HandshakeResponse, Status>>;
+    type ListFlightsStream = BoxStream<Result<FlightInfo, Status>>;
+    type DoGetStream = BoxStream<Result<FlightData, Status>>;
+    type DoPutStream = BoxStream<Result<PutResult, Status>>;
+    type DoExchangeStream = BoxStream<Result<FlightData, Status>>;
+    type DoActionStream = BoxStream<Result<arrow_flight::Result, Status>>;
+    type ListActionsStream = BoxStream<Result<ActionType, Status>>;
+
+    async fn handshake(
+        &self,
+        _: Request<Streaming<HandshakeRequest>>,
+    ) -> Result<Response<Self::HandshakeStream>, Status> {
+        unimplemented()
+    }
+
+    async fn list_flights(
+        &self,
+        _: Request<Criteria>,
+    ) -> Result<Response<Self::ListFlightsStream>, Status> {
+        unimplemented()
+    }
+
+    async fn get_flight_info(
+        &self,
+        _: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        unimplemented()
+    }
+
+    async fn poll_flight_info(
+        &self,
+        _: Request<FlightDescriptor>,
+    ) -> Result<Response<PollInfo>, Status> {
+        unimplemented()
+    }
+
+    async fn get_schema(
+        &self,
+        _: Request<FlightDescriptor>,
+    ) -> Result<Response<SchemaResult>, Status> {
+        let schema = entity_schema(None);
+        let ipc_options = IpcWriteOptions::default();
+        let schema_as_ipc = SchemaAsIpc::new(&schema, &ipc_options);
+        // Conversion is infallible (Error = Infallible).
+        let flight_data: FlightData = schema_as_ipc.try_into().unwrap();
+        Ok(Response::new(SchemaResult {
+            schema: flight_data.data_header,
+        }))
+    }
+
+    async fn do_get(
+        &self,
+        request: Request<Ticket>,
+    ) -> Result<Response<Self::DoGetStream>, Status> {
+        let state = self.state.clone();
+        let ticket: GetTicket = serde_json::from_slice(&request.into_inner().ticket)
+            .map_err(|e| Status::invalid_argument(format!("invalid ticket JSON: {e}")))?;
+
+        let mut filter = SpatiotemporalFilter::new();
+        if let Some([start, end]) = ticket.time_range_tai_s {
+            filter = filter.with_time_range(
+                hifitime::Epoch::from_tai_seconds(start),
+                hifitime::Epoch::from_tai_seconds(end),
+            );
+        }
+        if let (Some(origin), Some(radius)) = (ticket.spatial_origin, ticket.spatial_radius) {
+            filter = filter.with_spatial(origin, radius);
+        }
+
+        let batches: Vec<RecordBatch> = {
+            let ledger = state
+                .ledger
+                .read()
+                .map_err(|_| Status::internal("ledger lock poisoned"))?;
+            ledger
+                .stream_query(&filter, &ticket.sts_column)
+                .filter_map(|r| r.ok())
+                .filter(|b| b.num_rows() > 0)
+                .collect()
+        };
+
+        let out_stream = FlightDataEncoderBuilder::new()
+            .build(futures::stream::iter(
+                batches.into_iter().map(Ok::<_, FlightError>),
+            ))
+            .map_err(|e| Status::internal(e.to_string()));
+
+        Ok(Response::new(Box::pin(out_stream)))
+    }
+
+    async fn do_put(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoPutStream>, Status> {
+        let state = self.state.clone();
+        let in_stream = request
+            .into_inner()
+            .map_err(|e| FlightError::Tonic(Box::new(e)));
+        let mut batch_stream = FlightRecordBatchStream::new_from_flight_data(in_stream);
+
+        while let Some(batch) = batch_stream.next().await {
+            let batch = batch.map_err(|e| Status::internal(e.to_string()))?;
+            state
+                .ledger
+                .write()
+                .map_err(|_| Status::internal("ledger lock poisoned"))?
+                .append(batch);
+        }
+
+        Ok(Response::new(Box::pin(futures::stream::empty())))
+    }
+
+    async fn do_exchange(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        let state = self.state.clone();
+        let mut in_stream = request.into_inner();
+
+        // First message carries the descriptor; it may also contain the IPC schema.
+        let first = in_stream
+            .message()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::invalid_argument("exchange stream is empty"))?;
+
+        let descriptor = first
+            .flight_descriptor
+            .clone()
+            .ok_or_else(|| {
+                Status::invalid_argument("first message must contain a flight_descriptor")
+            })?;
+        let desc: ExchangeDescriptor = serde_json::from_slice(&descriptor.cmd)
+            .map_err(|e| Status::invalid_argument(format!("invalid descriptor JSON: {e}")))?;
+
+        // Prepend first message back so FlightRecordBatchStream sees the schema message.
+        let first_stream = futures::stream::once(futures::future::ready(
+            Ok::<FlightData, FlightError>(first),
+        ));
+        let rest = in_stream.map_err(|e| FlightError::Tonic(Box::new(e)));
+        let mut batch_stream =
+            FlightRecordBatchStream::new_from_flight_data(first_stream.chain(rest));
+
+        let mut transformed: Vec<RecordBatch> = Vec::new();
+        while let Some(batch) = batch_stream.next().await {
+            let batch = batch.map_err(|e| Status::internal(e.to_string()))?;
+            transformed.push(transform_with_server_registry(&state, &batch, &desc)?);
+        }
+
+        let out_stream = FlightDataEncoderBuilder::new()
+            .build(futures::stream::iter(
+                transformed.into_iter().map(Ok::<_, FlightError>),
+            ))
+            .map_err(|e| Status::internal(e.to_string()));
+
+        Ok(Response::new(Box::pin(out_stream)))
+    }
+
+    async fn list_actions(
+        &self,
+        _: Request<Empty>,
+    ) -> Result<Response<Self::ListActionsStream>, Status> {
+        let actions = vec![
+            Ok(ActionType {
+                r#type: "register_frame".to_string(),
+                description: "Add a custom frame. Body: {local_name, parent, translation:[f64;3], rotation_quat:[f64;4]}".to_string(),
+            }),
+            Ok(ActionType {
+                r#type: "remove_frame".to_string(),
+                description: "Remove a frame by local name. Body: {local_name}".to_string(),
+            }),
+            Ok(ActionType {
+                r#type: "list_frames".to_string(),
+                description: "List all registered frame names. Returns a JSON array.".to_string(),
+            }),
+        ];
+        Ok(Response::new(Box::pin(futures::stream::iter(actions))))
+    }
+
+    async fn do_action(
+        &self,
+        request: Request<Action>,
+    ) -> Result<Response<Self::DoActionStream>, Status> {
+        let action = request.into_inner();
+
+        match action.r#type.as_str() {
+            "register_frame" => {
+                let body: RegisterFrameBody = serde_json::from_slice(&action.body)
+                    .map_err(|e| {
+                        Status::invalid_argument(format!("invalid register_frame body: {e}"))
+                    })?;
+                let mut registry = self
+                    .state
+                    .registry
+                    .write()
+                    .map_err(|_| Status::internal("registry lock poisoned"))?;
+                registry.add_frame(
+                    &body.local_name,
+                    &body.parent,
+                    body.translation,
+                    body.rotation_quat,
+                );
+                let qualified = registry.qualify(&body.local_name);
+                self.state.persist_registry(&registry);
+                let result = arrow_flight::Result {
+                    body: qualified.into_bytes().into(),
+                };
+                Ok(Response::new(Box::pin(futures::stream::once(
+                    futures::future::ready(Ok(result)),
+                ))))
+            }
+
+            "remove_frame" => {
+                let body: RemoveFrameBody = serde_json::from_slice(&action.body)
+                    .map_err(|e| {
+                        Status::invalid_argument(format!("invalid remove_frame body: {e}"))
+                    })?;
+                let mut registry = self
+                    .state
+                    .registry
+                    .write()
+                    .map_err(|_| Status::internal("registry lock poisoned"))?;
+                let existed = registry.remove_frame(&body.local_name);
+                self.state.persist_registry(&registry);
+                let flag: &[u8] = if existed { b"true" } else { b"false" };
+                let result = arrow_flight::Result {
+                    body: flag.to_vec().into(),
+                };
+                Ok(Response::new(Box::pin(futures::stream::once(
+                    futures::future::ready(Ok(result)),
+                ))))
+            }
+
+            "list_frames" => {
+                let registry = self
+                    .state
+                    .registry
+                    .read()
+                    .map_err(|_| Status::internal("registry lock poisoned"))?;
+                let frames: Vec<&str> = registry.list_frames();
+                let json = serde_json::to_string(&frames)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                let result = arrow_flight::Result {
+                    body: json.into_bytes().into(),
+                };
+                Ok(Response::new(Box::pin(futures::stream::once(
+                    futures::future::ready(Ok(result)),
+                ))))
+            }
+
+            other => Err(Status::invalid_argument(format!(
+                "unknown action type: '{other}'"
+            ))),
+        }
+    }
+}
