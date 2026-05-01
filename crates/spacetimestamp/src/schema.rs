@@ -145,6 +145,47 @@ impl FrameRegistry {
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
+
+    /// Returns the namespace prefix used to qualify local frame names.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// Returns `true` if the given fully-qualified frame name exists in this registry.
+    pub fn contains_frame(&self, qualified_name: &str) -> bool {
+        self.frames.contains_key(qualified_name)
+    }
+
+    /// Returns all fully-qualified frame names in this registry.
+    pub fn list_frames(&self) -> Vec<&str> {
+        self.frames.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Removes a frame by its local (unqualified) name.
+    ///
+    /// Returns `true` if the frame existed and was removed. Does not check whether
+    /// other frames reference this one as a parent — the caller is responsible for
+    /// maintaining a valid tree.
+    pub fn remove_frame(&mut self, local_name: &str) -> bool {
+        let qualified = self.qualify(local_name);
+        self.frames.remove(&qualified).is_some()
+    }
+
+    /// Combines this registry with `other`, returning a new registry containing all frames
+    /// from both. The result uses this registry's namespace.
+    ///
+    /// Runs [`FrameRegistry::validate`] on the merged result. Returns `Err` if the combined
+    /// frame graph contains a cycle (e.g. cross-registry references that form a loop).
+    pub fn merge(&self, other: &FrameRegistry) -> Result<FrameRegistry, String> {
+        let mut merged = FrameRegistry {
+            namespace: self.namespace.clone(),
+            frames: HashMap::new(),
+        };
+        merged.frames.extend(self.frames.clone());
+        merged.frames.extend(other.frames.clone());
+        merged.validate()?;
+        Ok(merged)
+    }
 }
 
 /// Appends one nullable 6-element covariance entry to a `FixedSizeListBuilder`.
@@ -645,6 +686,60 @@ mod tests {
         let recovered_reg = FrameRegistry::from_json(json).unwrap();
         assert_eq!(recovered_reg.namespace, "robot_1");
         assert!(recovered_reg.frames.contains_key("robot_1:cam"));
+    }
+
+    #[test]
+    fn test_list_and_contains() {
+        let mut reg = FrameRegistry::new_with_namespace("ns");
+        reg.add_frame("cam", "ICRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
+        reg.add_frame("lidar", "ICRF", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
+
+        let frames = reg.list_frames();
+        assert_eq!(frames.len(), 2);
+        assert!(reg.contains_frame("ns:cam"));
+        assert!(reg.contains_frame("ns:lidar"));
+        assert!(!reg.contains_frame("ns:unknown"));
+        assert_eq!(reg.namespace(), "ns");
+    }
+
+    #[test]
+    fn test_remove_frame() {
+        let mut reg = FrameRegistry::new_with_namespace("ns");
+        reg.add_frame("cam", "ICRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
+
+        assert!(reg.remove_frame("cam"));
+        assert!(!reg.contains_frame("ns:cam"));
+        assert!(reg.list_frames().is_empty());
+        // Removing again returns false
+        assert!(!reg.remove_frame("cam"));
+    }
+
+    #[test]
+    fn test_merge() {
+        let mut reg_a = FrameRegistry::new_with_namespace("ns_a");
+        let mut reg_b = FrameRegistry::new_with_namespace("ns_b");
+        reg_a.add_frame("cam", "ICRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
+        reg_b.add_frame("lidar", "ICRF", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
+
+        let merged = reg_a.merge(&reg_b).unwrap();
+        assert_eq!(merged.namespace(), "ns_a");
+        assert!(merged.contains_frame("ns_a:cam"));
+        assert!(merged.contains_frame("ns_b:lidar"));
+        assert_eq!(merged.list_frames().len(), 2);
+    }
+
+    #[test]
+    fn test_merge_cycle_detected() {
+        let mut reg_a = FrameRegistry::new_with_namespace("ns_a");
+        let mut reg_b = FrameRegistry::new_with_namespace("ns_b");
+        // ns_a:frame_a → ns_b:frame_b (cross-registry reference; valid in isolation)
+        reg_a.add_frame("frame_a", "ns_b:frame_b", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
+        // ns_b:frame_b → ns_a:frame_a (creates a cycle when merged)
+        reg_b.add_frame("frame_b", "ns_a:frame_a", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
+
+        assert!(reg_a.validate().is_ok());
+        assert!(reg_b.validate().is_ok());
+        assert!(reg_a.merge(&reg_b).is_err());
     }
 
     #[test]
