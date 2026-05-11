@@ -9,10 +9,15 @@ pub struct ServerState {
     pub registry: Arc<RwLock<FrameRegistry>>,
     pub almanac: Almanac,
     pub registry_path: Option<PathBuf>,
+    pub ledger_path: Option<PathBuf>,
 }
 
 impl ServerState {
-    pub fn new(almanac: Almanac, registry_path: Option<PathBuf>) -> Self {
+    pub fn new(
+        almanac: Almanac,
+        registry_path: Option<PathBuf>,
+        ledger_path: Option<PathBuf>,
+    ) -> Self {
         let registry = registry_path
             .as_ref()
             .filter(|p| p.exists())
@@ -20,11 +25,29 @@ impl ServerState {
             .and_then(|json| FrameRegistry::from_json(&json).ok())
             .unwrap_or_default();
 
+        let ledger = ledger_path
+            .as_ref()
+            .filter(|p| p.exists())
+            .and_then(|p| {
+                match Ledger::load_ipc(p) {
+                    Ok(l) => {
+                        eprintln!("soloc-server: ledger loaded from {:?} ({} batches)", p, l.len());
+                        Some(l)
+                    }
+                    Err(e) => {
+                        eprintln!("soloc-server: WARNING — failed to load ledger from {:?}: {e}", p);
+                        None
+                    }
+                }
+            })
+            .unwrap_or_else(Ledger::new);
+
         Self {
-            ledger: Arc::new(RwLock::new(Ledger::new())),
+            ledger: Arc::new(RwLock::new(ledger)),
             registry: Arc::new(RwLock::new(registry)),
             almanac,
             registry_path,
+            ledger_path,
         }
     }
 
@@ -32,6 +55,21 @@ impl ServerState {
         if let Some(ref path) = self.registry_path {
             if let Ok(json) = registry.to_json() {
                 let _ = std::fs::write(path, json);
+            }
+        }
+    }
+
+    pub fn persist_ledger(&self) {
+        if let Some(ref path) = self.ledger_path {
+            match self.ledger.read() {
+                Ok(ledger) => {
+                    if let Err(e) = ledger.save_ipc(path) {
+                        eprintln!("soloc-server: WARNING — failed to save ledger to {:?}: {e}", path);
+                    } else {
+                        eprintln!("soloc-server: ledger saved to {:?} ({} batches)", path, ledger.len());
+                    }
+                }
+                Err(_) => eprintln!("soloc-server: WARNING — ledger lock poisoned, skipping save"),
             }
         }
     }

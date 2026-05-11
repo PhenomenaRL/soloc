@@ -39,6 +39,11 @@ struct RemoveFrameBody {
 }
 
 #[derive(Deserialize)]
+struct SaveLedgerBody {
+    path: String,
+}
+
+#[derive(Deserialize)]
 struct ExchangeDescriptor {
     target_frame: String,
     #[serde(default = "default_km")]
@@ -346,6 +351,14 @@ impl FlightService for SolocFlightService {
                 r#type: "list_frames".to_string(),
                 description: "List all registered frame names. Returns a JSON array.".to_string(),
             }),
+            Ok(ActionType {
+                r#type: "save_ledger".to_string(),
+                description: "Persist the ledger to an Arrow IPC file. Body: {path}".to_string(),
+            }),
+            Ok(ActionType {
+                r#type: "load_ledger".to_string(),
+                description: "Replace the in-memory ledger from an Arrow IPC file. Body: {path}".to_string(),
+            }),
         ];
         Ok(Response::new(Box::pin(futures::stream::iter(actions))))
     }
@@ -418,6 +431,45 @@ impl FlightService for SolocFlightService {
                     .map_err(|e| Status::internal(e.to_string()))?;
                 let result = arrow_flight::Result {
                     body: json.into_bytes().into(),
+                };
+                Ok(Response::new(Box::pin(futures::stream::once(
+                    futures::future::ready(Ok(result)),
+                ))))
+            }
+
+            "save_ledger" => {
+                let body: SaveLedgerBody = serde_json::from_slice(&action.body)
+                    .map_err(|e| Status::invalid_argument(format!("invalid save_ledger body: {e}")))?;
+                let ledger = self
+                    .state
+                    .ledger
+                    .read()
+                    .map_err(|_| Status::internal("ledger lock poisoned"))?;
+                let n = ledger.len();
+                ledger
+                    .save_ipc(std::path::Path::new(&body.path))
+                    .map_err(|e| Status::internal(format!("save_ledger failed: {e}")))?;
+                let result = arrow_flight::Result {
+                    body: format!("saved {n} batches to {}", body.path).into_bytes().into(),
+                };
+                Ok(Response::new(Box::pin(futures::stream::once(
+                    futures::future::ready(Ok(result)),
+                ))))
+            }
+
+            "load_ledger" => {
+                let body: SaveLedgerBody = serde_json::from_slice(&action.body)
+                    .map_err(|e| Status::invalid_argument(format!("invalid load_ledger body: {e}")))?;
+                let new_ledger = soloc::ledger::Ledger::load_ipc(std::path::Path::new(&body.path))
+                    .map_err(|e| Status::internal(format!("load_ledger failed: {e}")))?;
+                let n = new_ledger.len();
+                *self
+                    .state
+                    .ledger
+                    .write()
+                    .map_err(|_| Status::internal("ledger lock poisoned"))? = new_ledger;
+                let result = arrow_flight::Result {
+                    body: format!("loaded {n} batches from {}", body.path).into_bytes().into(),
                 };
                 Ok(Response::new(Box::pin(futures::stream::once(
                     futures::future::ready(Ok(result)),

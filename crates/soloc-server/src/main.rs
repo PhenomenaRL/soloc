@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anise::almanac::Almanac;
 use anise::almanac::metaload::MetaAlmanac;
 use arrow_flight::flight_service_server::FlightServiceServer;
+use tokio::signal::unix::{SignalKind, signal};
 use tonic::transport::Server;
 
 mod service;
@@ -62,17 +63,30 @@ fn load_almanac() -> Almanac {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "0.0.0.0:50051".parse()?;
     let almanac = load_almanac();
-    // Optional first arg: path to persist the frame registry across restarts.
-    let registry_path: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
 
-    let state = Arc::new(ServerState::new(almanac, registry_path));
-    let service = SolocFlightService::new(state);
+    // argv[1]: registry JSON path (optional, persists frame registry across restarts)
+    // argv[2]: ledger IPC path   (optional, auto-loads on start, saves on SIGTERM)
+    let registry_path: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
+    let ledger_path: Option<PathBuf> = std::env::args().nth(2).map(PathBuf::from);
+
+    let state = Arc::new(ServerState::new(almanac, registry_path, ledger_path));
+    let service = SolocFlightService::new(state.clone());
+
+    // Register SIGTERM handler. When the signal fires, the shutdown future resolves,
+    // tonic drains in-flight requests, then serve_with_shutdown returns and we save
+    // the ledger. This is the safety-net path; the nominal path is DoAction("save_ledger").
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let shutdown = async move { sigterm.recv().await; };
 
     eprintln!("soloc-server listening on {addr}");
     Server::builder()
         .add_service(FlightServiceServer::new(service))
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown)
         .await?;
+
+    eprintln!("soloc-server: shutdown signal received, saving ledger ...");
+    state.persist_ledger();
+    eprintln!("soloc-server: goodbye");
 
     Ok(())
 }
