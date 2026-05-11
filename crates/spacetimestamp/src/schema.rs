@@ -14,6 +14,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt16Type, UInt32Type};
 use arrow::record_batch::RecordBatch;
+use anise::{almanac::Almanac, prelude::Frame};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -156,6 +157,58 @@ impl FrameRegistry {
                 rotation_quat,
             },
         );
+    }
+
+    /// Adds a custom frame to the registry, validating the parent before committing.
+    ///
+    /// If `parent_name` is external (per [`is_external_frame`](Self::is_external_frame)):
+    /// validates that `anise` can resolve it as a named frame. This catches typos and
+    /// unsupported frame names at registration time rather than silently producing an
+    /// unresolvable root anchor that only fails at `transform_batch` time.
+    ///
+    /// If `parent_name` is a local sibling: validates that the sibling already exists
+    /// in this registry, catching ordering mistakes early.
+    ///
+    /// On success, delegates to [`add_frame`](Self::add_frame). Use the infallible
+    /// `add_frame` in tests or offline contexts where no `Almanac` is available.
+    pub fn add_frame_validated(
+        &mut self,
+        local_name: &str,
+        parent_name: &str,
+        translation: [f64; 3],
+        rotation_quat: [f64; 4],
+        almanac: &Almanac,
+    ) -> Result<(), String> {
+        if self.is_external_frame(parent_name) {
+            // KNOWN_EXTERNAL_FRAMES, *_IAU, and fully-qualified names are compile-time
+            // trusted — we don't call Frame::from_name for them because anise doesn't
+            // resolve all of them as body centers (e.g. "ICRF" is an orientation, not
+            // a center). Only user-registered extra frames get runtime validation, since
+            // those are arbitrary strings we cannot trust statically.
+            if self.extra_external_frames.contains(parent_name) {
+                Frame::from_name(parent_name, "J2000")
+                    .or_else(|_| Frame::from_name("SSB", parent_name))
+                    .map_err(|_| format!(
+                        "parent frame '{}' was registered via add_external_frame() but is \
+                         not recognized by anise. Verify the frame name or NAIF ID.",
+                        parent_name
+                    ))?;
+            }
+            // almanac is reserved for future per-frame SPK availability checks
+            // (e.g. a translate() probe to verify SPK data is loaded for this body).
+            let _ = almanac;
+        } else {
+            let qualified_parent = self.qualify(parent_name);
+            if !self.frames.contains_key(&qualified_parent) {
+                return Err(format!(
+                    "parent frame '{}' (qualified: '{}') does not exist in this registry; \
+                     add it before referencing it as a parent.",
+                    parent_name, qualified_parent
+                ));
+            }
+        }
+        self.add_frame(local_name, parent_name, translation, rotation_quat);
+        Ok(())
     }
 
     /// Validates the transform tree to ensure there are no cycles.
@@ -840,6 +893,60 @@ mod tests {
         let merged = reg_a.merge(&reg_b).unwrap();
         assert!(merged.is_external_frame("FRAME_A"));
         assert!(merged.is_external_frame("FRAME_B"));
+    }
+
+    #[test]
+    fn test_add_frame_validated_external_ok() {
+        let mut reg = FrameRegistry::new_with_namespace("ns");
+        let almanac = anise::almanac::Almanac::default();
+        // KNOWN_EXTERNAL_FRAMES entries — trusted without anise runtime call
+        assert!(reg.add_frame_validated("cam",    "Earth", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
+        assert!(reg.add_frame_validated("ant",    "ICRF",  [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
+        assert!(reg.add_frame_validated("sensor", "GCRF",  [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
+        // IAU convention — trusted without anise runtime call
+        assert!(reg.add_frame_validated("imu", "MARS_IAU", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
+        assert_eq!(reg.frames["ns:cam"].parent_id, "Earth");
+        assert_eq!(reg.frames["ns:ant"].parent_id, "ICRF");
+    }
+
+    #[test]
+    fn test_add_frame_validated_extra_external_anise_check() {
+        let mut reg = FrameRegistry::new_with_namespace("ns");
+        let almanac = anise::almanac::Almanac::default();
+
+        // A valid name in anise's catalog, registered as extra_external — should pass
+        reg.add_external_frame("Earth");
+        assert!(reg.add_frame_validated("cam", "Earth", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
+
+        // An invalid name registered as extra_external — anise rejects it at validation time
+        reg.add_external_frame("NOT_A_REAL_FRAME");
+        let err = reg
+            .add_frame_validated("bad", "NOT_A_REAL_FRAME", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac)
+            .unwrap_err();
+        assert!(err.contains("NOT_A_REAL_FRAME"), "error should name the frame: {err}");
+        assert!(!reg.frames.contains_key("ns:bad"), "frame must not be inserted on failure");
+    }
+
+    #[test]
+    fn test_add_frame_validated_local_sibling_ok() {
+        let mut reg = FrameRegistry::new_with_namespace("ns");
+        let almanac = anise::almanac::Almanac::default();
+        reg.add_frame("base_link", "ICRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
+        // cam's parent "base_link" exists → should succeed
+        assert!(reg.add_frame_validated("cam", "base_link", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
+        assert_eq!(reg.frames["ns:cam"].parent_id, "ns:base_link");
+    }
+
+    #[test]
+    fn test_add_frame_validated_local_sibling_missing() {
+        let mut reg = FrameRegistry::new_with_namespace("ns");
+        let almanac = anise::almanac::Almanac::default();
+        // "base_link" hasn't been added yet
+        let err = reg
+            .add_frame_validated("cam", "base_link", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac)
+            .unwrap_err();
+        assert!(err.contains("base_link"), "error should name the missing parent: {err}");
+        assert!(!reg.frames.contains_key("ns:cam"));
     }
 
     #[test]
