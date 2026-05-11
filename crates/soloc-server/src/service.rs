@@ -200,6 +200,14 @@ impl FlightService for SolocFlightService {
             filter = filter.with_spatial(origin, radius);
         }
 
+        // Snapshot the registry before acquiring the ledger lock to avoid
+        // holding both locks simultaneously.
+        let registry = state
+            .registry
+            .read()
+            .map_err(|_| Status::internal("registry lock poisoned"))?
+            .clone();
+
         let batches: Vec<RecordBatch> = {
             let ledger = state
                 .ledger
@@ -209,7 +217,8 @@ impl FlightService for SolocFlightService {
                 .stream_query(&filter, &ticket.sts_column)
                 .filter_map(|r| r.ok())
                 .filter(|b| b.num_rows() > 0)
-                .collect()
+                .map(|b| inject_registry(&b, &registry))
+                .collect::<Result<Vec<_>, _>>()?
         };
 
         let out_stream = FlightDataEncoderBuilder::new()
@@ -233,11 +242,42 @@ impl FlightService for SolocFlightService {
 
         while let Some(batch) = batch_stream.next().await {
             let batch = batch.map_err(|e| Status::internal(e.to_string()))?;
+
+            // Merge any registry embedded in the batch into the server's canonical
+            // registry, then re-tag the batch before storing. This ensures every ledger
+            // entry is self-describing with the full merged frame map, and that custom
+            // frames from clients accumulate in the server's persistent registry.
+            let tagged = {
+                let batch_reg = batch
+                    .schema()
+                    .metadata()
+                    .get(STS_REGISTRY_METADATA_KEY)
+                    .and_then(|json| FrameRegistry::from_json(json).ok());
+
+                let mut server_reg = state
+                    .registry
+                    .write()
+                    .map_err(|_| Status::internal("registry lock poisoned"))?;
+
+                if let Some(ref br) = batch_reg {
+                    let merged = server_reg
+                        .merge(br)
+                        .map_err(|e| Status::internal(format!("registry merge failed: {e}")))?;
+                    *server_reg = merged;
+                }
+
+                let tagged = inject_registry(&batch, &server_reg)?;
+                let snapshot = server_reg.clone();
+                drop(server_reg);
+                state.persist_registry(&snapshot);
+                tagged
+            };
+
             state
                 .ledger
                 .write()
                 .map_err(|_| Status::internal("ledger lock poisoned"))?
-                .append(batch);
+                .append(tagged);
         }
 
         Ok(Response::new(Box::pin(futures::stream::empty())))
@@ -327,12 +367,15 @@ impl FlightService for SolocFlightService {
                     .registry
                     .write()
                     .map_err(|_| Status::internal("registry lock poisoned"))?;
-                registry.add_frame(
-                    &body.local_name,
-                    &body.parent,
-                    body.translation,
-                    body.rotation_quat,
-                );
+                registry
+                    .add_frame_validated(
+                        &body.local_name,
+                        &body.parent,
+                        body.translation,
+                        body.rotation_quat,
+                        &self.state.almanac,
+                    )
+                    .map_err(|e| Status::invalid_argument(format!("register_frame failed: {e}")))?;
                 let qualified = registry.qualify(&body.local_name);
                 self.state.persist_registry(&registry);
                 let result = arrow_flight::Result {
