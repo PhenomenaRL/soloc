@@ -20,6 +20,26 @@ use std::collections::{HashMap, HashSet};
 /// The metadata key used to store the serialized `FrameRegistry` in the Arrow schema.
 pub const STS_REGISTRY_METADATA_KEY: &str = "soloc.frame_registry";
 
+/// Astronomical frame names recognized as external roots by `anise`.
+///
+/// Any name in this list (or matching `*_IAU` or containing `:`) is treated as an
+/// external frame anchor in `add_frame` — it will not be namespace-qualified.
+/// Use `FrameRegistry::add_external_frame` for mission-specific names not listed here.
+pub const KNOWN_EXTERNAL_FRAMES: &[&str] = &[
+    // Inertial / quasi-inertial
+    "ICRF", "J2000", "GCRF", "EME2000", "TEME",
+    // Earth-fixed
+    "ITRF", "ECEF", "ECI",
+    // Barycenters
+    "SSB", "EMB",
+    // Solar system body centers (anise resolves these with J2000 orientation)
+    "Sun", "Mercury", "Venus", "Earth", "Moon",
+    "Mars", "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto",
+    // Common moon / small-body centers
+    "Phobos", "Deimos", "Io", "Europa", "Ganymede", "Callisto",
+    "Titan", "Enceladus",
+];
+
 /// Represents a static spatial transformation between a child frame and its parent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FrameTransform {
@@ -42,6 +62,11 @@ pub struct FrameRegistry {
     pub namespace: String,
     /// Maps a fully qualified frame ID (`namespace:local_name`) to its transform definition.
     pub frames: HashMap<String, FrameTransform>,
+    /// Mission-specific external frame names not in `KNOWN_EXTERNAL_FRAMES`.
+    /// These are treated as external roots and never namespace-qualified.
+    /// Serialized into JSON alongside `frames` so they survive persistence.
+    #[serde(default)]
+    pub extra_external_frames: HashSet<String>,
 }
 
 impl Default for FrameRegistry {
@@ -57,6 +82,7 @@ impl FrameRegistry {
         Self {
             namespace,
             frames: HashMap::new(),
+            extra_external_frames: HashSet::new(),
         }
     }
 
@@ -65,6 +91,7 @@ impl FrameRegistry {
         Self {
             namespace: namespace.into(),
             frames: HashMap::new(),
+            extra_external_frames: HashSet::new(),
         }
     }
 
@@ -73,12 +100,41 @@ impl FrameRegistry {
         format!("{}:{}", self.namespace, local_name)
     }
 
+    /// Returns `true` if `name` should be treated as an external astronomical frame root —
+    /// i.e., it will not be namespace-qualified when used as a parent in `add_frame`.
+    ///
+    /// A name is external if it:
+    /// - Is already fully qualified (contains `:`),
+    /// - Matches the `*_IAU` body-fixed naming convention,
+    /// - Appears in [`KNOWN_EXTERNAL_FRAMES`], or
+    /// - Was registered via [`add_external_frame`](Self::add_external_frame).
+    pub fn is_external_frame(&self, name: &str) -> bool {
+        name.contains(':')
+            || name.ends_with("_IAU")
+            || KNOWN_EXTERNAL_FRAMES.contains(&name)
+            || self.extra_external_frames.contains(name)
+    }
+
+    /// Registers a mission-specific frame name as an external root.
+    ///
+    /// Use this for names that `anise` recognizes but are not in [`KNOWN_EXTERNAL_FRAMES`]
+    /// (e.g., raw NAIF ID strings, mission-specific orientation frames). Registered names
+    /// survive JSON serialization alongside `frames`.
+    pub fn add_external_frame(&mut self, name: impl Into<String>) {
+        self.extra_external_frames.insert(name.into());
+    }
+
     /// Adds a custom frame to the registry.
     ///
     /// The `local_name` is the name of the new frame.
     /// The `parent_name` can be either:
     /// 1. Another local name within this registry (e.g., "base_link").
-    /// 2. An external astronomical frame (e.g., "MARS_IAU" or "ICRF").
+    /// 2. An external astronomical frame (e.g., "MARS_IAU", "GCRF", "Neptune").
+    ///
+    /// External parents are detected via [`is_external_frame`](Self::is_external_frame)
+    /// and passed through unchanged. Local siblings are namespace-qualified automatically.
+    /// For runtime validation that the parent is resolvable by the loaded `Almanac`,
+    /// use `add_frame_validated` (Step 2).
     pub fn add_frame(
         &mut self,
         local_name: &str,
@@ -87,19 +143,11 @@ impl FrameRegistry {
         rotation_quat: [f64; 4],
     ) {
         let child_id = self.qualify(local_name);
-
-        // If the parent already contains a ':' or matches standard anise frame
-        // conventions, we assume it's external or fully qualified.
-        // Otherwise, we qualify it to our local namespace.
-        let parent_id = if parent_name.contains(':')
-            || parent_name == "ICRF"
-            || parent_name.ends_with("_IAU")
-        {
+        let parent_id = if self.is_external_frame(parent_name) {
             parent_name.to_string()
         } else {
             self.qualify(parent_name)
         };
-
         self.frames.insert(
             child_id,
             FrameTransform {
@@ -180,6 +228,10 @@ impl FrameRegistry {
         let mut merged = FrameRegistry {
             namespace: self.namespace.clone(),
             frames: HashMap::new(),
+            extra_external_frames: self.extra_external_frames
+                .union(&other.extra_external_frames)
+                .cloned()
+                .collect(),
         };
         merged.frames.extend(self.frames.clone());
         merged.frames.extend(other.frames.clone());
@@ -726,6 +778,68 @@ mod tests {
         assert!(merged.contains_frame("ns_a:cam"));
         assert!(merged.contains_frame("ns_b:lidar"));
         assert_eq!(merged.list_frames().len(), 2);
+    }
+
+    #[test]
+    fn test_is_external_frame() {
+        let mut reg = FrameRegistry::new_with_namespace("ns");
+
+        // Static catalog entries
+        assert!(reg.is_external_frame("ICRF"));
+        assert!(reg.is_external_frame("GCRF"));
+        assert!(reg.is_external_frame("EME2000"));
+        assert!(reg.is_external_frame("Neptune"));
+        assert!(reg.is_external_frame("SSB"));
+
+        // IAU convention
+        assert!(reg.is_external_frame("EARTH_IAU"));
+        assert!(reg.is_external_frame("MARS_IAU"));
+
+        // Already fully qualified
+        assert!(reg.is_external_frame("ns:cam"));
+
+        // Local name — not external
+        assert!(!reg.is_external_frame("base_link"));
+        assert!(!reg.is_external_frame("cam"));
+
+        // User-registered custom external
+        reg.add_external_frame("NEPTUNE_IAU_CUSTOM");
+        assert!(reg.is_external_frame("NEPTUNE_IAU_CUSTOM"));
+    }
+
+    #[test]
+    fn test_add_frame_with_catalog_parents() {
+        let mut reg = FrameRegistry::new_with_namespace("ns");
+
+        // These should all be recognized as external and NOT be namespace-qualified
+        reg.add_frame("cam", "GCRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
+        reg.add_frame("antenna", "Neptune", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
+        reg.add_frame("sensor", "EME2000", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
+
+        assert_eq!(reg.frames["ns:cam"].parent_id, "GCRF");
+        assert_eq!(reg.frames["ns:antenna"].parent_id, "Neptune");
+        assert_eq!(reg.frames["ns:sensor"].parent_id, "EME2000");
+    }
+
+    #[test]
+    fn test_add_frame_with_custom_external() {
+        let mut reg = FrameRegistry::new_with_namespace("ns");
+        reg.add_external_frame("MISSION_FRAME_42");
+        reg.add_frame("cam", "MISSION_FRAME_42", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
+
+        assert_eq!(reg.frames["ns:cam"].parent_id, "MISSION_FRAME_42");
+    }
+
+    #[test]
+    fn test_merge_unions_extra_external_frames() {
+        let mut reg_a = FrameRegistry::new_with_namespace("ns_a");
+        let mut reg_b = FrameRegistry::new_with_namespace("ns_b");
+        reg_a.add_external_frame("FRAME_A");
+        reg_b.add_external_frame("FRAME_B");
+
+        let merged = reg_a.merge(&reg_b).unwrap();
+        assert!(merged.is_external_frame("FRAME_A"));
+        assert!(merged.is_external_frame("FRAME_B"));
     }
 
     #[test]
