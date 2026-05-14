@@ -14,12 +14,14 @@
 //! Positions come from the DE440/DE440s SPK files. Load them via `anise::MetaAlmanac::latest()`,
 //! which downloads ~150 MB on first run and caches them in `~/.local/share/nyx-space/anise/`.
 
-use anise::constants::frames::{
-    EARTH_J2000, JUPITER_BARYCENTER_J2000, MARS_J2000, MERCURY_J2000, MOON_J2000,
-    NEPTUNE_BARYCENTER_J2000, SATURN_BARYCENTER_J2000, SSB_J2000, SUN_J2000,
-    URANUS_BARYCENTER_J2000, VENUS_J2000,
+use anise::constants::celestial_objects::{
+    EARTH, JUPITER, JUPITER_BARYCENTER, MARS, MERCURY, MOON, NEPTUNE,
+    NEPTUNE_BARYCENTER, SATURN, SATURN_BARYCENTER, SUN, URANUS, URANUS_BARYCENTER,
+    VENUS,
 };
+use anise::constants::frames::SSB_J2000;
 use anise::prelude::{Almanac, Frame};
+use nalgebra::{Rotation3, UnitQuaternion};
 use arrow::record_batch::RecordBatch;
 use hifitime::Epoch;
 use std::str::FromStr;
@@ -33,9 +35,9 @@ use crate::ledger::Ledger;
 
 /// Well-known solar system bodies whose ephemeris is available in the DE440 SPK family.
 ///
-/// Outer planets use their *system barycentre* frames (e.g. `JUPITER_BARYCENTER_J2000`)
-/// because that is what DE440 provides natively; the offset from the planet centre is
-/// negligible for most applications.
+/// Each variant maps to a NAIF body center ID via [`naif_id`](Self::naif_id), which is
+/// used to construct both the IAU body-fixed frame ([`iau_frame`](Self::iau_frame)) and
+/// the J2000 barycenter frame ([`frame`](Self::frame)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CelestialBody {
     Sun,
@@ -44,13 +46,9 @@ pub enum CelestialBody {
     Earth,
     Moon,
     Mars,
-    /// Jupiter system barycentre.
     Jupiter,
-    /// Saturn system barycentre.
     Saturn,
-    /// Uranus system barycentre.
     Uranus,
-    /// Neptune system barycentre.
     Neptune,
 }
 
@@ -69,19 +67,57 @@ impl CelestialBody {
         CelestialBody::Neptune,
     ];
 
-    /// The `anise` frame constant used to query this body's ICRF state vector.
-    pub fn frame(self) -> Frame {
+    /// NAIF body center integer ID for this body.
+    ///
+    /// By NAIF convention this also serves as the IAU orientation ID — the body's
+    /// IAU body-fixed frame has the same integer for both ephemeris origin and
+    /// orientation (see [`iau_frame`](Self::iau_frame)).
+    pub fn naif_id(self) -> i32 {
         match self {
-            CelestialBody::Sun     => SUN_J2000,
-            CelestialBody::Mercury => MERCURY_J2000,
-            CelestialBody::Venus   => VENUS_J2000,
-            CelestialBody::Earth   => EARTH_J2000,
-            CelestialBody::Moon    => MOON_J2000,
-            CelestialBody::Mars    => MARS_J2000,
-            CelestialBody::Jupiter => JUPITER_BARYCENTER_J2000,
-            CelestialBody::Saturn  => SATURN_BARYCENTER_J2000,
-            CelestialBody::Uranus  => URANUS_BARYCENTER_J2000,
-            CelestialBody::Neptune => NEPTUNE_BARYCENTER_J2000,
+            CelestialBody::Sun     => SUN,      // 10
+            CelestialBody::Mercury => MERCURY,  // 199
+            CelestialBody::Venus   => VENUS,    // 299
+            CelestialBody::Earth   => EARTH,    // 399
+            CelestialBody::Moon    => MOON,     // 301
+            CelestialBody::Mars    => MARS,     // 499
+            CelestialBody::Jupiter => JUPITER,  // 599
+            CelestialBody::Saturn  => SATURN,   // 699
+            CelestialBody::Uranus  => URANUS,   // 799
+            CelestialBody::Neptune => NEPTUNE,  // 899
+        }
+    }
+
+    /// The IAU body-fixed frame for this body.
+    ///
+    /// Constructed as `Frame::new(naif_id, naif_id)` — the ephemeris origin is
+    /// the planet body center and the orientation follows the IAU rotation model
+    /// stored in the loaded PCK (e.g. `pck11.pca` from `MetaAlmanac::latest()`).
+    /// The z-axis of this frame is the body's north pole (rotation axis); the
+    /// x-axis points toward the prime meridian.
+    ///
+    /// This convention holds for all supported bodies including the Sun, for which
+    /// anise does not export a named constant but the NAIF ID (10) is correct.
+    pub fn iau_frame(self) -> Frame {
+        Frame::new(self.naif_id(), self.naif_id())
+    }
+
+    /// The J2000-oriented frame used to query this body's state vector from DE440.
+    ///
+    /// Inner planets use their body center NaifId (same as their IAU frame origin).
+    /// Outer planets (Jupiter–Neptune) use their system barycenter NaifId, which is
+    /// what DE440 provides directly without additional satellite SPK files.
+    ///
+    /// Retained for callers that explicitly need barycenter frames (e.g. as transform
+    /// targets). For body-center positions and IAU orientation use
+    /// [`iau_frame`](Self::iau_frame).
+    pub fn frame(self) -> Frame {
+        let orientation = 1; // J2000 orientation NaifId
+        match self {
+            CelestialBody::Jupiter => Frame::new(JUPITER_BARYCENTER, orientation),
+            CelestialBody::Saturn  => Frame::new(SATURN_BARYCENTER, orientation),
+            CelestialBody::Uranus  => Frame::new(URANUS_BARYCENTER, orientation),
+            CelestialBody::Neptune => Frame::new(NEPTUNE_BARYCENTER, orientation),
+            _                      => Frame::new(self.naif_id(), orientation),
         }
     }
 
@@ -148,9 +184,17 @@ fn epoch_to_parts(epoch: Epoch) -> (i16, u64) {
 /// [`RecordBatch`].
 ///
 /// All rows use `frame_id = "ICRF"`, `units_pos = "km"`, `timescale_id = "TAI"`,
-/// `source_id = "anise"`, and `estimate_type = "MEASURED"`. Velocity is populated from
-/// the DE440 state vector. Orientation is the identity quaternion (body rotation is not
-/// tracked). Mass is derived from DE440/IAU 2012 GM constants.
+/// `source_id = "anise"`, and `estimate_type = "MEASURED"`.
+///
+/// - **Position**: body center relative to the Solar System Barycentre (SSB), from DE440.
+/// - **Velocity**: body-center linear velocity from DE440.
+/// - **Orientation**: quaternion `[w, x, y, z]` encoding the rotation from the body's
+///   IAU body-fixed frame to ICRF. The z-axis of the IAU frame is the body's north pole
+///   (rotation axis); the x-axis points toward the prime meridian. Derived from the IAU
+///   PCK rotation model via `almanac.rotate()`.
+/// - **Angular velocity**: body spin in ICRF (rad/s), derived from the time derivative of
+///   the IAU rotation model. Present when the loaded PCK includes that derivative.
+/// - **Mass**: from DE440/IAU 2012 GM constants.
 ///
 /// The returned batch is schema-compatible with any other entity batch and can be appended
 /// directly to a [`Ledger`]:
@@ -159,12 +203,20 @@ fn epoch_to_parts(epoch: Epoch) -> (i16, u64) {
 /// ledger.append(celestial_snapshot(&almanac, CelestialBody::ALL, epoch)?);
 /// ```
 ///
+/// # Data requirements
+///
+/// - **Inner planets** (Sun, Mercury, Venus, Earth, Moon, Mars): position and orientation
+///   are fully resolved by `MetaAlmanac::latest()` (DE440 + pck11.pca).
+/// - **Outer planets** (Jupiter, Saturn, Uranus, Neptune): orientation is resolved by
+///   `MetaAlmanac::latest()`, but body-center position additionally requires a satellite
+///   SPK (e.g. `jup365.bsp` for Jupiter). Load it via `MetaAlmanac` or supply the file
+///   directly to the `Almanac`.
+///
 /// # Errors
 ///
 /// Returns `Err` if:
 /// - `bodies` is empty.
-/// - The almanac fails to resolve any body (most commonly: no SPK loaded).
-///   Load one with `anise::MetaAlmanac::latest()`.
+/// - The almanac fails to resolve position or orientation for any body.
 pub fn celestial_snapshot(
     almanac: &Almanac,
     bodies: &[CelestialBody],
@@ -180,15 +232,37 @@ pub fn celestial_snapshot(
     let mut builder = EntityBuilder::new(bodies.len(), None);
 
     for &body in bodies {
+        let iau = body.iau_frame();
+
         let state = almanac
-            .translate(body.frame(), SSB_J2000, epoch, None)
-            .map_err(|e| {
-                format!(
-                    "Failed to get ephemeris state for {:?} at {epoch}: {e}. \
-                     Ensure a planetary SPK is loaded via anise::MetaAlmanac::latest().",
-                    body,
-                )
-            })?;
+            .translate(iau, SSB_J2000, epoch, None)
+            .map_err(|e| format!(
+                "Failed to get body-center position for {:?} at {epoch}: {e}. \
+                 Inner planets require DE440; outer planets (Jupiter+) additionally \
+                 need a satellite SPK (e.g. jup365.bsp for Jupiter). Load via \
+                 MetaAlmanac or supply the file directly.",
+                body,
+            ))?;
+
+        let dcm = almanac
+            .rotate(iau, SSB_J2000, epoch)
+            .map_err(|e| format!(
+                "Failed to get IAU orientation for {:?} at {epoch}: {e}. \
+                 Ensure a PCK (e.g. pck11.pca) is loaded, available via \
+                 MetaAlmanac::latest().",
+                body,
+            ))?;
+
+        let q = UnitQuaternion::from_rotation_matrix(
+            &Rotation3::from_matrix_unchecked(dcm.rot_mat),
+        );
+
+        // Angular velocity of the body in ICRF (rad/s): ω = axial_vec(dR/dt · Rᵀ).
+        // Present when the PCK encodes the time derivative of the rotation model.
+        let angular_velocity = dcm.rot_mat_dt.map(|r_dt| {
+            let omega = r_dt * dcm.rot_mat.transpose();
+            [omega[(2, 1)], omega[(0, 2)], omega[(1, 0)]]
+        });
 
         builder.append_entity(
             body.entity_id(),
@@ -198,18 +272,14 @@ pub fn celestial_snapshot(
             "anise",
             "MEASURED",
             [state.radius_km.x, state.radius_km.y, state.radius_km.z],
-            [1.0, 0.0, 0.0, 0.0], // identity quaternion — body rotation not tracked
+            [q.w, q.i, q.j, q.k],
             centuries,
             ns,
-            Some([
-                state.velocity_km_s.x,
-                state.velocity_km_s.y,
-                state.velocity_km_s.z,
-            ]),
-            None, // angular_velocity
-            None, // acceleration
+            Some([state.velocity_km_s.x, state.velocity_km_s.y, state.velocity_km_s.z]),
+            angular_velocity,
+            None,
             Some(body.mass_kg()),
-            None, // state_covariance
+            None,
         );
     }
 
@@ -387,6 +457,10 @@ mod tests {
         let mass = batch.column_by_name("mass_kg").unwrap();
         assert_eq!(mass.null_count(), 0, "all bodies should have mass");
 
+        // Angular velocity should be non-null (PCK includes rotation rate derivatives)
+        let ang_vel = batch.column_by_name("angular_velocity").unwrap();
+        assert_eq!(ang_vel.null_count(), 0, "all bodies should have angular velocity from PCK");
+
         // Earth is ~1 AU from SSB (within a factor of 2 for a rough check)
         use arrow::array::{FixedSizeListArray, Float64Array, StructArray};
         let sts = batch
@@ -418,6 +492,29 @@ mod tests {
         assert!(
             (0.9..=1.1).contains(&dist_au),
             "Earth should be ~1 AU from SSB at J2000, got {dist_au:.4} AU"
+        );
+
+        // Earth's orientation at J2000 is not the identity — the IAU rotation model
+        // encodes Earth's ~23.4° axial tilt and prime-meridian angle.
+        let quat_list = sts
+            .column_by_name("quaternion")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let quat_vals = quat_list
+            .values()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let base = (quat_list.offset() + earth_row) * 4;
+        let qw = quat_vals.value(base);
+        let qx = quat_vals.value(base + 1);
+        let qy = quat_vals.value(base + 2);
+        let qz = quat_vals.value(base + 3);
+        assert!(
+            !(qx.abs() < 1e-9 && qy.abs() < 1e-9 && qz.abs() < 1e-9),
+            "Earth orientation at J2000 should not be identity, got [{qw}, {qx}, {qy}, {qz}]"
         );
     }
 }
