@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 pub struct ServerState {
     pub ledger: Arc<RwLock<Ledger>>,
     pub registry: Arc<RwLock<FrameRegistry>>,
-    pub almanac: Almanac,
+    pub almanac: Arc<RwLock<Almanac>>,
     pub registry_path: Option<PathBuf>,
     pub ledger_path: Option<PathBuf>,
 }
@@ -45,7 +45,7 @@ impl ServerState {
         Self {
             ledger: Arc::new(RwLock::new(ledger)),
             registry: Arc::new(RwLock::new(registry)),
-            almanac,
+            almanac: Arc::new(RwLock::new(almanac)),
             registry_path,
             ledger_path,
         }

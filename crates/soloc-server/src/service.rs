@@ -16,7 +16,9 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use tonic::{Request, Response, Status, Streaming};
 
+use anise::almanac::metaload::MetaFile;
 use soloc::entity::entity_schema;
+use soloc::ephemeris::naif_snapshot;
 use spacetimestamp::query::SpatiotemporalFilter;
 use spacetimestamp::schema::{FrameRegistry, STS_REGISTRY_METADATA_KEY};
 use spacetimestamp::transforms::transform_batch;
@@ -41,6 +43,25 @@ struct RemoveFrameBody {
 #[derive(Deserialize)]
 struct SaveLedgerBody {
     path: String,
+}
+
+#[derive(Deserialize)]
+struct LoadKernelBody {
+    /// URL (http/https) or local filesystem path to a SPICE kernel (BSP/PCK/BPC).
+    source: String,
+}
+
+#[derive(Deserialize)]
+struct NaifBodyEntry {
+    naif_id: i32,
+    entity_id: String,
+}
+
+#[derive(Deserialize)]
+struct AppendSnapshotBody {
+    bodies: Vec<NaifBodyEntry>,
+    /// Epoch expressed as TAI seconds past J2000.
+    epoch_tai_s: f64,
 }
 
 #[derive(Deserialize)]
@@ -124,11 +145,15 @@ fn transform_with_server_registry(
     drop(server_reg);
 
     let patched = inject_registry(batch, &merged)?;
+    let almanac = state
+        .almanac
+        .read()
+        .map_err(|_| Status::internal("almanac lock poisoned"))?;
     transform_batch(
         &patched,
         &desc.sts_column,
         &desc.target_frame,
-        &state.almanac,
+        &almanac,
         &desc.target_units,
     )
     .map_err(|e| Status::internal(format!("transform failed: {e}")))
@@ -359,6 +384,18 @@ impl FlightService for SolocFlightService {
                 r#type: "load_ledger".to_string(),
                 description: "Replace the in-memory ledger from an Arrow IPC file. Body: {path}".to_string(),
             }),
+            Ok(ActionType {
+                r#type: "load_kernel".to_string(),
+                description: "Load a SPICE kernel (BSP/PCK/BPC) into the server almanac. \
+                              Body: {source} where source is an http/https URL or local path. \
+                              URLs are downloaded and cached in the anise data directory.".to_string(),
+            }),
+            Ok(ActionType {
+                r#type: "append_snapshot".to_string(),
+                description: "Query the almanac for arbitrary NAIF bodies at a given epoch and \
+                              append the result to the ledger. \
+                              Body: {bodies: [{naif_id, entity_id}], epoch_tai_s}".to_string(),
+            }),
         ];
         Ok(Response::new(Box::pin(futures::stream::iter(actions))))
     }
@@ -380,13 +417,18 @@ impl FlightService for SolocFlightService {
                     .registry
                     .write()
                     .map_err(|_| Status::internal("registry lock poisoned"))?;
+                let almanac = self
+                    .state
+                    .almanac
+                    .read()
+                    .map_err(|_| Status::internal("almanac lock poisoned"))?;
                 registry
                     .add_frame_validated(
                         &body.local_name,
                         &body.parent,
                         body.translation,
                         body.rotation_quat,
-                        &self.state.almanac,
+                        &almanac,
                     )
                     .map_err(|e| Status::invalid_argument(format!("register_frame failed: {e}")))?;
                 let qualified = registry.qualify(&body.local_name);
@@ -470,6 +512,88 @@ impl FlightService for SolocFlightService {
                     .map_err(|_| Status::internal("ledger lock poisoned"))? = new_ledger;
                 let result = arrow_flight::Result {
                     body: format!("loaded {n} batches from {}", body.path).into_bytes().into(),
+                };
+                Ok(Response::new(Box::pin(futures::stream::once(
+                    futures::future::ready(Ok(result)),
+                ))))
+            }
+
+            "load_kernel" => {
+                let body: LoadKernelBody = serde_json::from_slice(&action.body)
+                    .map_err(|e| Status::invalid_argument(format!("invalid load_kernel body: {e}")))?;
+
+                // MetaFile::process() downloads the file if it's a URL and updates the
+                // uri field to the local cache path, or leaves it as-is for local paths.
+                // It is blocking (network I/O), so we run it on the blocking thread pool.
+                let source = body.source.clone();
+                let local_path = tokio::task::spawn_blocking(move || {
+                    let mut meta = MetaFile { uri: source, crc32: None };
+                    meta.process(false).map(|_| meta.uri)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("load_kernel task panicked: {e}")))?
+                .map_err(|e| Status::internal(format!("kernel download/resolve failed: {e}")))?;
+
+                // Clone the current almanac, load the new kernel, then swap if successful.
+                let mut almanac_guard = self
+                    .state
+                    .almanac
+                    .write()
+                    .map_err(|_| Status::internal("almanac lock poisoned"))?;
+                let updated = almanac_guard
+                    .clone()
+                    .load(&local_path)
+                    .map_err(|e| Status::internal(format!("failed to load kernel '{local_path}': {e}")))?;
+                *almanac_guard = updated;
+                drop(almanac_guard);
+
+                let msg = format!("kernel loaded: {}", body.source);
+                let result = arrow_flight::Result { body: msg.into_bytes().into() };
+                Ok(Response::new(Box::pin(futures::stream::once(
+                    futures::future::ready(Ok(result)),
+                ))))
+            }
+
+            "append_snapshot" => {
+                let body: AppendSnapshotBody = serde_json::from_slice(&action.body)
+                    .map_err(|e| Status::invalid_argument(format!("invalid append_snapshot body: {e}")))?;
+
+                if body.bodies.is_empty() {
+                    return Err(Status::invalid_argument("bodies list is empty"));
+                }
+
+                let epoch = hifitime::Epoch::from_tai_seconds(body.epoch_tai_s);
+                let pairs: Vec<(i32, String)> = body
+                    .bodies
+                    .iter()
+                    .map(|b| (b.naif_id, b.entity_id.clone()))
+                    .collect();
+
+                let almanac = self
+                    .state
+                    .almanac
+                    .read()
+                    .map_err(|_| Status::internal("almanac lock poisoned"))?;
+
+                // Build the &str slice from the owned Strings.
+                let ref_pairs: Vec<(i32, &str)> = pairs
+                    .iter()
+                    .map(|(id, eid)| (*id, eid.as_str()))
+                    .collect();
+
+                let batch = naif_snapshot(&almanac, &ref_pairs, epoch)
+                    .map_err(|e| Status::internal(format!("naif_snapshot failed: {e}")))?;
+                drop(almanac);
+
+                let n = batch.num_rows();
+                self.state
+                    .ledger
+                    .write()
+                    .map_err(|_| Status::internal("ledger lock poisoned"))?
+                    .append(batch);
+
+                let result = arrow_flight::Result {
+                    body: format!("appended {n} rows").into_bytes().into(),
                 };
                 Ok(Response::new(Box::pin(futures::stream::once(
                     futures::future::ready(Ok(result)),

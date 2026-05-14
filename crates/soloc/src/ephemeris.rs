@@ -286,6 +286,90 @@ pub fn celestial_snapshot(
     Ok(builder.flush())
 }
 
+/// Queries the almanac for arbitrary NAIF bodies at `epoch` and returns a standard entity
+/// [`RecordBatch`].
+///
+/// Each entry in `bodies` is a `(naif_id, entity_id)` pair — `naif_id` is the NAIF integer
+/// ID of the body (e.g. `2099942` for Apophis, `599` for Jupiter center), and `entity_id`
+/// is the URI to store in the ledger (e.g. `"urn:soloc:asteroid:apophis"`).
+///
+/// Unlike [`celestial_snapshot`], orientation silently falls back to the identity quaternion
+/// and `angular_velocity` to `None` when the loaded PCK has no rotation model for the
+/// requested body — so this function succeeds for any body that has SPK position data,
+/// regardless of PCK coverage. Mass is not populated (unknown for arbitrary bodies).
+///
+/// # Errors
+///
+/// Returns `Err` if:
+/// - `bodies` is empty.
+/// - The almanac cannot resolve the position of any body (SPK data missing).
+pub fn naif_snapshot(
+    almanac: &Almanac,
+    bodies: &[(i32, &str)],
+    epoch: Epoch,
+) -> Result<RecordBatch, String> {
+    if bodies.is_empty() {
+        return Err(
+            "bodies list is empty — provide at least one (naif_id, entity_id) pair".to_string(),
+        );
+    }
+
+    let (centuries, ns) = epoch_to_parts(epoch);
+    let mut builder = EntityBuilder::new(bodies.len(), None);
+
+    for &(naif_id, entity_id) in bodies {
+        let iau = Frame::new(naif_id, naif_id);
+
+        let state = almanac
+            .translate(iau, SSB_J2000, epoch, None)
+            .map_err(|e| format!(
+                "Failed to get position for NAIF ID {naif_id} ({entity_id}) at {epoch}: {e}.",
+            ))?;
+
+        let (quaternion, angular_velocity) = match almanac.rotate(iau, SSB_J2000, epoch) {
+            Ok(dcm) => {
+                let q = UnitQuaternion::from_rotation_matrix(
+                    &Rotation3::from_matrix_unchecked(dcm.rot_mat),
+                );
+                let ang_vel = dcm.rot_mat_dt.map(|r_dt| {
+                    let omega = r_dt * dcm.rot_mat.transpose();
+                    [omega[(2, 1)], omega[(0, 2)], omega[(1, 0)]]
+                });
+                ([q.w, q.i, q.j, q.k], ang_vel)
+            }
+            Err(_) => ([1.0, 0.0, 0.0, 0.0], None),
+        };
+
+        builder.append_entity(
+            entity_id,
+            "ICRF", "km", "TAI", "anise", "MEASURED",
+            [state.radius_km.x, state.radius_km.y, state.radius_km.z],
+            quaternion,
+            centuries,
+            ns,
+            Some([state.velocity_km_s.x, state.velocity_km_s.y, state.velocity_km_s.z]),
+            angular_velocity,
+            None,
+            None,
+            None,
+        );
+    }
+
+    Ok(builder.flush())
+}
+
+/// Convenience wrapper: calls [`naif_snapshot`] and appends the result to `ledger`.
+pub fn append_naif(
+    ledger: &mut Ledger,
+    almanac: &Almanac,
+    bodies: &[(i32, &str)],
+    epoch: Epoch,
+) -> Result<(), String> {
+    let batch = naif_snapshot(almanac, bodies, epoch)?;
+    ledger.append(batch);
+    Ok(())
+}
+
 /// Convenience wrapper: calls [`celestial_snapshot`] and appends the result to `ledger`.
 ///
 /// Equivalent to `ledger.append(celestial_snapshot(almanac, bodies, epoch)?)`.
