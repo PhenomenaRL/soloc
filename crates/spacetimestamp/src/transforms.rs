@@ -47,7 +47,7 @@ use arrow::array::{
 use arrow::datatypes::{UInt16Type, UInt32Type};
 use arrow::record_batch::RecordBatch;
 use hifitime::{Duration, Epoch, TimeScale};
-use nalgebra::{Isometry3, Quaternion, Rotation3, Translation3, UnitQuaternion, Vector3};
+use nalgebra::{Isometry3, Point3, Quaternion, Rotation3, Translation3, UnitQuaternion, Vector3};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -60,8 +60,30 @@ fn unit_to_km_factor(unit: &str) -> f64 {
         "m" | "meters" | "meter" => 0.001,
         "km" | "kilometers" | "kilometer" => 1.0,
         "au" => 149_597_870.7,
-        _ => 1.0, // Default to assuming kilometers if unknown
+        _ => 1.0,
     }
+}
+
+/// Resolves "IAU_BODY" strings (e.g. "IAU_EARTH") to the corresponding anise IAU body-fixed
+/// frame by mapping the BODY name to its standard NAIF integer ID and constructing
+/// `Frame::new(naif_id, naif_id)`.
+///
+/// Returns `None` for unknown bodies.
+fn iau_frame_from_name(body_upper: &str) -> Option<Frame> {
+    let naif_id: i32 = match body_upper {
+        "SUN"     => 10,
+        "MERCURY" => 199,
+        "VENUS"   => 299,
+        "EARTH"   => 399,
+        "MOON"    => 301,
+        "MARS"    => 499,
+        "JUPITER" => 599,
+        "SATURN"  => 699,
+        "URANUS"  => 799,
+        "NEPTUNE" => 899,
+        _         => return None,
+    };
+    Some(Frame::new(naif_id, naif_id))
 }
 
 /// Reads a flat `[x, y, z]` triple from the raw values buffer of a `FixedSizeListArray`,
@@ -98,17 +120,33 @@ fn read_vec4(values: &Float64Array, list_offset: usize, row: usize) -> [f64; 4] 
 /// * `target_frame_name` - The target `anise` frame (e.g. "ICRF", "Earth").
 /// * `almanac` - The `anise` ephemeris engine holding planetary data.
 /// * `target_unit` - The desired output unit for position and velocity (e.g. "km" or "m").
+/// * `dynamic_frames` - Optional map from entity URI frame IDs to `(astronomical_root, isometry_km)`.
+///   Used when a row's `frame_id` is an entity URI (e.g. `"urn:soloc:truck_A"`) whose pose
+///   must be looked up in the ledger. The isometry translates child-frame coordinates (in km)
+///   into the astronomical root frame. Build this map with
+///   [`soloc::ledger::Ledger::build_dynamic_frame_map`] before calling.
+///
+///   Dynamic frame isometries are always in km, regardless of the batch's `units_pos`.
+///   Static [`FrameRegistry`] entries are checked first; dynamic frames are the fallback.
 pub fn transform_batch(
     batch: &RecordBatch,
     sts_column_name: &str,
     target_frame_name: &str,
     almanac: &Almanac,
     target_unit: &str,
+    dynamic_frames: Option<&HashMap<String, (String, Isometry3<f64>)>>,
 ) -> Result<RecordBatch, String> {
     // Attempt to resolve the target frame in anise. We default to assuming J2000 orientation
-    // if the user simply passed a planetary center like "Mars".
+    // if the user simply passed a planetary center like "Mars".  Also handles "IAU_BODY" strings
+    // (e.g. "IAU_EARTH") by mapping to the corresponding anise body-fixed frame.
     let target_frame = Frame::from_name(target_frame_name, "J2000")
         .or_else(|_| Frame::from_name("SSB", target_frame_name))
+        .or_else(|last_err| {
+            target_frame_name
+                .strip_prefix("IAU_")
+                .and_then(iau_frame_from_name)
+                .ok_or(last_err)
+        })
         .map_err(|e| format!("Invalid target_frame_name '{}': {}", target_frame_name, e))?;
 
     let schema = batch.schema();
@@ -308,31 +346,39 @@ pub fn transform_batch(
 
         let to_km = unit_to_km_factor(current_unit);
 
-        // --- Stage 1: Static transform (local frame → astronomical root) ---
+        // --- Stage 1: Local frame → astronomical root ---
         //
-        // Retrieve the pre-composed isometry for this custom frame.
-        // Falls back to identity if original_frame is already an astronomical frame.
-        let (root_frame_name, static_iso) = custom_frame_cache
-            .get(original_frame)
-            .cloned()
-            .unwrap_or_else(|| (original_frame.to_string(), Isometry3::identity()));
-
-        // Positions are Points: isometry applies BOTH rotation and translation.
-        // Apply in native units (registry translations share the data's unit system),
-        // then convert to km for the anise boundary.
-        let pos_local = nalgebra::Point3::new(px, py, pz);
-        let pos_root = (static_iso * pos_local).coords * to_km;
-
-        // Velocities and orientations are vectors/rotors: only the rotational part applies.
+        // Three possible resolutions, checked in priority order:
+        //   a) Static FrameRegistry entry  — isometry is in batch native units
+        //   b) Dynamic frame from caller   — isometry is in km (entity pose from ledger)
+        //   c) Passthrough                 — original_frame is already an astronomical root
+        let quat_local = UnitQuaternion::from_quaternion(Quaternion::new(qw, qx, qy, qz));
         let vel_local: Vector3<f64> = match vel_opt {
             Some([vx, vy, vz]) => Vector3::new(vx, vy, vz) * to_km,
             None => Vector3::zeros(),
         };
-        let quat_local: UnitQuaternion<f64> =
-            UnitQuaternion::from_quaternion(Quaternion::new(qw, qx, qy, qz));
 
-        let vel_root: Vector3<f64> = static_iso.rotation * vel_local;
-        let quat_root: UnitQuaternion<f64> = static_iso.rotation * quat_local;
+        let (root_frame_name, pos_root, vel_root, quat_root) =
+            if let Some((root, iso)) = custom_frame_cache.get(original_frame) {
+                // Static: isometry in batch units; convert to km after applying.
+                let pos_root = (iso * Point3::new(px, py, pz)).coords * to_km;
+                let vel_root = iso.rotation * vel_local;
+                let quat_root = iso.rotation * quat_local;
+                (root.clone(), pos_root, vel_root, quat_root)
+            } else if let Some((root, iso)) =
+                dynamic_frames.and_then(|m| m.get(original_frame))
+            {
+                // Dynamic: isometry in km; normalize coordinates to km first.
+                let pos_km = Point3::new(px * to_km, py * to_km, pz * to_km);
+                let pos_root = (iso * pos_km).coords;
+                let vel_root = iso.rotation * vel_local;
+                let quat_root = iso.rotation * quat_local;
+                (root.clone(), pos_root, vel_root, quat_root)
+            } else {
+                // Passthrough: original_frame is an astronomical root already.
+                let pos_root = Vector3::new(px, py, pz) * to_km;
+                (original_frame.to_string(), pos_root, vel_local, quat_local)
+            };
 
         // --- Stage 2 & 3: Dynamic transform (astronomical root → target) via Almanac ---
         //
@@ -342,6 +388,12 @@ pub fn transform_batch(
         let root_frame_base = root_frame_name.split(':').last().unwrap_or(root_frame_name.as_str());
         let root_frame = Frame::from_name(root_frame_base, "J2000")
             .or_else(|_| Frame::from_name("SSB", root_frame_base))
+            .or_else(|last_err| {
+                root_frame_base
+                    .strip_prefix("IAU_")
+                    .and_then(iau_frame_from_name)
+                    .ok_or(last_err)
+            })
             .map_err(|e| format!("Failed resolving root frame '{}': {}", root_frame_name, e))?;
 
         // almanac.translate(from, to, epoch) → radius_km is the position of `from`'s origin
@@ -481,7 +533,7 @@ mod tests {
         builder.append_spacetimestamp("cam", "m", "TAI", "s", "MEASURED", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
-        let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "m").unwrap();
+        let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "m", None).unwrap();
 
         let pos = read_output_pos(&result, 0);
         assert_eq!(pos, [1.0, 0.0, 0.0]);
@@ -501,7 +553,7 @@ mod tests {
         builder.append_spacetimestamp("cam", "m", "TAI", "s", "MEASURED", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
-        let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "m").unwrap();
+        let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "m", None).unwrap();
 
         let pos = read_output_pos(&result, 0);
         assert!((pos[0] - 1.0).abs() < 1e-10, "x={}", pos[0]);
@@ -533,7 +585,7 @@ mod tests {
         );
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
-        let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "m").unwrap();
+        let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "m", None).unwrap();
 
         let pos = read_output_pos(&result, 0);
         assert!(pos[0].abs() < 1e-10, "x should be ~0, got {}", pos[0]);
@@ -563,7 +615,7 @@ mod tests {
         builder.append_spacetimestamp("arm", "m", "TAI", "s", "MEASURED", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
-        let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "m").unwrap();
+        let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "m", None).unwrap();
 
         let pos0 = read_output_pos(&result, 0);
         assert!((pos0[0] - 5.0).abs() < 1e-10, "row0 x={}", pos0[0]);
@@ -580,7 +632,7 @@ mod tests {
         builder.append_spacetimestamp("Earth", "m", "TAI", "s", "MEASURED", [1000.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
 
         let batch = make_sts_batch(&mut builder, None);
-        let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "km").unwrap();
+        let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "km", None).unwrap();
 
         let pos = read_output_pos(&result, 0);
         assert!((pos[0] - 1.0).abs() < 1e-10, "expected 1.0 km, got {}", pos[0]);

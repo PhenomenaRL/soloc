@@ -22,11 +22,17 @@
 //! [`Ledger::save_ipc`] / [`Ledger::load_ipc`] use the Arrow IPC file format. All batches
 //! are serialized to a single file in insertion order and reconstructed on load.
 
-use arrow::array::{Array, BooleanBuilder, DictionaryArray, StringArray};
-use arrow::datatypes::UInt32Type;
+use arrow::array::{
+    Array, BooleanBuilder, DictionaryArray, FixedSizeListArray, Float64Array,
+    Int16Array, StringArray, StructArray, UInt64Array,
+};
+use arrow::datatypes::{UInt16Type, UInt32Type};
 use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
+use hifitime::{Duration, Epoch};
+use nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 
@@ -175,6 +181,161 @@ impl Ledger {
             .collect();
 
         RecordBatch::try_new(last.schema(), filtered.ok()?).ok()
+    }
+
+    /// Returns the pose of `entity_id` at the latest timestamp ≤ `epoch` as an
+    /// `(parent_frame_id, isometry_km)` pair, where the isometry translates child-frame
+    /// coordinates into `parent_frame_id` coordinates, with the translation in km.
+    ///
+    /// Returns `None` if the entity has no entry at or before `epoch` in the ledger.
+    pub fn resolve_frame_at(
+        &self,
+        entity_id: &str,
+        epoch: Epoch,
+    ) -> Option<(String, Isometry3<f64>)> {
+        let j2000 = Epoch::from_gregorian_tai(2000, 1, 1, 12, 0, 0, 0);
+        let target_dur = epoch - j2000;
+
+        let mut best_dur: Option<Duration> = None;
+        let mut best: Option<(String, Isometry3<f64>)> = None;
+
+        for batch in &self.batches {
+            let Some(eid_raw) = batch.column_by_name("entity_id") else { continue };
+            let Some(eid_col) = eid_raw.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() else { continue };
+            let Some(eid_dict) = eid_col.values().as_any().downcast_ref::<StringArray>() else { continue };
+
+            let Some(sts_raw) = batch.column_by_name("spacetimestamp") else { continue };
+            let Some(sts) = sts_raw.as_any().downcast_ref::<StructArray>() else { continue };
+
+            let Some(frame_raw) = sts.column_by_name("frame_id") else { continue };
+            let Some(frame_col) = frame_raw.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() else { continue };
+            let Some(frame_dict) = frame_col.values().as_any().downcast_ref::<StringArray>() else { continue };
+
+            let Some(units_raw) = sts.column_by_name("units_pos") else { continue };
+            let Some(units_col) = units_raw.as_any().downcast_ref::<DictionaryArray<UInt16Type>>() else { continue };
+            let Some(units_dict) = units_col.values().as_any().downcast_ref::<StringArray>() else { continue };
+
+            let Some(pos_raw) = sts.column_by_name("position") else { continue };
+            let Some(pos_list) = pos_raw.as_any().downcast_ref::<FixedSizeListArray>() else { continue };
+            let Some(pos_vals) = pos_list.values().as_any().downcast_ref::<Float64Array>() else { continue };
+            let pos_offset = pos_list.offset();
+
+            let Some(quat_raw) = sts.column_by_name("quaternion") else { continue };
+            let Some(quat_list) = quat_raw.as_any().downcast_ref::<FixedSizeListArray>() else { continue };
+            let Some(quat_vals) = quat_list.values().as_any().downcast_ref::<Float64Array>() else { continue };
+            let quat_offset = quat_list.offset();
+
+            let Some(cent_raw) = sts.column_by_name("duration_centuries") else { continue };
+            let Some(cent_arr) = cent_raw.as_any().downcast_ref::<Int16Array>() else { continue };
+
+            let Some(ns_raw) = sts.column_by_name("duration_ns") else { continue };
+            let Some(ns_arr) = ns_raw.as_any().downcast_ref::<UInt64Array>() else { continue };
+
+            for i in 0..batch.num_rows() {
+                let eid = eid_dict.value(eid_col.keys().value(i) as usize);
+                if eid != entity_id {
+                    continue;
+                }
+
+                let centuries = cent_arr.value(i);
+                let ns = ns_arr.value(i);
+                let row_dur = Duration::from_parts(centuries, ns);
+
+                if row_dur > target_dur {
+                    continue; // future entry — skip
+                }
+                if best_dur.map_or(false, |b| row_dur <= b) {
+                    continue; // not a better match
+                }
+
+                let units = units_dict.value(units_col.keys().value(i) as usize);
+                let to_km: f64 = match units.to_lowercase().as_str() {
+                    "m" | "meters" | "meter" => 0.001,
+                    "au" => 149_597_870.7,
+                    _ => 1.0,
+                };
+
+                let pb = (pos_offset + i) * 3;
+                let translation = Translation3::new(
+                    pos_vals.value(pb) * to_km,
+                    pos_vals.value(pb + 1) * to_km,
+                    pos_vals.value(pb + 2) * to_km,
+                );
+
+                let qb = (quat_offset + i) * 4;
+                let rotation = UnitQuaternion::from_quaternion(Quaternion::new(
+                    quat_vals.value(qb),     // w
+                    quat_vals.value(qb + 1), // x
+                    quat_vals.value(qb + 2), // y
+                    quat_vals.value(qb + 3), // z
+                ));
+
+                let frame_id = frame_dict.value(frame_col.keys().value(i) as usize).to_string();
+                best_dur = Some(row_dur);
+                best = Some((frame_id, Isometry3::from_parts(translation, rotation)));
+            }
+        }
+
+        best
+    }
+
+    /// Builds a dynamic frame map for use with [`spacetimestamp::transforms::transform_batch`].
+    ///
+    /// For each entity URI in `entity_ids`, looks up the entity's latest pose at or before
+    /// `epoch` and returns it as `(astronomical_root_frame, composed_isometry_km)`. The
+    /// isometry transforms coordinates expressed in that entity's body frame into the
+    /// astronomical root frame, with translation in km.
+    ///
+    /// Parent frames that are themselves entity URIs (start with `"urn:"`) are resolved
+    /// recursively and the isometries composed. Returns `Err` if any entity is not found
+    /// in the ledger or if a cycle is detected in the parent chain.
+    pub fn build_dynamic_frame_map(
+        &self,
+        entity_ids: &[&str],
+        epoch: Epoch,
+    ) -> Result<HashMap<String, (String, Isometry3<f64>)>, String> {
+        let mut result = HashMap::new();
+        for &id in entity_ids {
+            if !result.contains_key(id) {
+                self.resolve_chain(id, epoch, &mut result, &mut HashSet::new())?;
+            }
+        }
+        Ok(result)
+    }
+
+    fn resolve_chain(
+        &self,
+        entity_id: &str,
+        epoch: Epoch,
+        result: &mut HashMap<String, (String, Isometry3<f64>)>,
+        visiting: &mut HashSet<String>,
+    ) -> Result<(), String> {
+        if result.contains_key(entity_id) {
+            return Ok(());
+        }
+        if !visiting.insert(entity_id.to_string()) {
+            return Err(format!(
+                "Cycle detected in entity frame chain involving '{entity_id}'"
+            ));
+        }
+
+        let (parent_frame, iso) = self
+            .resolve_frame_at(entity_id, epoch)
+            .ok_or_else(|| format!(
+                "Entity '{entity_id}' not found in ledger at or before {epoch}"
+            ))?;
+
+        if parent_frame.starts_with("urn:") {
+            // Parent is another entity — recurse to get its composed isometry.
+            self.resolve_chain(&parent_frame, epoch, result, visiting)?;
+            let (root_frame, parent_iso) = result[&parent_frame].clone();
+            result.insert(entity_id.to_string(), (root_frame, parent_iso * iso));
+        } else {
+            result.insert(entity_id.to_string(), (parent_frame, iso));
+        }
+
+        visiting.remove(entity_id);
+        Ok(())
     }
 
     /// Serializes all batches to an Arrow IPC file at `path`.

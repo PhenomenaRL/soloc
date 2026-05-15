@@ -4731,6 +4731,7 @@ dependencies = [
  "arrow-flight",
  "futures",
  "hifitime",
+ "nalgebra",
  "prost",
  "serde",
  "serde_json",

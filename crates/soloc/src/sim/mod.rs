@@ -98,6 +98,7 @@ impl Simulation {
                 "ICRF",
                 &self.propagator.almanac,
                 "km",
+                None,
             )?
         };
 

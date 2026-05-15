@@ -50,22 +50,29 @@ pub fn validate_spacetimestamp_batch(batch: &RecordBatch) -> Result<(), String> 
                 && reg.frames.contains_key(frame_str) {
                     continue;
                 }
-            
+
             // b) Is it a raw NAIF ID?
             if frame_str.parse::<i32>().is_ok() {
                 continue;
             }
-            
+
             // c) ICRF/J2000 standard fallbacks
             if frame_str == "ICRF" || frame_str == "J2000" || frame_str == "EME2000" || frame_str == "IAU_MARS" || frame_str == "IAU_EARTH" {
                 continue;
             }
-            
-            // d) Validate via Anise if it's a compound name like "Earth_J2000"
+
+            // d) Entity URI — a forward-reference to another entity in the ledger whose pose
+            // defines this frame at query time. Resolution is deferred to transform_batch /
+            // Ledger::build_dynamic_frame_map; we accept it here unconditionally.
+            if frame_str.starts_with("urn:") {
+                continue;
+            }
+
+            // e) Validate via Anise if it's a compound name like "Earth_J2000"
             let is_compound = frame_str.split_once('_').map(|(center, orient)| {
                 Frame::from_name(center, orient).is_ok()
             }).unwrap_or(false);
-            
+
             if is_compound {
                 continue;
             }
@@ -143,6 +150,28 @@ mod tests {
         assert!(result.unwrap_err().contains("Invalid frame_id: 'INVALID_FRAME'"));
     }
     
+    #[test]
+    fn test_entity_uri_frame_is_valid() {
+        let mut builder = SpaceTimestampBuilder::new(1, None);
+        builder.append_spacetimestamp(
+            "urn:soloc:truck_A",
+            "m",
+            "TAI",
+            "sensor_1",
+            "MEASURED",
+            [1.0, 2.0, 3.0],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            0,
+            None, None,
+        );
+        let batch = builder.flush();
+        assert!(
+            validate_spacetimestamp_batch(&batch).is_ok(),
+            "entity URI frame_id should be accepted as a deferred ledger reference"
+        );
+    }
+
     #[test]
     fn test_valid_custom_frame() {
         let mut reg = FrameRegistry::new_with_namespace("robot");
