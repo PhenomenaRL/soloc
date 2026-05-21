@@ -286,7 +286,7 @@ impl Ledger {
     /// isometry transforms coordinates expressed in that entity's body frame into the
     /// astronomical root frame, with translation in km.
     ///
-    /// Parent frames that are themselves entity URIs (start with `"urn:"`) are resolved
+    /// Parent frames that are themselves entity URIs (contain `":"`) are resolved
     /// recursively and the isometries composed. Returns `Err` if any entity is not found
     /// in the ledger or if a cycle is detected in the parent chain.
     pub fn build_dynamic_frame_map(
@@ -539,5 +539,106 @@ mod tests {
         let loaded = Ledger::load_ipc(&path).unwrap();
         assert_eq!(loaded.len(), 2);
         std::fs::remove_file(path).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // FRICTION 7: entity-URI frame chain resolution
+    // -----------------------------------------------------------------------
+
+    /// Builds an entity batch using EntityBuilder (includes entity_id column).
+    fn make_entity_batch(
+        entity_id: &str,
+        frame_id: &str,
+        pos: [f64; 3],
+        quat: [f64; 4],
+        ns: u64,
+    ) -> RecordBatch {
+        use crate::entity::EntityBuilder;
+        let mut b = EntityBuilder::new(1, None);
+        b.append_entity(
+            entity_id, frame_id, "km", "TAI", "test:src", "MEASURED",
+            pos, quat, 0, ns,
+            None, None, None, None, None,
+        );
+        b.flush()
+    }
+
+    #[test]
+    fn test_build_dynamic_frame_map_single_hop() {
+        // truck_A at [100, 0, 0] km in IAU_EARTH, identity orientation.
+        let mut ledger = Ledger::new();
+        ledger.append(make_entity_batch(
+            "demo:truck_A", "IAU_EARTH",
+            [100.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
+        ));
+        // robot_truck at [1, 0, 0] km in truck_A body frame.
+        ledger.append(make_entity_batch(
+            "demo:robot_truck", "demo:truck_A",
+            [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
+        ));
+
+        let epoch = j2000();
+        let map = ledger.build_dynamic_frame_map(&["demo:robot_truck"], epoch).unwrap();
+
+        let (root, iso) = map.get("demo:robot_truck").unwrap();
+        assert_eq!(root, "IAU_EARTH");
+
+        // Composed isometry: robot at [1,0,0] in truck frame, truck at [100,0,0] in ECEF.
+        // Applying iso to the robot's local origin [0,0,0] should give [101,0,0] in ECEF.
+        let origin = nalgebra::Point3::new(0.0, 0.0, 0.0);
+        let result = iso.transform_point(&origin);
+        assert!((result.x - 101.0).abs() < 1e-9, "expected x≈101, got {}", result.x);
+        assert!(result.y.abs() < 1e-9);
+        assert!(result.z.abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_build_dynamic_frame_map_two_hop() {
+        // facility at [50, 0, 0] km in IAU_EARTH.
+        // robot at [5, 0, 0] km in facility frame.
+        // Expected: robot origin in ECEF = [55, 0, 0] km.
+        let mut ledger = Ledger::new();
+        ledger.append(make_entity_batch(
+            "demo:facility", "IAU_EARTH",
+            [50.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
+        ));
+        ledger.append(make_entity_batch(
+            "demo:robot", "demo:facility",
+            [5.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
+        ));
+
+        let epoch = j2000();
+        let map = ledger.build_dynamic_frame_map(&["demo:robot"], epoch).unwrap();
+
+        let (root, iso) = map.get("demo:robot").unwrap();
+        assert_eq!(root, "IAU_EARTH");
+
+        let origin = nalgebra::Point3::new(0.0, 0.0, 0.0);
+        let result = iso.transform_point(&origin);
+        assert!((result.x - 55.0).abs() < 1e-9, "expected x≈55, got {}", result.x);
+    }
+
+    #[test]
+    fn test_build_dynamic_frame_map_entity_not_found() {
+        let ledger = Ledger::new();
+        let epoch = j2000();
+        let err = ledger.build_dynamic_frame_map(&["demo:ghost"], epoch).unwrap_err();
+        assert!(err.contains("demo:ghost"), "error should name the missing entity: {err}");
+    }
+
+    #[test]
+    fn test_build_dynamic_frame_map_cycle_detected() {
+        // A → B → A forms a cycle.
+        let mut ledger = Ledger::new();
+        ledger.append(make_entity_batch(
+            "demo:A", "demo:B", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
+        ));
+        ledger.append(make_entity_batch(
+            "demo:B", "demo:A", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
+        ));
+
+        let epoch = j2000();
+        let err = ledger.build_dynamic_frame_map(&["demo:A"], epoch).unwrap_err();
+        assert!(err.to_lowercase().contains("cycle"), "expected cycle error: {err}");
     }
 }
