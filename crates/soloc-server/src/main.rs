@@ -49,13 +49,23 @@ fn default_bind() -> String {
     "0.0.0.0:50051".to_string()
 }
 
-/// Persistence paths for the ledger and frame registry.
+/// Persistence configuration for the ledger and frame registry.
 ///
 /// When omitted the server runs entirely in memory and all data is lost on shutdown.
+///
+/// `ledger_url` takes priority over `ledger_path` when both are set.
 #[derive(Deserialize, Default)]
 struct StorageConfig {
-    /// Path to an Arrow IPC file for the ledger (`*.arrows`).
-    /// Loaded on startup if the file exists; saved on clean shutdown or `save_ledger` action.
+    /// Object-store URL for the ledger, e.g.:
+    ///   `s3://my-bucket/soloc/ledger.arrows`
+    ///   `gs://my-bucket/soloc/ledger.arrows`
+    ///   `az://my-container/soloc/ledger.arrows`
+    ///   `file:///var/data/ledger.arrows`
+    /// Loaded on startup; saved on clean shutdown or `save_ledger` action.
+    /// Credentials are resolved from the standard environment-variable chain.
+    ledger_url: Option<String>,
+    /// Local filesystem path for the ledger (`*.arrows`).
+    /// Used when `ledger_url` is not set.
     ledger_path: Option<String>,
     /// Path to a JSON file for the frame registry.
     /// Loaded on startup if the file exists; saved whenever the registry changes.
@@ -165,8 +175,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let registry_path = cfg.storage.registry_path.map(PathBuf::from);
     let ledger_path   = cfg.storage.ledger_path.map(PathBuf::from);
+    let ledger_url    = cfg.storage.ledger_url;
 
-    let state = Arc::new(ServerState::new(almanac, registry_path, ledger_path));
+    let state = Arc::new(ServerState::new(almanac, registry_path, ledger_path, ledger_url).await);
     let service = SolocFlightService::new(state.clone());
 
     // SIGTERM handler: drain in-flight requests then save the ledger.
@@ -181,7 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     eprintln!("soloc-server: shutdown signal received, saving ledger ...");
-    state.persist_ledger();
+    state.persist_ledger().await;
     eprintln!("soloc-server: goodbye");
 
     Ok(())

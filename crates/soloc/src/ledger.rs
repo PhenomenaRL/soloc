@@ -34,6 +34,7 @@ use hifitime::{Duration, Epoch};
 use nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::io::Cursor;
 use std::path::Path;
 
 use anise::prelude::Almanac;
@@ -582,6 +583,45 @@ impl Ledger {
 
         Ok(Self { batches })
     }
+
+    /// Serializes all batches to an in-memory Arrow IPC buffer.
+    ///
+    /// Equivalent to [`Ledger::save_ipc`] but writes to a `Vec<u8>` instead of a file.
+    /// Used by the S3 storage backend.
+    pub fn save_ipc_to_bytes(&self) -> Result<Vec<u8>, String> {
+        if self.batches.is_empty() {
+            return Err("Cannot save an empty ledger".to_string());
+        }
+        let schema = self.batches[0].schema();
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = FileWriter::try_new(&mut buf, &schema)
+                .map_err(|e| format!("Failed to create Arrow IPC writer: {e}"))?;
+            for batch in &self.batches {
+                writer.write(batch).map_err(|e| format!("Failed to write batch: {e}"))?;
+            }
+            writer.finish().map_err(|e| format!("Failed to finalise IPC: {e}"))?;
+        }
+        Ok(buf)
+    }
+
+    /// Deserializes a ledger from an in-memory Arrow IPC buffer.
+    ///
+    /// Equivalent to [`Ledger::load_ipc`] but reads from `&[u8]` instead of a file.
+    /// Used by the S3 storage backend.
+    pub fn load_ipc_from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let cursor = Cursor::new(bytes);
+        let reader = FileReader::try_new(cursor, None)
+            .map_err(|e| format!("Failed to open Arrow IPC reader: {e}"))?;
+        let mut batches = Vec::new();
+        for result in reader {
+            batches.push(result.map_err(|e| format!("Failed to read batch: {e}"))?);
+        }
+        if batches.is_empty() {
+            return Err("IPC bytes contained no record batches".to_string());
+        }
+        Ok(Self { batches })
+    }
 }
 
 fn estimate_type_priority(s: &str) -> u8 {
@@ -781,6 +821,17 @@ mod tests {
             ledger.append(make_batch([i as f64, 0.0, 0.0], i as u64));
         }
         assert_eq!(ledger.len(), SEGMENT_THRESHOLD);
+    }
+
+    #[test]
+    fn test_save_and_load_ipc_from_bytes_round_trip() {
+        let mut ledger = Ledger::new();
+        ledger.append(make_batch([1.0, 2.0, 3.0], 0));
+        ledger.append(make_batch([4.0, 5.0, 6.0], 1000));
+
+        let bytes = ledger.save_ipc_to_bytes().unwrap();
+        let loaded = Ledger::load_ipc_from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.len(), 2);
     }
 
     #[test]
