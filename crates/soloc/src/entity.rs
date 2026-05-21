@@ -45,7 +45,7 @@ pub fn entity_schema(registry: Option<&FrameRegistry>) -> SchemaRef {
     let sts = sts_schema(registry);
 
     Arc::new(Schema::new(vec![
-        // Dictionary encoded string URI (e.g., "urn:soloc:nasa:perseverance")
+        // Federated entity ID (e.g., "nasa.gov:perseverance" or "naif:499" for Mars)
         Field::new(
             "entity_id",
             DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
@@ -296,11 +296,11 @@ mod tests {
 
         // Row 1: Planet (has velocity, no acceleration)
         builder.append_entity(
-            "urn:soloc:earth",
+            "naif:399",
             "ICRF",
             "km",
             "TDB",
-            "anise_ephemeris",
+            "naif:de440s",
             "PREDICTED",
             [1.0, 0.0, 0.0],
             [1.0, 0.0, 0.0, 0.0],
@@ -315,11 +315,11 @@ mod tests {
 
         // Row 2: IoT Sensor (only has pose, everything else null)
         builder.append_entity(
-            "urn:soloc:sensor_1",
+            "demo:sensor_1",
             "IAU_MARS",
             "m",
             "TAI",
-            "sensor_1",
+            "demo:sensor_1",
             "MEASURED",
             [1.2, 0.0, 0.0],
             [1.0, 0.0, 0.0, 0.0],
@@ -349,11 +349,11 @@ mod tests {
     fn test_entity_batch_validation() {
         let mut builder = EntityBuilder::new(10, None);
         builder.append_entity(
-            "urn:soloc:earth",
+            "naif:399",
             "ICRF",
             "km",
             "TDB",
-            "anise",
+            "naif:de440s",
             "PREDICTED",
             [1.0, 0.0, 0.0],
             [1.0, 0.0, 0.0, 0.0],

@@ -221,7 +221,7 @@ mod tests {
 
         // Entity 0: a spacecraft with velocity (will be propagated)
         builder.append_entity(
-            "urn:soloc:test:ship_a",
+            "demo:ship_a",
             "ICRF",
             "km",
             "TAI",
@@ -240,7 +240,7 @@ mod tests {
 
         // Entity 1: a static reference point (no velocity)
         builder.append_entity(
-            "urn:soloc:test:ground_station",
+            "demo:ground_station",
             "ICRF",
             "km",
             "TAI",

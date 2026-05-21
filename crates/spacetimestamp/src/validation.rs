@@ -64,7 +64,7 @@ pub fn validate_spacetimestamp_batch(batch: &RecordBatch) -> Result<(), String> 
             // d) Entity URI — a forward-reference to another entity in the ledger whose pose
             // defines this frame at query time. Resolution is deferred to transform_batch /
             // Ledger::build_dynamic_frame_map; we accept it here unconditionally.
-            if frame_str.starts_with("urn:") {
+            if crate::schema::is_entity_uri(frame_str) {
                 continue;
             }
 
@@ -154,7 +154,7 @@ mod tests {
     fn test_entity_uri_frame_is_valid() {
         let mut builder = SpaceTimestampBuilder::new(1, None);
         builder.append_spacetimestamp(
-            "urn:soloc:truck_A",
+            "demo:truck_A",
             "m",
             "TAI",
             "sensor_1",

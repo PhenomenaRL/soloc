@@ -50,7 +50,7 @@ fn main() -> eframe::Result<()> {
     let mut builder = EntityBuilder::new(2, None);
 
     builder.append_entity(
-        "urn:soloc:viz:spacecraft",
+        "demo:spacecraft",
         "ICRF", "km", "TAI",
         "soloc-viz", "MEASURED",
         sc_pos,
@@ -63,7 +63,7 @@ fn main() -> eframe::Result<()> {
     );
 
     builder.append_entity(
-        "urn:soloc:viz:earth",
+        "naif:399",
         "ICRF", "km", "TAI",
         "soloc-viz", "MEASURED",
         earth_pos,

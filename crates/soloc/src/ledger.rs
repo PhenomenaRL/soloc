@@ -325,7 +325,7 @@ impl Ledger {
                 "Entity '{entity_id}' not found in ledger at or before {epoch}"
             ))?;
 
-        if parent_frame.starts_with("urn:") {
+        if spacetimestamp::schema::is_entity_uri(&parent_frame) {
             // Parent is another entity — recurse to get its composed isometry.
             self.resolve_chain(&parent_frame, epoch, result, visiting)?;
             let (root_frame, parent_iso) = result[&parent_frame].clone();

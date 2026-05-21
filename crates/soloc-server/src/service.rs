@@ -204,7 +204,7 @@ fn build_dynamic_frames_for_batch(
     let uri_frames: HashSet<&str> = (0..frames_dict.len())
         .filter(|&i| !frames_dict.is_null(i))
         .map(|i| frames_dict.value(i))
-        .filter(|s| s.starts_with("urn:"))
+        .filter(|s| spacetimestamp::schema::is_entity_uri(s))
         .collect();
 
     if uri_frames.is_empty() {

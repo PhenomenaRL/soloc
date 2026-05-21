@@ -17,11 +17,11 @@ fn make_entity_batch(n_rows: usize, t_offset_ns: u64) -> RecordBatch {
     for i in 0..n_rows {
         let angle = (i as f64) * 2.0 * std::f64::consts::PI / (n_rows as f64);
         builder.append_entity(
-            "urn:soloc:bench_sat",
+            "demo:bench_sat",
             "ICRF",
             "km",
             "TAI",
-            "urn:soloc:bench_sat",
+            "demo:bench_sat",
             "SIMULATED",
             [6800.0 * angle.cos(), 6800.0 * angle.sin(), 0.0],
             [1.0, 0.0, 0.0, 0.0],

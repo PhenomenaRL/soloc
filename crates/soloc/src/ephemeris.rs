@@ -6,7 +6,7 @@
 //! batch and can be appended directly to a [`crate::ledger::Ledger`].
 //!
 //! Celestial bodies are not special — they are entities like any other, recorded with the same
-//! schema as a spacecraft or robot. The only distinction is `source_id = "anise"` and
+//! schema as a spacecraft or robot. The only distinction is `source_id = "naif:de440s"` and
 //! `estimate_type = "MEASURED"` (ephemeris data is derived from real observations).
 //!
 //! # Ephemeris data
@@ -122,18 +122,21 @@ impl CelestialBody {
     }
 
     /// Canonical entity ID for this body as stored in the soloc ledger.
+    ///
+    /// Uses NAIF body-center IDs (`naif:<id>`) as the globally unique identifier.
+    /// These IDs are recognized by all soloc instances without any namespace configuration.
     pub fn entity_id(self) -> &'static str {
         match self {
-            CelestialBody::Sun     => "urn:soloc:solar_system:sun",
-            CelestialBody::Mercury => "urn:soloc:solar_system:mercury",
-            CelestialBody::Venus   => "urn:soloc:solar_system:venus",
-            CelestialBody::Earth   => "urn:soloc:solar_system:earth",
-            CelestialBody::Moon    => "urn:soloc:solar_system:moon",
-            CelestialBody::Mars    => "urn:soloc:solar_system:mars",
-            CelestialBody::Jupiter => "urn:soloc:solar_system:jupiter",
-            CelestialBody::Saturn  => "urn:soloc:solar_system:saturn",
-            CelestialBody::Uranus  => "urn:soloc:solar_system:uranus",
-            CelestialBody::Neptune => "urn:soloc:solar_system:neptune",
+            CelestialBody::Sun     => "naif:10",
+            CelestialBody::Mercury => "naif:199",
+            CelestialBody::Venus   => "naif:299",
+            CelestialBody::Earth   => "naif:399",
+            CelestialBody::Moon    => "naif:301",
+            CelestialBody::Mars    => "naif:499",
+            CelestialBody::Jupiter => "naif:599",
+            CelestialBody::Saturn  => "naif:699",
+            CelestialBody::Uranus  => "naif:799",
+            CelestialBody::Neptune => "naif:899",
         }
     }
 
@@ -184,7 +187,7 @@ fn epoch_to_parts(epoch: Epoch) -> (i16, u64) {
 /// [`RecordBatch`].
 ///
 /// All rows use `frame_id = "ICRF"`, `units_pos = "km"`, `timescale_id = "TAI"`,
-/// `source_id = "anise"`, and `estimate_type = "MEASURED"`.
+/// `source_id = "naif:de440s"`, and `estimate_type = "MEASURED"`.
 ///
 /// - **Position**: body center relative to the Solar System Barycentre (SSB), from DE440.
 /// - **Velocity**: body-center linear velocity from DE440.
@@ -269,7 +272,7 @@ pub fn celestial_snapshot(
             "ICRF",
             "km",
             "TAI",
-            "anise",
+            "naif:de440s",
             "MEASURED",
             [state.radius_km.x, state.radius_km.y, state.radius_km.z],
             [q.w, q.i, q.j, q.k],
@@ -291,7 +294,7 @@ pub fn celestial_snapshot(
 ///
 /// Each entry in `bodies` is a `(naif_id, entity_id)` pair — `naif_id` is the NAIF integer
 /// ID of the body (e.g. `2099942` for Apophis, `599` for Jupiter center), and `entity_id`
-/// is the URI to store in the ledger (e.g. `"urn:soloc:asteroid:apophis"`).
+/// is the URI to store in the ledger (e.g. `"naif:2099942"` for Apophis, or `"jpl-sb:2004-MN4"`).
 ///
 /// Unlike [`celestial_snapshot`], orientation silently falls back to the identity quaternion
 /// and `angular_velocity` to `None` when the loaded PCK has no rotation model for the
@@ -406,12 +409,12 @@ mod tests {
     }
 
     #[test]
-    fn test_entity_ids_are_urns() {
+    fn test_entity_ids_use_naif_prefix() {
         for body in CelestialBody::ALL {
             let id = body.entity_id();
             assert!(
-                id.starts_with("urn:soloc:solar_system:"),
-                "{id:?} does not match expected URN prefix"
+                id.starts_with("naif:"),
+                "{id:?} does not match expected naif: prefix"
             );
         }
     }

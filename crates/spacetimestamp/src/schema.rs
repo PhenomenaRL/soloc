@@ -293,6 +293,17 @@ impl FrameRegistry {
     }
 }
 
+/// Returns `true` if `id` is a federated entity URI rather than an astronomical frame name.
+///
+/// Entity URIs contain a `:` separating the authority (`naif`, `norad`, `acme.com`, …) from
+/// the local path. Astronomical frame names (`ICRF`, `IAU_EARTH`, `J2000`) never contain `:`.
+///
+/// Used by frame-resolution code to decide whether to look up `id` in the ledger (entity URI)
+/// or pass it directly to the anise almanac (astronomical frame name).
+pub fn is_entity_uri(id: &str) -> bool {
+    id.contains(':')
+}
+
 /// Appends one nullable 6-element covariance entry to a `FixedSizeListBuilder`.
 fn append_optional_cov6(builder: &mut FixedSizeListBuilder<Float64Builder>, value: Option<[f64; 6]>) {
     match value {

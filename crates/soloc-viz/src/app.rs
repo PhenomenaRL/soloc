@@ -149,8 +149,8 @@ fn extract_entities_inner(snap: &RecordBatch, scale: f64) -> Option<Vec<(String,
     let result = (0..snap.num_rows())
         .map(|i| {
             let full_id = entity_dict.value(entity_col.keys().value(i) as usize);
-            // Trim URI prefix for display: "urn:soloc:viz:spacecraft" → "spacecraft"
-            let label = full_id.split(':').last().unwrap_or(full_id).to_string();
+            // Trim namespace prefix for display: "demo:spacecraft" → "spacecraft", "naif:399" → "399"
+            let label = full_id.split_once(':').map(|(_, local)| local).unwrap_or(full_id).to_string();
             let base = (offset + i) * 3;
             let x = pos_vals.value(base) * scale;
             let y = pos_vals.value(base + 1) * scale;
