@@ -36,7 +36,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 
+use anise::prelude::Almanac;
 use spacetimestamp::query::{SpatiotemporalFilter, filter_batch};
+use spacetimestamp::schema::is_entity_uri;
+use spacetimestamp::transforms::transform_batch;
 
 /// Merge batches in memory when the count exceeds this to keep query latency bounded.
 ///
@@ -181,6 +184,66 @@ impl Ledger {
             .collect();
 
         RecordBatch::try_new(last.schema(), filtered.ok()?).ok()
+    }
+
+    /// Seeds the ledger with a celestial body snapshot at the given epoch.
+    ///
+    /// Equivalent to calling [`crate::ephemeris::celestial_snapshot`] and appending the result.
+    /// This is the recommended way to initialise a ledger for simulation or analysis without
+    /// a running server.
+    ///
+    /// ```rust,ignore
+    /// let almanac = MetaAlmanac::latest()?;
+    /// let mut ledger = Ledger::new();
+    /// ledger.seed_solar_system(&almanac, CelestialBody::ALL, epoch)?;
+    /// ```
+    pub fn seed_solar_system(
+        &mut self,
+        almanac: &Almanac,
+        bodies: &[crate::ephemeris::CelestialBody],
+        epoch: Epoch,
+    ) -> Result<(), String> {
+        let batch = crate::ephemeris::celestial_snapshot(almanac, bodies, epoch)?;
+        self.append(batch);
+        Ok(())
+    }
+
+    /// Transforms `batch` into `target_frame`, resolving any entity-URI frame chains
+    /// against this ledger's current contents.
+    ///
+    /// This is the in-process equivalent of the server's `DoExchange` endpoint. The caller
+    /// supplies the almanac so the ledger itself remains a pure data store.
+    ///
+    /// Entity-URI `frame_id` values (e.g. `"demo:truck_A"`) are resolved by looking up
+    /// the parent entity's latest pose in the ledger at the batch's epoch and composing
+    /// the isometry chain. Static [`spacetimestamp::schema::FrameRegistry`] entries embedded
+    /// in `batch`'s schema metadata are honoured automatically.
+    ///
+    /// ```rust,ignore
+    /// let result = ledger.transform(&my_batch, "spacetimestamp", "ICRF", "km", &almanac)?;
+    /// ```
+    pub fn transform(
+        &self,
+        batch: &RecordBatch,
+        sts_column: &str,
+        target_frame: &str,
+        target_units: &str,
+        almanac: &Almanac,
+    ) -> Result<RecordBatch, String> {
+        // Extract the epoch from the first row so dynamic frame lookup is time-consistent.
+        let epoch = epoch_from_batch(batch, sts_column);
+
+        // Collect unique entity-URI frame_ids from the batch's frame_id dictionary.
+        let uri_frames = collect_uri_frames(batch, sts_column);
+
+        let dynamic_frames = if uri_frames.is_empty() {
+            None
+        } else {
+            let ids: Vec<&str> = uri_frames.iter().map(|s| s.as_str()).collect();
+            Some(self.build_dynamic_frame_map(&ids, epoch)?)
+        };
+
+        transform_batch(batch, sts_column, target_frame, almanac, target_units, dynamic_frames.as_ref())
     }
 
     /// Returns the pose of `entity_id` at the latest timestamp ≤ `epoch` as an
@@ -388,6 +451,60 @@ impl Ledger {
 
         Ok(Self { batches })
     }
+}
+
+/// Extracts the epoch from the first row of the spacetimestamp struct column.
+/// Falls back to J2000 TAI if the column or fields are absent.
+fn epoch_from_batch(batch: &RecordBatch, sts_column: &str) -> Epoch {
+    let j2000 = Epoch::from_gregorian_tai(2000, 1, 1, 12, 0, 0, 0);
+    if batch.num_rows() == 0 {
+        return j2000;
+    }
+    let Some(sts) = batch
+        .column_by_name(sts_column)
+        .and_then(|c| c.as_any().downcast_ref::<StructArray>())
+    else {
+        return j2000;
+    };
+    let cent = sts
+        .column_by_name("duration_centuries")
+        .and_then(|c| c.as_any().downcast_ref::<Int16Array>())
+        .map(|a| a.value(0))
+        .unwrap_or(0);
+    let ns = sts
+        .column_by_name("duration_ns")
+        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        .map(|a| a.value(0))
+        .unwrap_or(0);
+    j2000 + Duration::from_parts(cent, ns)
+}
+
+/// Returns the set of unique entity-URI values present in the frame_id dictionary
+/// of the spacetimestamp struct column. These are the frames that need ledger resolution.
+fn collect_uri_frames(batch: &RecordBatch, sts_column: &str) -> Vec<String> {
+    let Some(sts) = batch
+        .column_by_name(sts_column)
+        .and_then(|c| c.as_any().downcast_ref::<StructArray>())
+    else {
+        return vec![];
+    };
+    let Some(frames) = sts
+        .column_by_name("frame_id")
+        .and_then(|c| c.as_any().downcast_ref::<DictionaryArray<UInt32Type>>())
+    else {
+        return vec![];
+    };
+    let Some(dict) = frames.values().as_any().downcast_ref::<StringArray>() else {
+        return vec![];
+    };
+    (0..dict.len())
+        .filter(|&i| !dict.is_null(i))
+        .map(|i| dict.value(i))
+        .filter(|s| is_entity_uri(s))
+        .map(|s| s.to_string())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]

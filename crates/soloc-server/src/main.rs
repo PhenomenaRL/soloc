@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anise::almanac::Almanac;
 use anise::almanac::metaload::MetaAlmanac;
 use arrow_flight::flight_service_server::FlightServiceServer;
+use serde::Deserialize;
 use tokio::signal::unix::{SignalKind, signal};
 use tonic::transport::Server;
 
@@ -13,36 +14,128 @@ mod state;
 use service::SolocFlightService;
 use state::ServerState;
 
-/// Loads the Almanac from the environment.
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+/// Server configuration loaded from `config.toml` (or `$SOLOC_CONFIG`).
 ///
-/// Resolution order:
-/// 1. `SOLOC_KERNEL_PATHS` — colon-separated list of local BSP/PCK/BPC files.
-///    Use this in production (ECS) where kernels are mounted from EFS or bundled
-///    in the image. No network access required.
-/// 2. `MetaAlmanac::latest()` — downloads DE440s + high-precision Earth/Moon kernels
-///    from NAIF and caches them locally. Convenient for local development.
-/// 3. Empty `Almanac::default()` with a warning — server starts but all
-///    astronomical frame transforms will fail at call time.
-fn load_almanac() -> Almanac {
-    if let Ok(kernel_paths) = std::env::var("SOLOC_KERNEL_PATHS") {
+/// All fields are optional and fall back to sensible defaults so the server
+/// can start with zero configuration for local development.
+#[derive(Deserialize, Default)]
+struct Config {
+    #[serde(default)]
+    server: ServerConfig,
+    #[serde(default)]
+    storage: StorageConfig,
+    #[serde(default)]
+    ephemeris: EphemerisConfig,
+}
+
+#[derive(Deserialize)]
+struct ServerConfig {
+    /// TCP address to bind. Default: `0.0.0.0:50051`.
+    #[serde(default = "default_bind")]
+    bind: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self { bind: default_bind() }
+    }
+}
+
+fn default_bind() -> String {
+    "0.0.0.0:50051".to_string()
+}
+
+/// Persistence paths for the ledger and frame registry.
+///
+/// When omitted the server runs entirely in memory and all data is lost on shutdown.
+#[derive(Deserialize, Default)]
+struct StorageConfig {
+    /// Path to an Arrow IPC file for the ledger (`*.arrows`).
+    /// Loaded on startup if the file exists; saved on clean shutdown or `save_ledger` action.
+    ledger_path: Option<String>,
+    /// Path to a JSON file for the frame registry.
+    /// Loaded on startup if the file exists; saved whenever the registry changes.
+    registry_path: Option<String>,
+}
+
+/// Ephemeris kernel configuration.
+///
+/// Resolution order for kernels:
+/// 1. `kernels` list in `config.toml`
+/// 2. `SOLOC_KERNEL_PATHS` environment variable (colon-separated paths)
+/// 3. `MetaAlmanac::latest()` — downloads DE440s + PCK files on first run (~150 MB cached)
+/// 4. Empty almanac with a warning — server starts but astronomical transforms will fail
+#[derive(Deserialize, Default)]
+struct EphemerisConfig {
+    /// List of local BSP/PCK/BPC kernel file paths.
+    /// Use in production (ECS/EFS) where kernels are pre-mounted.
+    #[serde(default)]
+    kernels: Vec<String>,
+}
+
+/// Loads config from (in order): `$SOLOC_CONFIG`, `./config.toml`, or returns defaults.
+fn load_config() -> Config {
+    let path = std::env::var("SOLOC_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("config.toml"));
+
+    if path.exists() {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match toml::from_str::<Config>(&text) {
+                Ok(cfg) => {
+                    eprintln!("soloc-server: loaded config from {:?}", path);
+                    return cfg;
+                }
+                Err(e) => eprintln!("soloc-server: WARNING — failed to parse {:?}: {e}", path),
+            },
+            Err(e) => eprintln!("soloc-server: WARNING — failed to read {:?}: {e}", path),
+        }
+    }
+
+    Config::default()
+}
+
+// ---------------------------------------------------------------------------
+// Almanac loading
+// ---------------------------------------------------------------------------
+
+fn load_almanac(cfg: &EphemerisConfig) -> Almanac {
+    // 1. Explicit kernel list from config.
+    if !cfg.kernels.is_empty() {
         let mut almanac = Almanac::default();
-        for path in kernel_paths.split(':').filter(|p| !p.is_empty()) {
-            // Clone before load: Almanac::load takes ownership and gives no way to
-            // recover the original on error, so we keep the pre-load state alive.
+        for path in &cfg.kernels {
             match almanac.clone().load(path) {
                 Ok(loaded) => {
                     eprintln!("soloc-server: loaded kernel {path}");
                     almanac = loaded;
                 }
-                Err(e) => {
-                    eprintln!("soloc-server: WARNING — failed to load kernel '{path}': {e}");
-                }
+                Err(e) => eprintln!("soloc-server: WARNING — failed to load kernel '{path}': {e}"),
             }
         }
         return almanac;
     }
 
-    eprintln!("soloc-server: SOLOC_KERNEL_PATHS not set, attempting MetaAlmanac::latest() ...");
+    // 2. Fall back to SOLOC_KERNEL_PATHS env var.
+    if let Ok(kernel_paths) = std::env::var("SOLOC_KERNEL_PATHS") {
+        let mut almanac = Almanac::default();
+        for path in kernel_paths.split(':').filter(|p| !p.is_empty()) {
+            match almanac.clone().load(path) {
+                Ok(loaded) => {
+                    eprintln!("soloc-server: loaded kernel {path}");
+                    almanac = loaded;
+                }
+                Err(e) => eprintln!("soloc-server: WARNING — failed to load kernel '{path}': {e}"),
+            }
+        }
+        return almanac;
+    }
+
+    // 3. MetaAlmanac auto-download.
+    eprintln!("soloc-server: no kernels configured, attempting MetaAlmanac::latest() ...");
     match MetaAlmanac::latest() {
         Ok(almanac) => {
             eprintln!("soloc-server: MetaAlmanac loaded successfully");
@@ -52,29 +145,32 @@ fn load_almanac() -> Almanac {
             eprintln!(
                 "soloc-server: WARNING — MetaAlmanac::latest() failed ({e}). \
                  Astronomical frame transforms will not work. \
-                 Set SOLOC_KERNEL_PATHS to one or more BSP/PCK files (colon-separated)."
+                 Set 'ephemeris.kernels' in config.toml or SOLOC_KERNEL_PATHS."
             );
             Almanac::default()
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "0.0.0.0:50051".parse()?;
-    let almanac = load_almanac();
+    let cfg = load_config();
 
-    // argv[1]: registry JSON path (optional, persists frame registry across restarts)
-    // argv[2]: ledger IPC path   (optional, auto-loads on start, saves on SIGTERM)
-    let registry_path: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
-    let ledger_path: Option<PathBuf> = std::env::args().nth(2).map(PathBuf::from);
+    let addr = cfg.server.bind.parse()?;
+    let almanac = load_almanac(&cfg.ephemeris);
+
+    let registry_path = cfg.storage.registry_path.map(PathBuf::from);
+    let ledger_path   = cfg.storage.ledger_path.map(PathBuf::from);
 
     let state = Arc::new(ServerState::new(almanac, registry_path, ledger_path));
     let service = SolocFlightService::new(state.clone());
 
-    // Register SIGTERM handler. When the signal fires, the shutdown future resolves,
-    // tonic drains in-flight requests, then serve_with_shutdown returns and we save
-    // the ledger. This is the safety-net path; the nominal path is DoAction("save_ledger").
+    // SIGTERM handler: drain in-flight requests then save the ledger.
+    // This is the safety-net path; the nominal path is DoAction("save_ledger").
     let mut sigterm = signal(SignalKind::terminate())?;
     let shutdown = async move { sigterm.recv().await; };
 
