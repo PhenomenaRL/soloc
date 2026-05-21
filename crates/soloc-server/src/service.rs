@@ -80,6 +80,14 @@ struct ExchangeDescriptor {
     sts_column: String,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum QueryType {
+    #[default]
+    Filter,
+    CurrentState,
+}
+
 #[derive(Deserialize)]
 struct GetTicket {
     #[serde(default)]
@@ -90,6 +98,12 @@ struct GetTicket {
     spatial_radius: Option<f64>,
     #[serde(default = "default_sts_column")]
     sts_column: String,
+    #[serde(default)]
+    query_type: QueryType,
+    #[serde(default)]
+    entity_ids: Option<Vec<String>>,
+    #[serde(default)]
+    not_before_tai_s: Option<f64>,
 }
 
 fn default_km() -> String {
@@ -329,12 +343,31 @@ impl FlightService for SolocFlightService {
                 .ledger
                 .read()
                 .map_err(|_| Status::internal("ledger lock poisoned"))?;
-            ledger
-                .stream_query(&filter, &ticket.sts_column)
-                .filter_map(|r| r.ok())
-                .filter(|b| b.num_rows() > 0)
-                .map(|b| inject_registry(&b, &registry))
-                .collect::<Result<Vec<_>, _>>()?
+            match ticket.query_type {
+                QueryType::Filter => ledger
+                    .stream_query(&filter, &ticket.sts_column)
+                    .filter_map(|r| r.ok())
+                    .filter(|b| b.num_rows() > 0)
+                    .map(|b| inject_registry(&b, &registry))
+                    .collect::<Result<Vec<_>, _>>()?,
+                QueryType::CurrentState => {
+                    let entity_ids_refs: Option<Vec<&str>> = ticket
+                        .entity_ids
+                        .as_ref()
+                        .map(|v| v.iter().map(|s| s.as_str()).collect());
+                    let entity_ids: Option<&[&str]> = entity_ids_refs.as_deref();
+                    let not_before =
+                        ticket.not_before_tai_s.map(hifitime::Epoch::from_tai_seconds);
+                    let result = ledger
+                        .current_state(entity_ids, not_before)
+                        .map_err(|e| Status::internal(format!("current_state failed: {e}")))?;
+                    if result.num_rows() == 0 {
+                        vec![]
+                    } else {
+                        vec![inject_registry(&result, &registry)?]
+                    }
+                }
+            }
         };
 
         let out_stream = FlightDataEncoderBuilder::new()

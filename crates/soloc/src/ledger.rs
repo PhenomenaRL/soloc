@@ -430,6 +430,137 @@ impl Ledger {
         Ok(())
     }
 
+    /// Returns the single best pose per entity across the entire ledger.
+    ///
+    /// "Best" is determined by:
+    /// 1. Most recent timestamp (highest `duration_centuries` / `duration_ns`).
+    /// 2. For equal timestamps, source priority: `MEASURED` > `PREDICTED` > `SIMULATED`.
+    /// 3. For equal timestamps and equal priority, later insertion order wins.
+    ///
+    /// `entity_ids`: if `Some`, only the listed entity IDs are included; `None` = all.
+    /// `not_before`: rows whose timestamp is strictly before this epoch are excluded.
+    ///
+    /// Returns an empty batch (correct schema, 0 rows) when the ledger has data but no rows
+    /// match the filters.
+    pub fn current_state(
+        &self,
+        entity_ids: Option<&[&str]>,
+        not_before: Option<Epoch>,
+    ) -> Result<RecordBatch, String> {
+        if self.batches.is_empty() {
+            return Err("Ledger is empty".to_string());
+        }
+
+        let j2000 = Epoch::from_gregorian_tai(2000, 1, 1, 12, 0, 0, 0);
+        let cutoff: Option<Duration> = not_before.map(|ep| ep - j2000);
+        let entity_filter: Option<HashSet<&str>> =
+            entity_ids.map(|ids| ids.iter().copied().collect());
+
+        // entity_id → (epoch_dur, priority, batch_idx, row_idx)
+        let mut best: HashMap<String, (Duration, u8, usize, usize)> = HashMap::new();
+
+        for (batch_idx, batch) in self.batches.iter().enumerate() {
+            let Some(eid_col) = batch
+                .column_by_name("entity_id")
+                .and_then(|c| c.as_any().downcast_ref::<DictionaryArray<UInt32Type>>())
+            else {
+                continue;
+            };
+            let Some(eid_dict) = eid_col.values().as_any().downcast_ref::<StringArray>() else {
+                continue;
+            };
+
+            let Some(sts) = batch
+                .column_by_name("spacetimestamp")
+                .and_then(|c| c.as_any().downcast_ref::<StructArray>())
+            else {
+                continue;
+            };
+            let Some(cent_arr) = sts
+                .column_by_name("duration_centuries")
+                .and_then(|c| c.as_any().downcast_ref::<Int16Array>())
+            else {
+                continue;
+            };
+            let Some(ns_arr) = sts
+                .column_by_name("duration_ns")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            else {
+                continue;
+            };
+            let Some(et_col) = sts
+                .column_by_name("estimate_type")
+                .and_then(|c| c.as_any().downcast_ref::<DictionaryArray<UInt16Type>>())
+            else {
+                continue;
+            };
+            let Some(et_dict) = et_col.values().as_any().downcast_ref::<StringArray>() else {
+                continue;
+            };
+
+            for row in 0..batch.num_rows() {
+                let eid = eid_dict.value(eid_col.keys().value(row) as usize);
+
+                if let Some(ref filter) = entity_filter {
+                    if !filter.contains(eid) {
+                        continue;
+                    }
+                }
+
+                let dur = Duration::from_parts(cent_arr.value(row), ns_arr.value(row));
+
+                if let Some(c) = cutoff {
+                    if dur < c {
+                        continue;
+                    }
+                }
+
+                let et = et_dict.value(et_col.keys().value(row) as usize);
+                let priority = estimate_type_priority(et);
+
+                let update = match best.get(eid) {
+                    None => true,
+                    Some(&(best_dur, best_pri, _, _)) => {
+                        dur > best_dur || (dur == best_dur && priority < best_pri)
+                    }
+                };
+
+                if update {
+                    best.insert(eid.to_string(), (dur, priority, batch_idx, row));
+                }
+            }
+        }
+
+        let schema = self.batches[0].schema();
+
+        if best.is_empty() {
+            return Ok(RecordBatch::new_empty(schema));
+        }
+
+        let mut rows: Vec<RecordBatch> = Vec::with_capacity(best.len());
+        for (_, _, batch_idx, row_idx) in best.values() {
+            let batch = &self.batches[*batch_idx];
+            let mut mask = BooleanBuilder::with_capacity(batch.num_rows());
+            for i in 0..batch.num_rows() {
+                mask.append_value(i == *row_idx);
+            }
+            let mask = mask.finish();
+            let cols: Result<Vec<_>, _> = batch
+                .columns()
+                .iter()
+                .map(|col| arrow::compute::filter(col.as_ref(), &mask))
+                .collect();
+            let cols = cols.map_err(|e| format!("row extraction failed: {e}"))?;
+            rows.push(
+                RecordBatch::try_new(batch.schema(), cols)
+                    .map_err(|e| format!("failed to build result row: {e}"))?,
+            );
+        }
+
+        arrow::compute::concat_batches(&schema, &rows)
+            .map_err(|e| format!("failed to concatenate current_state rows: {e}"))
+    }
+
     /// Loads a ledger from an Arrow IPC file previously saved with [`Ledger::save_ipc`].
     pub fn load_ipc(path: &Path) -> Result<Self, String> {
         let file = File::open(path)
@@ -450,6 +581,14 @@ impl Ledger {
         }
 
         Ok(Self { batches })
+    }
+}
+
+fn estimate_type_priority(s: &str) -> u8 {
+    match s {
+        "MEASURED" => 0,
+        "PREDICTED" => 1,
+        _ => 2, // SIMULATED or unknown
     }
 }
 
@@ -757,5 +896,144 @@ mod tests {
         let epoch = j2000();
         let err = ledger.build_dynamic_frame_map(&["demo:A"], epoch).unwrap_err();
         assert!(err.to_lowercase().contains("cycle"), "expected cycle error: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // current_state tests
+    // -----------------------------------------------------------------------
+
+    fn make_entity_batch_et(
+        entity_id: &str,
+        pos: [f64; 3],
+        ns: u64,
+        estimate_type: &str,
+    ) -> RecordBatch {
+        use crate::entity::EntityBuilder;
+        let mut b = EntityBuilder::new(1, None);
+        b.append_entity(
+            entity_id, "ICRF", "km", "TAI", "test:src", estimate_type,
+            pos, [1.0, 0.0, 0.0, 0.0], 0, ns,
+            None, None, None, None, None,
+        );
+        b.flush()
+    }
+
+    #[test]
+    fn test_current_state_latest_wins() {
+        let mut ledger = Ledger::new();
+        ledger.append(make_entity_batch_et("demo:sat", [1.0, 0.0, 0.0], 1000, "MEASURED"));
+        ledger.append(make_entity_batch_et("demo:sat", [2.0, 0.0, 0.0], 5000, "MEASURED"));
+
+        let result = ledger.current_state(None, None).unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        // Verify the later timestamp's position was selected.
+        let sts = result
+            .column_by_name("spacetimestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .unwrap();
+        let ns_arr = sts
+            .column_by_name("duration_ns")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(ns_arr.value(0), 5000);
+    }
+
+    #[test]
+    fn test_current_state_priority_wins_same_epoch() {
+        // MEASURED arrives first (batch 0); SIMULATED arrives second (batch 1) — same timestamp.
+        // MEASURED must win because its priority (0) < SIMULATED priority (2).
+        let mut ledger = Ledger::new();
+        ledger.append(make_entity_batch_et("demo:sat", [1.0, 0.0, 0.0], 3000, "MEASURED"));
+        ledger.append(make_entity_batch_et("demo:sat", [9.0, 0.0, 0.0], 3000, "SIMULATED"));
+
+        let result = ledger.current_state(None, None).unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        // MEASURED row has position [1,0,0]; SIMULATED has [9,0,0].
+        let sts = result
+            .column_by_name("spacetimestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .unwrap();
+        let et_col = sts
+            .column_by_name("estimate_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt16Type>>()
+            .unwrap();
+        let et_dict = et_col.values().as_any().downcast_ref::<StringArray>().unwrap();
+        let et = et_dict.value(et_col.keys().value(0) as usize);
+        assert_eq!(et, "MEASURED");
+    }
+
+    #[test]
+    fn test_current_state_staleness_cutoff() {
+        let mut ledger = Ledger::new();
+        ledger.append(make_entity_batch_et("demo:sat", [1.0, 0.0, 0.0], 100, "MEASURED"));
+        ledger.append(make_entity_batch_et("demo:sat", [2.0, 0.0, 0.0], 2000, "MEASURED"));
+
+        // Cutoff: only rows at or after ns=500 are accepted.
+        let cutoff = j2000() + Duration::from_parts(0, 500);
+        let result = ledger.current_state(None, Some(cutoff)).unwrap();
+        assert_eq!(result.num_rows(), 1);
+
+        let sts = result
+            .column_by_name("spacetimestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .unwrap();
+        let ns_arr = sts
+            .column_by_name("duration_ns")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(ns_arr.value(0), 2000);
+    }
+
+    #[test]
+    fn test_current_state_all_entities() {
+        let mut ledger = Ledger::new();
+        // Batch 0: entity A and B.
+        use crate::entity::EntityBuilder;
+        let batch0 = {
+            let mut b = EntityBuilder::new(2, None);
+            b.append_entity("demo:A", "ICRF", "km", "TAI", "src", "MEASURED",
+                [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 100,
+                None, None, None, None, None);
+            b.append_entity("demo:B", "ICRF", "km", "TAI", "src", "MEASURED",
+                [2.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 100,
+                None, None, None, None, None);
+            b.flush()
+        };
+        ledger.append(batch0);
+        // Batch 1: entity C only.
+        ledger.append(make_entity_batch_et("demo:C", [3.0, 0.0, 0.0], 200, "SIMULATED"));
+
+        let result = ledger.current_state(None, None).unwrap();
+        assert_eq!(result.num_rows(), 3, "expected one row per entity");
+
+        // Verify entity IDs are all present.
+        let eid_col = result
+            .column_by_name("entity_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+            .unwrap();
+        let eid_dict = eid_col.values().as_any().downcast_ref::<StringArray>().unwrap();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for row in 0..result.num_rows() {
+            seen.insert(eid_dict.value(eid_col.keys().value(row) as usize).to_string());
+        }
+        assert!(seen.contains("demo:A"));
+        assert!(seen.contains("demo:B"));
+        assert!(seen.contains("demo:C"));
     }
 }
