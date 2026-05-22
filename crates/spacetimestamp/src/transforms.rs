@@ -46,12 +46,13 @@ use arrow::array::{
 };
 use arrow::datatypes::{UInt16Type, UInt32Type};
 use arrow::record_batch::RecordBatch;
-use hifitime::{Duration, Epoch, TimeScale};
+use hifitime::{Duration, TimeScale};
 use nalgebra::{Isometry3, Point3, Quaternion, Rotation3, Translation3, UnitQuaternion, Vector3};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::ephemeris::j2000_tai;
 use crate::schema::{FrameRegistry, STS_REGISTRY_METADATA_KEY, SpaceTimestampBuilder};
 
 /// Converts a position/velocity unit string to a multiplier yielding kilometers.
@@ -336,9 +337,7 @@ pub fn transform_batch(
     let num_rows = batch.num_rows();
     let mut sts_builder = SpaceTimestampBuilder::new(num_rows, registry.clone());
 
-    // The J2000 reference epoch for duration offsets (TAI scale).
-    // All stored durations are relative to this epoch using TAI, regardless of timescale_id.
-    let j2000_epoch = Epoch::from_str("2000-01-01T12:00:00 TAI").unwrap();
+    let j2000_epoch = j2000_tai();
     let to_target_factor = 1.0 / unit_to_km_factor(target_unit);
 
     // 4. Iterate over the data and apply transformations.

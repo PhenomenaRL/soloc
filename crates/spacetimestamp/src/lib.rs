@@ -4,6 +4,7 @@
 //! positions and orientations, along with the [`SpaceTimestampBuilder`] for
 //! efficient, row-oriented ingestion of this data into Arrow [`RecordBatch`]es.
 
+pub mod ephemeris;
 pub mod query;
 pub mod schema;
 pub mod transforms;

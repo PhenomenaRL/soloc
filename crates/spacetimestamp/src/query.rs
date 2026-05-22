@@ -21,13 +21,9 @@ use arrow::array::{
 use arrow::datatypes::UInt32Type;
 use arrow::record_batch::RecordBatch;
 use hifitime::{Duration, Epoch};
-use std::str::FromStr;
 use std::sync::Arc;
 
-/// Returns the J2000 TAI reference epoch used as the zero-point for all stored durations.
-fn j2000_tai() -> Epoch {
-    Epoch::from_str("2000-01-01T12:00:00 TAI").expect("J2000 TAI is a valid epoch string")
-}
+use crate::ephemeris::j2000_tai;
 
 /// A spatiotemporal filter for use with [`filter_batch`] and ledger query APIs.
 ///
