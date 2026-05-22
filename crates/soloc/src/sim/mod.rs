@@ -265,7 +265,7 @@ mod tests {
         use arrow::array::{DictionaryArray, StringArray};
         use arrow::datatypes::UInt16Type;
 
-        let mut ledger = Ledger::new();
+        let mut ledger = Ledger::new(&crate::entity::entity_schema(None), "spacetimestamp", "entity_id").unwrap();
         ledger.append(make_simple_sim_batch());
 
         let dt = Duration::from_parts(0, 60_000_000_000u64); // 60 seconds
@@ -305,7 +305,7 @@ mod tests {
     fn test_static_entity_position_unchanged() {
         use arrow::array::{Array, StructArray};
 
-        let mut ledger = Ledger::new();
+        let mut ledger = Ledger::new(&crate::entity::entity_schema(None), "spacetimestamp", "entity_id").unwrap();
         ledger.append(make_simple_sim_batch());
 
         let dt = Duration::from_parts(0, 60_000_000_000u64);
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn test_run_until_advances_epoch() {
-        let mut ledger = Ledger::new();
+        let mut ledger = Ledger::new(&crate::entity::entity_schema(None), "spacetimestamp", "entity_id").unwrap();
         ledger.append(make_simple_sim_batch());
 
         let dt = Duration::from_parts(0, 60_000_000_000u64); // 60 s

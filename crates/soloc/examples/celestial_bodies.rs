@@ -39,7 +39,8 @@ fn main() -> Result<(), String> {
     // -------------------------------------------------------------------------
     // Snapshot all supported bodies at the current epoch and append to ledger.
     // -------------------------------------------------------------------------
-    let mut ledger = Ledger::new();
+    let mut ledger = Ledger::new(&soloc::entity::entity_schema(None), "spacetimestamp", "entity_id")
+        .map_err(|e| format!("Failed to create ledger: {e}"))?;
 
     append_celestial(&mut ledger, &almanac, CelestialBody::ALL, now)?;
     println!("Appended {} bodies at T+0:", CelestialBody::ALL.len());

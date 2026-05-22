@@ -26,7 +26,7 @@ use arrow::array::{
     Array, BooleanBuilder, DictionaryArray, FixedSizeListArray, Float64Array,
     Int16Array, StringArray, StructArray, UInt64Array,
 };
-use arrow::datatypes::{UInt16Type, UInt32Type};
+use arrow::datatypes::{DataType, Fields, SchemaRef, UInt16Type, UInt32Type};
 use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
@@ -38,6 +38,7 @@ use std::io::Cursor;
 use std::path::Path;
 
 use anise::prelude::Almanac;
+use spacetimestamp::ephemeris::j2000_tai;
 use spacetimestamp::query::{SpatiotemporalFilter, filter_batch};
 use spacetimestamp::schema::is_entity_uri;
 use spacetimestamp::transforms::transform_batch;
@@ -48,19 +49,81 @@ use spacetimestamp::transforms::transform_batch;
 /// time-filter queries stay under ~1 ms. Beyond this threshold, merging pays off.
 const SEGMENT_THRESHOLD: usize = 50;
 
+/// Required field names inside the spacetimestamp struct column.
+const STS_REQUIRED_FIELDS: &[&str] = &[
+    "frame_id", "units_pos", "timescale_id", "source_id", "estimate_type",
+    "position", "quaternion", "duration_centuries", "duration_ns",
+];
+
 /// An append-only store of [`RecordBatch`]es forming the soloc Universal Ledger.
 ///
-/// Designed for use with entity batches following [`crate::entity::entity_schema`], but
-/// accepts any batch — schema validation is deferred to higher-level ingestion logic.
-#[derive(Default)]
+/// Schema-agnostic: works with any Arrow schema that embeds a spacetimestamp struct column.
+/// The schema, `sts_column` name, and `id_column` name are fixed at construction and
+/// validated against the provided schema before the ledger is created.
+///
+/// For the standard entity schema, construct with:
+/// ```rust,ignore
+/// use soloc::entity::entity_schema;
+/// use soloc::ledger::Ledger;
+///
+/// let ledger = Ledger::new(&entity_schema(None), "spacetimestamp", "entity_id").unwrap();
+/// ```
+#[derive(Debug)]
 pub struct Ledger {
     batches: Vec<RecordBatch>,
+    /// Name of the spacetimestamp struct column (e.g. `"spacetimestamp"`).
+    sts_column: String,
+    /// Name of the entity-identity column (e.g. `"entity_id"`). Empty string = no id column.
+    id_column: String,
 }
 
 impl Ledger {
-    /// Creates an empty ledger.
-    pub fn new() -> Self {
-        Self::default()
+    /// Creates an empty ledger, validating `sts_column` and (if non-empty) `id_column`
+    /// against `schema`.
+    ///
+    /// Validation checks:
+    /// - `sts_column` exists in `schema` and its type is `Struct`.
+    /// - The struct contains all required STS sub-fields.
+    /// - If `id_column` is non-empty, it exists in `schema`.
+    pub fn new(schema: &SchemaRef, sts_column: &str, id_column: &str) -> Result<Self, String> {
+        Self::validate_schema(schema, sts_column, id_column)?;
+        Ok(Self {
+            batches: Vec::new(),
+            sts_column: sts_column.to_string(),
+            id_column: id_column.to_string(),
+        })
+    }
+
+    /// Validates that `schema` is compatible with the given column names.
+    fn validate_schema(schema: &SchemaRef, sts_column: &str, id_column: &str) -> Result<(), String> {
+        let sts_field = schema
+            .field_with_name(sts_column)
+            .map_err(|_| format!("sts_column '{sts_column}' not found in schema"))?;
+
+        let sts_fields: &Fields = match sts_field.data_type() {
+            DataType::Struct(f) => f,
+            other => {
+                return Err(format!(
+                    "sts_column '{sts_column}' must be Struct, got {other:?}"
+                ))
+            }
+        };
+
+        for &name in STS_REQUIRED_FIELDS {
+            if sts_fields.find(name).is_none() {
+                return Err(format!(
+                    "'{sts_column}' struct is missing required STS field '{name}'"
+                ));
+            }
+        }
+
+        if !id_column.is_empty() {
+            schema
+                .field_with_name(id_column)
+                .map_err(|_| format!("id_column '{id_column}' not found in schema"))?;
+        }
+
+        Ok(())
     }
 
     /// Appends a batch to the ledger. Existing data is never modified.
@@ -99,11 +162,7 @@ impl Ledger {
     /// rules apply: spatial filters require all rows to be in the same frame.
     ///
     /// Returns an empty batch (correct schema, 0 rows) when there are no matches.
-    pub fn query(
-        &self,
-        filter: &SpatiotemporalFilter,
-        sts_column: &str,
-    ) -> Result<RecordBatch, String> {
+    pub fn query(&self, filter: &SpatiotemporalFilter) -> Result<RecordBatch, String> {
         if self.batches.is_empty() {
             return Err("Ledger is empty".to_string());
         }
@@ -112,7 +171,7 @@ impl Ledger {
         let mut kept: Vec<RecordBatch> = Vec::new();
 
         for batch in &self.batches {
-            let filtered = filter_batch(batch, sts_column, filter)?;
+            let filtered = filter_batch(batch, &self.sts_column, filter)?;
             if filtered.num_rows() > 0 {
                 kept.push(filtered);
             }
@@ -133,37 +192,26 @@ impl Ledger {
     pub fn stream_query<'a>(
         &'a self,
         filter: &'a SpatiotemporalFilter,
-        sts_column: &'a str,
     ) -> impl Iterator<Item = Result<RecordBatch, String>> + 'a {
         self.batches
             .iter()
-            .map(move |batch| filter_batch(batch, sts_column, filter))
+            .map(move |batch| filter_batch(batch, &self.sts_column, filter))
     }
 
     /// Returns the most recent batch in the ledger, optionally filtered to specific entity IDs.
     ///
-    /// After the first simulation step every subsequent batch is a full-entity snapshot, so
-    /// the last batch always represents the latest known state of all tracked entities.
-    ///
-    /// If `entity_ids` is provided, only rows whose `entity_id` matches one of the given
-    /// strings are returned.
-    ///
-    /// # Note
-    ///
-    /// This is a fast-path implementation that returns the last batch only. It is correct
-    /// for the common simulation workflow where all entities are seeded in a single initial
-    /// batch. For heterogeneous ingestion where different entities may have their most recent
-    /// state in different batches, a full ledger scan is needed (planned for a future version).
+    /// If `entity_ids` is `Some` and this ledger has no `id_column`, returns `None`.
     pub fn latest_snapshot(&self, entity_ids: Option<&[&str]>) -> Option<RecordBatch> {
         let last = self.batches.last()?;
 
         let ids = match entity_ids {
             None => return Some(last.clone()),
+            Some(_) if self.id_column.is_empty() => return None,
             Some(ids) => ids,
         };
 
         let entity_col = last
-            .column_by_name("entity_id")?
+            .column_by_name(&self.id_column)?
             .as_any()
             .downcast_ref::<DictionaryArray<UInt32Type>>()?;
         let entity_dict = entity_col
@@ -195,7 +243,7 @@ impl Ledger {
     ///
     /// ```rust,ignore
     /// let almanac = MetaAlmanac::latest()?;
-    /// let mut ledger = Ledger::new();
+    /// let mut ledger = Ledger::new(&entity_schema(None), "spacetimestamp", "entity_id")?;
     /// ledger.seed_solar_system(&almanac, CelestialBody::ALL, epoch)?;
     /// ```
     pub fn seed_solar_system(
@@ -221,21 +269,17 @@ impl Ledger {
     /// in `batch`'s schema metadata are honoured automatically.
     ///
     /// ```rust,ignore
-    /// let result = ledger.transform(&my_batch, "spacetimestamp", "ICRF", "km", &almanac)?;
+    /// let result = ledger.transform(&my_batch, "ICRF", "km", &almanac)?;
     /// ```
     pub fn transform(
         &self,
         batch: &RecordBatch,
-        sts_column: &str,
         target_frame: &str,
         target_units: &str,
         almanac: &Almanac,
     ) -> Result<RecordBatch, String> {
-        // Extract the epoch from the first row so dynamic frame lookup is time-consistent.
-        let epoch = epoch_from_batch(batch, sts_column);
-
-        // Collect unique entity-URI frame_ids from the batch's frame_id dictionary.
-        let uri_frames = collect_uri_frames(batch, sts_column);
+        let epoch = epoch_from_batch(batch, &self.sts_column);
+        let uri_frames = collect_uri_frames(batch, &self.sts_column);
 
         let dynamic_frames = if uri_frames.is_empty() {
             None
@@ -244,31 +288,34 @@ impl Ledger {
             Some(self.build_dynamic_frame_map(&ids, epoch)?)
         };
 
-        transform_batch(batch, sts_column, target_frame, almanac, target_units, dynamic_frames.as_ref())
+        transform_batch(batch, &self.sts_column, target_frame, almanac, target_units, dynamic_frames.as_ref())
     }
 
     /// Returns the pose of `entity_id` at the latest timestamp ≤ `epoch` as an
-    /// `(parent_frame_id, isometry_km)` pair, where the isometry translates child-frame
-    /// coordinates into `parent_frame_id` coordinates, with the translation in km.
+    /// `(parent_frame_id, isometry_km)` pair.
     ///
-    /// Returns `None` if the entity has no entry at or before `epoch` in the ledger.
+    /// Returns `None` if this ledger has no `id_column`, or if the entity has no entry
+    /// at or before `epoch`.
     pub fn resolve_frame_at(
         &self,
         entity_id: &str,
         epoch: Epoch,
     ) -> Option<(String, Isometry3<f64>)> {
-        let j2000 = Epoch::from_gregorian_tai(2000, 1, 1, 12, 0, 0, 0);
-        let target_dur = epoch - j2000;
+        if self.id_column.is_empty() {
+            return None;
+        }
+
+        let target_dur = epoch - j2000_tai();
 
         let mut best_dur: Option<Duration> = None;
         let mut best: Option<(String, Isometry3<f64>)> = None;
 
         for batch in &self.batches {
-            let Some(eid_raw) = batch.column_by_name("entity_id") else { continue };
+            let Some(eid_raw) = batch.column_by_name(&self.id_column) else { continue };
             let Some(eid_col) = eid_raw.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() else { continue };
             let Some(eid_dict) = eid_col.values().as_any().downcast_ref::<StringArray>() else { continue };
 
-            let Some(sts_raw) = batch.column_by_name("spacetimestamp") else { continue };
+            let Some(sts_raw) = batch.column_by_name(&self.sts_column) else { continue };
             let Some(sts) = sts_raw.as_any().downcast_ref::<StructArray>() else { continue };
 
             let Some(frame_raw) = sts.column_by_name("frame_id") else { continue };
@@ -306,10 +353,10 @@ impl Ledger {
                 let row_dur = Duration::from_parts(centuries, ns);
 
                 if row_dur > target_dur {
-                    continue; // future entry — skip
+                    continue;
                 }
                 if best_dur.map_or(false, |b| row_dur <= b) {
-                    continue; // not a better match
+                    continue;
                 }
 
                 let units = units_dict.value(units_col.keys().value(i) as usize);
@@ -328,10 +375,10 @@ impl Ledger {
 
                 let qb = (quat_offset + i) * 4;
                 let rotation = UnitQuaternion::from_quaternion(Quaternion::new(
-                    quat_vals.value(qb),     // w
-                    quat_vals.value(qb + 1), // x
-                    quat_vals.value(qb + 2), // y
-                    quat_vals.value(qb + 3), // z
+                    quat_vals.value(qb),
+                    quat_vals.value(qb + 1),
+                    quat_vals.value(qb + 2),
+                    quat_vals.value(qb + 3),
                 ));
 
                 let frame_id = frame_dict.value(frame_col.keys().value(i) as usize).to_string();
@@ -344,15 +391,6 @@ impl Ledger {
     }
 
     /// Builds a dynamic frame map for use with [`spacetimestamp::transforms::transform_batch`].
-    ///
-    /// For each entity URI in `entity_ids`, looks up the entity's latest pose at or before
-    /// `epoch` and returns it as `(astronomical_root_frame, composed_isometry_km)`. The
-    /// isometry transforms coordinates expressed in that entity's body frame into the
-    /// astronomical root frame, with translation in km.
-    ///
-    /// Parent frames that are themselves entity URIs (contain `":"`) are resolved
-    /// recursively and the isometries composed. Returns `Err` if any entity is not found
-    /// in the ledger or if a cycle is detected in the parent chain.
     pub fn build_dynamic_frame_map(
         &self,
         entity_ids: &[&str],
@@ -390,7 +428,6 @@ impl Ledger {
             ))?;
 
         if spacetimestamp::schema::is_entity_uri(&parent_frame) {
-            // Parent is another entity — recurse to get its composed isometry.
             self.resolve_chain(&parent_frame, epoch, result, visiting)?;
             let (root_frame, parent_iso) = result[&parent_frame].clone();
             result.insert(entity_id.to_string(), (root_frame, parent_iso * iso));
@@ -403,9 +440,6 @@ impl Ledger {
     }
 
     /// Serializes all batches to an Arrow IPC file at `path`.
-    ///
-    /// All batches are written in insertion order. The file can be reloaded with
-    /// [`Ledger::load_ipc`].
     pub fn save_ipc(&self, path: &Path) -> Result<(), String> {
         if self.batches.is_empty() {
             return Err("Cannot save an empty ledger".to_string());
@@ -438,11 +472,8 @@ impl Ledger {
     /// 2. For equal timestamps, source priority: `MEASURED` > `PREDICTED` > `SIMULATED`.
     /// 3. For equal timestamps and equal priority, later insertion order wins.
     ///
-    /// `entity_ids`: if `Some`, only the listed entity IDs are included; `None` = all.
+    /// `entity_ids`: if `Some` and this ledger has no `id_column`, returns an empty batch.
     /// `not_before`: rows whose timestamp is strictly before this epoch are excluded.
-    ///
-    /// Returns an empty batch (correct schema, 0 rows) when the ledger has data but no rows
-    /// match the filters.
     pub fn current_state(
         &self,
         entity_ids: Option<&[&str]>,
@@ -452,27 +483,36 @@ impl Ledger {
             return Err("Ledger is empty".to_string());
         }
 
-        let j2000 = Epoch::from_gregorian_tai(2000, 1, 1, 12, 0, 0, 0);
-        let cutoff: Option<Duration> = not_before.map(|ep| ep - j2000);
+        let cutoff: Option<Duration> = not_before.map(|ep| ep - j2000_tai());
         let entity_filter: Option<HashSet<&str>> =
             entity_ids.map(|ids| ids.iter().copied().collect());
+
+        let schema = self.batches[0].schema();
+
+        // If caller asked for specific entities but we have no id column, return empty.
+        if entity_filter.is_some() && self.id_column.is_empty() {
+            return Ok(RecordBatch::new_empty(schema));
+        }
 
         // entity_id → (epoch_dur, priority, batch_idx, row_idx)
         let mut best: HashMap<String, (Duration, u8, usize, usize)> = HashMap::new();
 
         for (batch_idx, batch) in self.batches.iter().enumerate() {
-            let Some(eid_col) = batch
-                .column_by_name("entity_id")
-                .and_then(|c| c.as_any().downcast_ref::<DictionaryArray<UInt32Type>>())
-            else {
-                continue;
-            };
-            let Some(eid_dict) = eid_col.values().as_any().downcast_ref::<StringArray>() else {
-                continue;
+            // id column lookup — skip batch if absent or wrong type
+            let eid_col_opt = if self.id_column.is_empty() {
+                None
+            } else {
+                batch
+                    .column_by_name(&self.id_column)
+                    .and_then(|c| c.as_any().downcast_ref::<DictionaryArray<UInt32Type>>())
             };
 
+            let eid_dict_opt = eid_col_opt.as_ref().and_then(|col| {
+                col.values().as_any().downcast_ref::<StringArray>()
+            });
+
             let Some(sts) = batch
-                .column_by_name("spacetimestamp")
+                .column_by_name(&self.sts_column)
                 .and_then(|c| c.as_any().downcast_ref::<StructArray>())
             else {
                 continue;
@@ -500,10 +540,15 @@ impl Ledger {
             };
 
             for row in 0..batch.num_rows() {
-                let eid = eid_dict.value(eid_col.keys().value(row) as usize);
+                // Derive a row key: use entity id if available, else row index string.
+                let row_key = if let (Some(col), Some(dict)) = (eid_col_opt, eid_dict_opt) {
+                    dict.value(col.keys().value(row) as usize).to_string()
+                } else {
+                    row.to_string()
+                };
 
                 if let Some(ref filter) = entity_filter {
-                    if !filter.contains(eid) {
+                    if !filter.contains(row_key.as_str()) {
                         continue;
                     }
                 }
@@ -519,7 +564,7 @@ impl Ledger {
                 let et = et_dict.value(et_col.keys().value(row) as usize);
                 let priority = estimate_type_priority(et);
 
-                let update = match best.get(eid) {
+                let update = match best.get(&row_key) {
                     None => true,
                     Some(&(best_dur, best_pri, _, _)) => {
                         dur > best_dur || (dur == best_dur && priority < best_pri)
@@ -527,12 +572,10 @@ impl Ledger {
                 };
 
                 if update {
-                    best.insert(eid.to_string(), (dur, priority, batch_idx, row));
+                    best.insert(row_key, (dur, priority, batch_idx, row));
                 }
             }
         }
-
-        let schema = self.batches[0].schema();
 
         if best.is_empty() {
             return Ok(RecordBatch::new_empty(schema));
@@ -563,12 +606,17 @@ impl Ledger {
     }
 
     /// Loads a ledger from an Arrow IPC file previously saved with [`Ledger::save_ipc`].
-    pub fn load_ipc(path: &Path) -> Result<Self, String> {
+    ///
+    /// Reads the schema from the IPC file and validates it against `sts_column` and `id_column`.
+    pub fn load_ipc(path: &Path, sts_column: &str, id_column: &str) -> Result<Self, String> {
         let file = File::open(path)
             .map_err(|e| format!("Failed to open '{}': {e}", path.display()))?;
 
         let reader = FileReader::try_new(file, None)
             .map_err(|e| format!("Failed to open Arrow IPC reader: {e}"))?;
+
+        let schema = reader.schema();
+        Self::validate_schema(&schema, sts_column, id_column)?;
 
         let mut batches = Vec::new();
         for result in reader {
@@ -581,13 +629,14 @@ impl Ledger {
             return Err("IPC file contained no record batches".to_string());
         }
 
-        Ok(Self { batches })
+        Ok(Self {
+            batches,
+            sts_column: sts_column.to_string(),
+            id_column: id_column.to_string(),
+        })
     }
 
     /// Serializes all batches to an in-memory Arrow IPC buffer.
-    ///
-    /// Equivalent to [`Ledger::save_ipc`] but writes to a `Vec<u8>` instead of a file.
-    /// Used by the S3 storage backend.
     pub fn save_ipc_to_bytes(&self) -> Result<Vec<u8>, String> {
         if self.batches.is_empty() {
             return Err("Cannot save an empty ledger".to_string());
@@ -607,12 +656,15 @@ impl Ledger {
 
     /// Deserializes a ledger from an in-memory Arrow IPC buffer.
     ///
-    /// Equivalent to [`Ledger::load_ipc`] but reads from `&[u8]` instead of a file.
-    /// Used by the S3 storage backend.
-    pub fn load_ipc_from_bytes(bytes: &[u8]) -> Result<Self, String> {
+    /// Reads the schema from the IPC bytes and validates it against `sts_column` and `id_column`.
+    pub fn load_ipc_from_bytes(bytes: &[u8], sts_column: &str, id_column: &str) -> Result<Self, String> {
         let cursor = Cursor::new(bytes);
         let reader = FileReader::try_new(cursor, None)
             .map_err(|e| format!("Failed to open Arrow IPC reader: {e}"))?;
+
+        let schema = reader.schema();
+        Self::validate_schema(&schema, sts_column, id_column)?;
+
         let mut batches = Vec::new();
         for result in reader {
             batches.push(result.map_err(|e| format!("Failed to read batch: {e}"))?);
@@ -620,7 +672,11 @@ impl Ledger {
         if batches.is_empty() {
             return Err("IPC bytes contained no record batches".to_string());
         }
-        Ok(Self { batches })
+        Ok(Self {
+            batches,
+            sts_column: sts_column.to_string(),
+            id_column: id_column.to_string(),
+        })
     }
 }
 
@@ -628,14 +684,14 @@ fn estimate_type_priority(s: &str) -> u8 {
     match s {
         "MEASURED" => 0,
         "PREDICTED" => 1,
-        _ => 2, // SIMULATED or unknown
+        _ => 2,
     }
 }
 
 /// Extracts the epoch from the first row of the spacetimestamp struct column.
 /// Falls back to J2000 TAI if the column or fields are absent.
 fn epoch_from_batch(batch: &RecordBatch, sts_column: &str) -> Epoch {
-    let j2000 = Epoch::from_gregorian_tai(2000, 1, 1, 12, 0, 0, 0);
+    let j2000 = j2000_tai();
     if batch.num_rows() == 0 {
         return j2000;
     }
@@ -658,8 +714,7 @@ fn epoch_from_batch(batch: &RecordBatch, sts_column: &str) -> Epoch {
     j2000 + Duration::from_parts(cent, ns)
 }
 
-/// Returns the set of unique entity-URI values present in the frame_id dictionary
-/// of the spacetimestamp struct column. These are the frames that need ledger resolution.
+/// Returns unique entity-URI values in the frame_id dictionary of the spacetimestamp struct.
 fn collect_uri_frames(batch: &RecordBatch, sts_column: &str) -> Vec<String> {
     let Some(sts) = batch
         .column_by_name(sts_column)
@@ -691,13 +746,26 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use hifitime::Duration;
+    use spacetimestamp::ephemeris::j2000_tai;
     use spacetimestamp::query::SpatiotemporalFilter;
     use spacetimestamp::schema::{SpaceTimestampBuilder, sts_schema};
-    use std::str::FromStr;
     use std::sync::Arc;
 
-    fn j2000() -> hifitime::Epoch {
-        hifitime::Epoch::from_str("2000-01-01T12:00:00 TAI").unwrap()
+    fn j2000() -> Epoch {
+        j2000_tai()
+    }
+
+    /// Schema matching make_batch() — just a spacetimestamp struct, no entity_id.
+    fn sts_only_schema() -> SchemaRef {
+        let sts_ref = sts_schema(None);
+        Arc::new(
+            Schema::new(vec![Field::new(
+                "spacetimestamp",
+                DataType::Struct(sts_ref.fields().clone()),
+                false,
+            )])
+            .with_metadata(sts_ref.metadata().clone()),
+        )
     }
 
     /// Build a minimal single-row batch that embeds a spacetimestamp struct column.
@@ -709,21 +777,22 @@ mod tests {
             None, None,
         );
         let struct_array = builder.finish_as_struct();
-        let sts_ref = sts_schema(None);
-        let schema = Arc::new(
-            Schema::new(vec![Field::new(
-                "spacetimestamp",
-                DataType::Struct(sts_ref.fields().clone()),
-                false,
-            )])
-            .with_metadata(sts_ref.metadata().clone()),
-        );
+        let schema = sts_only_schema();
         RecordBatch::try_new(schema, vec![Arc::new(struct_array)]).unwrap()
+    }
+
+    fn make_sts_ledger() -> Ledger {
+        Ledger::new(&sts_only_schema(), "spacetimestamp", "").unwrap()
+    }
+
+    fn make_entity_ledger() -> Ledger {
+        use crate::entity::entity_schema;
+        Ledger::new(&entity_schema(None), "spacetimestamp", "entity_id").unwrap()
     }
 
     #[test]
     fn test_append_and_len() {
-        let mut ledger = Ledger::new();
+        let mut ledger = make_sts_ledger();
         assert!(ledger.is_empty());
         ledger.append(make_batch([0.0, 0.0, 0.0], 0));
         ledger.append(make_batch([1.0, 0.0, 0.0], 1000));
@@ -732,20 +801,20 @@ mod tests {
 
     #[test]
     fn test_query_no_filter_returns_all_rows() {
-        let mut ledger = Ledger::new();
+        let mut ledger = make_sts_ledger();
         ledger.append(make_batch([0.0, 0.0, 0.0], 0));
         ledger.append(make_batch([10.0, 0.0, 0.0], 1000));
-        let result = ledger.query(&SpatiotemporalFilter::new(), "spacetimestamp").unwrap();
+        let result = ledger.query(&SpatiotemporalFilter::new()).unwrap();
         assert_eq!(result.num_rows(), 2);
     }
 
     #[test]
     fn test_query_spatial_filter() {
-        let mut ledger = Ledger::new();
-        ledger.append(make_batch([1.0, 0.0, 0.0], 0));   // inside 5 km sphere
-        ledger.append(make_batch([100.0, 0.0, 0.0], 0)); // outside
+        let mut ledger = make_sts_ledger();
+        ledger.append(make_batch([1.0, 0.0, 0.0], 0));
+        ledger.append(make_batch([100.0, 0.0, 0.0], 0));
         let filter = SpatiotemporalFilter::new().with_spatial([0.0, 0.0, 0.0], 5.0);
-        let result = ledger.query(&filter, "spacetimestamp").unwrap();
+        let result = ledger.query(&filter).unwrap();
         assert_eq!(result.num_rows(), 1);
     }
 
@@ -755,24 +824,24 @@ mod tests {
         let t1 = j2000 + Duration::from_parts(0, 400);
         let t2 = j2000 + Duration::from_parts(0, 600);
 
-        let mut ledger = Ledger::new();
-        ledger.append(make_batch([0.0, 0.0, 0.0], 0));    // before range
-        ledger.append(make_batch([1.0, 0.0, 0.0], 500));  // inside
-        ledger.append(make_batch([2.0, 0.0, 0.0], 9999)); // after range
+        let mut ledger = make_sts_ledger();
+        ledger.append(make_batch([0.0, 0.0, 0.0], 0));
+        ledger.append(make_batch([1.0, 0.0, 0.0], 500));
+        ledger.append(make_batch([2.0, 0.0, 0.0], 9999));
 
         let filter = SpatiotemporalFilter::new().with_time_range(t1, t2);
-        let result = ledger.query(&filter, "spacetimestamp").unwrap();
+        let result = ledger.query(&filter).unwrap();
         assert_eq!(result.num_rows(), 1);
     }
 
     #[test]
     fn test_stream_query_yields_per_batch() {
-        let mut ledger = Ledger::new();
+        let mut ledger = make_sts_ledger();
         ledger.append(make_batch([0.0, 0.0, 0.0], 0));
         ledger.append(make_batch([1.0, 0.0, 0.0], 1000));
 
         let total_rows: usize = ledger
-            .stream_query(&SpatiotemporalFilter::new(), "spacetimestamp")
+            .stream_query(&SpatiotemporalFilter::new())
             .filter_map(Result::ok)
             .map(|b| b.num_rows())
             .sum();
@@ -781,18 +850,16 @@ mod tests {
 
     #[test]
     fn test_latest_snapshot_returns_last_batch() {
-        let mut ledger = Ledger::new();
+        let mut ledger = make_sts_ledger();
         ledger.append(make_batch([0.0, 0.0, 0.0], 0));
         ledger.append(make_batch([99.0, 0.0, 0.0], 9999));
         let snap = ledger.latest_snapshot(None).unwrap();
         assert_eq!(snap.num_rows(), 1);
-        // The last batch has position [99, 0, 0].
-        // Just verify it round-trips without error.
     }
 
     #[test]
     fn test_seal_merges_batches_at_threshold() {
-        let mut ledger = Ledger::new();
+        let mut ledger = make_sts_ledger();
         for i in 0..=SEGMENT_THRESHOLD {
             ledger.append(make_batch([i as f64, 0.0, 0.0], i as u64));
         }
@@ -801,13 +868,13 @@ mod tests {
 
     #[test]
     fn test_seal_preserves_row_count() {
-        let mut ledger = Ledger::new();
+        let mut ledger = make_sts_ledger();
         let n = SEGMENT_THRESHOLD + 1;
         for i in 0..n {
             ledger.append(make_batch([i as f64, 0.0, 0.0], i as u64));
         }
         let total: usize = ledger
-            .stream_query(&SpatiotemporalFilter::new(), "spacetimestamp")
+            .stream_query(&SpatiotemporalFilter::new())
             .filter_map(Result::ok)
             .map(|b| b.num_rows())
             .sum();
@@ -816,7 +883,7 @@ mod tests {
 
     #[test]
     fn test_no_seal_below_threshold() {
-        let mut ledger = Ledger::new();
+        let mut ledger = make_sts_ledger();
         for i in 0..SEGMENT_THRESHOLD {
             ledger.append(make_batch([i as f64, 0.0, 0.0], i as u64));
         }
@@ -825,34 +892,57 @@ mod tests {
 
     #[test]
     fn test_save_and_load_ipc_from_bytes_round_trip() {
-        let mut ledger = Ledger::new();
+        let mut ledger = make_sts_ledger();
         ledger.append(make_batch([1.0, 2.0, 3.0], 0));
         ledger.append(make_batch([4.0, 5.0, 6.0], 1000));
 
         let bytes = ledger.save_ipc_to_bytes().unwrap();
-        let loaded = Ledger::load_ipc_from_bytes(&bytes).unwrap();
+        let loaded = Ledger::load_ipc_from_bytes(&bytes, "spacetimestamp", "").unwrap();
         assert_eq!(loaded.len(), 2);
     }
 
     #[test]
     fn test_save_and_load_ipc_preserves_batches() {
-        let mut ledger = Ledger::new();
+        let mut ledger = make_sts_ledger();
         ledger.append(make_batch([1.0, 2.0, 3.0], 0));
         ledger.append(make_batch([4.0, 5.0, 6.0], 1000));
 
         let path = std::env::temp_dir().join("soloc_ledger_test.arrows");
         ledger.save_ipc(&path).unwrap();
 
-        let loaded = Ledger::load_ipc(&path).unwrap();
+        let loaded = Ledger::load_ipc(&path, "spacetimestamp", "").unwrap();
         assert_eq!(loaded.len(), 2);
         std::fs::remove_file(path).ok();
     }
 
+    #[test]
+    fn test_new_rejects_missing_sts_column() {
+        let schema = sts_only_schema();
+        let err = Ledger::new(&schema, "nonexistent", "").unwrap_err();
+        assert!(err.contains("nonexistent"), "got: {err}");
+    }
+
+    #[test]
+    fn test_new_rejects_non_struct_sts_column() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("spacetimestamp", DataType::Utf8, false),
+        ]));
+        let err = Ledger::new(&schema, "spacetimestamp", "").unwrap_err();
+        assert!(err.contains("Struct"), "got: {err}");
+    }
+
+    #[test]
+    fn test_new_rejects_missing_id_column() {
+        let schema = sts_only_schema();
+        let err = Ledger::new(&schema, "spacetimestamp", "entity_id").unwrap_err();
+        assert!(err.contains("entity_id"), "got: {err}");
+    }
+
     // -----------------------------------------------------------------------
-    // FRICTION 7: entity-URI frame chain resolution
+    // entity-URI frame chain resolution
     // -----------------------------------------------------------------------
 
-    /// Builds an entity batch using EntityBuilder (includes entity_id column).
     fn make_entity_batch(
         entity_id: &str,
         frame_id: &str,
@@ -872,13 +962,11 @@ mod tests {
 
     #[test]
     fn test_build_dynamic_frame_map_single_hop() {
-        // truck_A at [100, 0, 0] km in IAU_EARTH, identity orientation.
-        let mut ledger = Ledger::new();
+        let mut ledger = make_entity_ledger();
         ledger.append(make_entity_batch(
             "demo:truck_A", "IAU_EARTH",
             [100.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
         ));
-        // robot_truck at [1, 0, 0] km in truck_A body frame.
         ledger.append(make_entity_batch(
             "demo:robot_truck", "demo:truck_A",
             [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
@@ -890,8 +978,6 @@ mod tests {
         let (root, iso) = map.get("demo:robot_truck").unwrap();
         assert_eq!(root, "IAU_EARTH");
 
-        // Composed isometry: robot at [1,0,0] in truck frame, truck at [100,0,0] in ECEF.
-        // Applying iso to the robot's local origin [0,0,0] should give [101,0,0] in ECEF.
         let origin = nalgebra::Point3::new(0.0, 0.0, 0.0);
         let result = iso.transform_point(&origin);
         assert!((result.x - 101.0).abs() < 1e-9, "expected x≈101, got {}", result.x);
@@ -901,10 +987,7 @@ mod tests {
 
     #[test]
     fn test_build_dynamic_frame_map_two_hop() {
-        // facility at [50, 0, 0] km in IAU_EARTH.
-        // robot at [5, 0, 0] km in facility frame.
-        // Expected: robot origin in ECEF = [55, 0, 0] km.
-        let mut ledger = Ledger::new();
+        let mut ledger = make_entity_ledger();
         ledger.append(make_entity_batch(
             "demo:facility", "IAU_EARTH",
             [50.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
@@ -927,7 +1010,7 @@ mod tests {
 
     #[test]
     fn test_build_dynamic_frame_map_entity_not_found() {
-        let ledger = Ledger::new();
+        let ledger = make_entity_ledger();
         let epoch = j2000();
         let err = ledger.build_dynamic_frame_map(&["demo:ghost"], epoch).unwrap_err();
         assert!(err.contains("demo:ghost"), "error should name the missing entity: {err}");
@@ -935,8 +1018,7 @@ mod tests {
 
     #[test]
     fn test_build_dynamic_frame_map_cycle_detected() {
-        // A → B → A forms a cycle.
-        let mut ledger = Ledger::new();
+        let mut ledger = make_entity_ledger();
         ledger.append(make_entity_batch(
             "demo:A", "demo:B", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
         ));
@@ -971,14 +1053,13 @@ mod tests {
 
     #[test]
     fn test_current_state_latest_wins() {
-        let mut ledger = Ledger::new();
+        let mut ledger = make_entity_ledger();
         ledger.append(make_entity_batch_et("demo:sat", [1.0, 0.0, 0.0], 1000, "MEASURED"));
         ledger.append(make_entity_batch_et("demo:sat", [2.0, 0.0, 0.0], 5000, "MEASURED"));
 
         let result = ledger.current_state(None, None).unwrap();
         assert_eq!(result.num_rows(), 1);
 
-        // Verify the later timestamp's position was selected.
         let sts = result
             .column_by_name("spacetimestamp")
             .unwrap()
@@ -996,16 +1077,13 @@ mod tests {
 
     #[test]
     fn test_current_state_priority_wins_same_epoch() {
-        // MEASURED arrives first (batch 0); SIMULATED arrives second (batch 1) — same timestamp.
-        // MEASURED must win because its priority (0) < SIMULATED priority (2).
-        let mut ledger = Ledger::new();
+        let mut ledger = make_entity_ledger();
         ledger.append(make_entity_batch_et("demo:sat", [1.0, 0.0, 0.0], 3000, "MEASURED"));
         ledger.append(make_entity_batch_et("demo:sat", [9.0, 0.0, 0.0], 3000, "SIMULATED"));
 
         let result = ledger.current_state(None, None).unwrap();
         assert_eq!(result.num_rows(), 1);
 
-        // MEASURED row has position [1,0,0]; SIMULATED has [9,0,0].
         let sts = result
             .column_by_name("spacetimestamp")
             .unwrap()
@@ -1025,11 +1103,10 @@ mod tests {
 
     #[test]
     fn test_current_state_staleness_cutoff() {
-        let mut ledger = Ledger::new();
+        let mut ledger = make_entity_ledger();
         ledger.append(make_entity_batch_et("demo:sat", [1.0, 0.0, 0.0], 100, "MEASURED"));
         ledger.append(make_entity_batch_et("demo:sat", [2.0, 0.0, 0.0], 2000, "MEASURED"));
 
-        // Cutoff: only rows at or after ns=500 are accepted.
         let cutoff = j2000() + Duration::from_parts(0, 500);
         let result = ledger.current_state(None, Some(cutoff)).unwrap();
         assert_eq!(result.num_rows(), 1);
@@ -1051,8 +1128,7 @@ mod tests {
 
     #[test]
     fn test_current_state_all_entities() {
-        let mut ledger = Ledger::new();
-        // Batch 0: entity A and B.
+        let mut ledger = make_entity_ledger();
         use crate::entity::EntityBuilder;
         let batch0 = {
             let mut b = EntityBuilder::new(2, None);
@@ -1065,13 +1141,11 @@ mod tests {
             b.flush()
         };
         ledger.append(batch0);
-        // Batch 1: entity C only.
         ledger.append(make_entity_batch_et("demo:C", [3.0, 0.0, 0.0], 200, "SIMULATED"));
 
         let result = ledger.current_state(None, None).unwrap();
         assert_eq!(result.num_rows(), 3, "expected one row per entity");
 
-        // Verify entity IDs are all present.
         let eid_col = result
             .column_by_name("entity_id")
             .unwrap()

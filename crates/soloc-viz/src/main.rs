@@ -9,7 +9,7 @@ use anise::prelude::MetaAlmanac;
 use anise::constants::frames::{EARTH_J2000, SSB_J2000};
 use hifitime::{Duration, Epoch};
 
-use soloc::entity::EntityBuilder;
+use soloc::entity::{EntityBuilder, entity_schema};
 use soloc::ledger::Ledger;
 
 use app::SolVizApp;
@@ -77,7 +77,8 @@ fn main() -> eframe::Result<()> {
 
     let initial = builder.flush();
 
-    let mut ledger = Ledger::new();
+    let mut ledger = Ledger::new(&entity_schema(None), "spacetimestamp", "entity_id")
+        .expect("entity_schema is always valid");
     ledger.append(initial);
 
     let initial_snap = ledger.latest_snapshot(None);

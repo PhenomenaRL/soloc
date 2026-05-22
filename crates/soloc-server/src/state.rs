@@ -1,4 +1,5 @@
 use anise::almanac::Almanac;
+use soloc::entity::entity_schema;
 use soloc::ledger::Ledger;
 use spacetimestamp::schema::FrameRegistry;
 use std::path::PathBuf;
@@ -14,6 +15,8 @@ pub struct ServerState {
     /// `az://container/key`, `file:///abs/path`).  When set, takes priority over
     /// `ledger_path` for both load-on-startup and save-on-shutdown.
     pub ledger_url: Option<String>,
+    pub sts_column: String,
+    pub id_column: String,
 }
 
 impl ServerState {
@@ -22,6 +25,9 @@ impl ServerState {
         registry_path: Option<PathBuf>,
         ledger_path: Option<PathBuf>,
         ledger_url: Option<String>,
+        schema_path: Option<PathBuf>,
+        sts_column: String,
+        id_column: String,
     ) -> Self {
         let registry = registry_path
             .as_ref()
@@ -31,7 +37,7 @@ impl ServerState {
             .unwrap_or_default();
 
         let ledger = if let Some(ref url) = ledger_url {
-            match object_store_download(url).await {
+            match object_store_download(url, &sts_column, &id_column).await {
                 Ok(l) => {
                     eprintln!("soloc-server: ledger loaded from {url} ({} batches)", l.len());
                     l
@@ -41,33 +47,30 @@ impl ServerState {
                         "soloc-server: WARNING — object-store load failed: {e}. \
                          Starting with empty ledger."
                     );
-                    Ledger::new()
+                    new_empty_ledger(&schema_path, &sts_column, &id_column)
                 }
             }
         } else {
-            ledger_path
-                .as_ref()
-                .filter(|p| p.exists())
-                .and_then(|p| {
-                    match Ledger::load_ipc(p) {
-                        Ok(l) => {
-                            eprintln!(
-                                "soloc-server: ledger loaded from {:?} ({} batches)",
-                                p,
-                                l.len()
-                            );
-                            Some(l)
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "soloc-server: WARNING — failed to load ledger from {:?}: {e}",
-                                p
-                            );
-                            None
-                        }
+            let loaded = ledger_path.as_ref().filter(|p| p.exists()).and_then(|p| {
+                match Ledger::load_ipc(p, &sts_column, &id_column) {
+                    Ok(l) => {
+                        eprintln!(
+                            "soloc-server: ledger loaded from {:?} ({} batches)",
+                            p,
+                            l.len()
+                        );
+                        Some(l)
                     }
-                })
-                .unwrap_or_else(Ledger::new)
+                    Err(e) => {
+                        eprintln!(
+                            "soloc-server: WARNING — failed to load ledger from {:?}: {e}",
+                            p
+                        );
+                        None
+                    }
+                }
+            });
+            loaded.unwrap_or_else(|| new_empty_ledger(&schema_path, &sts_column, &id_column))
         };
 
         Self {
@@ -77,6 +80,8 @@ impl ServerState {
             registry_path,
             ledger_path,
             ledger_url,
+            sts_column,
+            id_column,
         }
     }
 
@@ -134,13 +139,47 @@ impl ServerState {
     }
 }
 
+/// Creates an empty ledger using `schema_path` (if provided) or the default entity schema.
+fn new_empty_ledger(schema_path: &Option<PathBuf>, sts_column: &str, id_column: &str) -> Ledger {
+    if let Some(ref path) = schema_path {
+        match read_schema_from_ipc(path) {
+            Ok(schema) => {
+                match Ledger::new(&schema, sts_column, id_column) {
+                    Ok(l) => {
+                        eprintln!("soloc-server: empty ledger created from schema {:?}", path);
+                        return l;
+                    }
+                    Err(e) => eprintln!(
+                        "soloc-server: WARNING — schema_path schema is invalid: {e}. \
+                         Falling back to entity schema."
+                    ),
+                }
+            }
+            Err(e) => eprintln!(
+                "soloc-server: WARNING — failed to read schema_path {:?}: {e}. \
+                 Falling back to entity schema.",
+                path
+            ),
+        }
+    }
+
+    Ledger::new(&entity_schema(None), sts_column, id_column)
+        .expect("entity_schema is always valid for 'spacetimestamp'/'entity_id'")
+}
+
+/// Reads only the schema from an Arrow IPC file (works for zero-row files).
+fn read_schema_from_ipc(path: &PathBuf) -> Result<arrow::datatypes::SchemaRef, String> {
+    use arrow::ipc::reader::FileReader;
+    use std::fs::File;
+    let file = File::open(path)
+        .map_err(|e| format!("Failed to open {:?}: {e}", path))?;
+    let reader = FileReader::try_new(file, None)
+        .map_err(|e| format!("Failed to read IPC schema from {:?}: {e}", path))?;
+    Ok(reader.schema())
+}
+
 /// Downloads and deserialises a ledger from any object-store URL.
-///
-/// The URL scheme selects the backend: `s3://`, `gs://`, `az://`, `file://`, etc.
-/// Credentials are resolved from the standard environment-variable chain for each provider
-/// (e.g. `AWS_ACCESS_KEY_ID` / ECS task-role IAM for S3, `GOOGLE_APPLICATION_CREDENTIALS`
-/// for GCS, `AZURE_STORAGE_ACCOUNT_KEY` for Azure Blob).
-async fn object_store_download(url_str: &str) -> Result<Ledger, String> {
+async fn object_store_download(url_str: &str, sts_column: &str, id_column: &str) -> Result<Ledger, String> {
     use object_store::ObjectStore;
 
     let url =
@@ -156,7 +195,7 @@ async fn object_store_download(url_str: &str) -> Result<Ledger, String> {
         .await
         .map_err(|e| format!("object-store read bytes failed: {e}"))?;
 
-    Ledger::load_ipc_from_bytes(&bytes)
+    Ledger::load_ipc_from_bytes(&bytes, sts_column, id_column)
 }
 
 /// Serialises and uploads the ledger to any object-store URL.

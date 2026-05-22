@@ -303,7 +303,12 @@ mod tests {
 
     #[test]
     fn test_append_celestial_does_not_mutate_ledger_on_error() {
-        let mut ledger = crate::ledger::Ledger::new();
+        let mut ledger = crate::ledger::Ledger::new(
+            &crate::entity::entity_schema(None),
+            "spacetimestamp",
+            "entity_id",
+        )
+        .unwrap();
         let almanac = Almanac::default();
         let epoch = j2000_tai();
         let result = append_celestial(&mut ledger, &almanac, &[CelestialBody::Earth], epoch);

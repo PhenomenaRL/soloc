@@ -96,7 +96,9 @@ struct GetTicket {
     spatial_origin: Option<[f64; 3]>,
     #[serde(default)]
     spatial_radius: Option<f64>,
+    /// Accepted for protocol backward-compatibility; the ledger's stored column name is used.
     #[serde(default = "default_sts_column")]
+    #[allow(dead_code)]
     sts_column: String,
     #[serde(default)]
     query_type: QueryType,
@@ -345,7 +347,7 @@ impl FlightService for SolocFlightService {
                 .map_err(|_| Status::internal("ledger lock poisoned"))?;
             match ticket.query_type {
                 QueryType::Filter => ledger
-                    .stream_query(&filter, &ticket.sts_column)
+                    .stream_query(&filter)
                     .filter_map(|r| r.ok())
                     .filter(|b| b.num_rows() > 0)
                     .map(|b| inject_registry(&b, &registry))
@@ -621,8 +623,12 @@ impl FlightService for SolocFlightService {
             "load_ledger" => {
                 let body: SaveLedgerBody = serde_json::from_slice(&action.body)
                     .map_err(|e| Status::invalid_argument(format!("invalid load_ledger body: {e}")))?;
-                let new_ledger = soloc::ledger::Ledger::load_ipc(std::path::Path::new(&body.path))
-                    .map_err(|e| Status::internal(format!("load_ledger failed: {e}")))?;
+                let new_ledger = soloc::ledger::Ledger::load_ipc(
+                    std::path::Path::new(&body.path),
+                    &self.state.sts_column,
+                    &self.state.id_column,
+                )
+                .map_err(|e| Status::internal(format!("load_ledger failed: {e}")))?;
                 let n = new_ledger.len();
                 *self
                     .state
