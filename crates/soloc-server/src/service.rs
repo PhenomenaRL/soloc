@@ -17,7 +17,6 @@ use serde::Deserialize;
 use tonic::{Request, Response, Status, Streaming};
 
 use anise::almanac::metaload::MetaFile;
-use soloc::entity::entity_schema;
 use soloc::ephemeris::naif_snapshot;
 use spacetimestamp::query::SpatiotemporalFilter;
 use spacetimestamp::schema::{FrameRegistry, STS_REGISTRY_METADATA_KEY};
@@ -303,10 +302,15 @@ impl FlightService for SolocFlightService {
         &self,
         _: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        let schema = entity_schema(None);
+        let schema = self
+            .state
+            .ledger
+            .read()
+            .map_err(|_| Status::internal("ledger lock poisoned"))?
+            .schema()
+            .clone();
         let ipc_options = IpcWriteOptions::default();
         let schema_as_ipc = SchemaAsIpc::new(&schema, &ipc_options);
-        // Conversion is infallible (Error = Infallible).
         let flight_data: FlightData = schema_as_ipc.try_into().unwrap();
         Ok(Response::new(SchemaResult {
             schema: flight_data.data_header,

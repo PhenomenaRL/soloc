@@ -40,14 +40,20 @@ use std::path::Path;
 use anise::prelude::Almanac;
 use spacetimestamp::ephemeris::j2000_tai;
 use spacetimestamp::query::{SpatiotemporalFilter, filter_batch};
-use spacetimestamp::schema::is_entity_uri;
+use spacetimestamp::schema::{FrameRegistry, is_entity_uri};
 use spacetimestamp::transforms::transform_batch;
+
+use crate::schemas::SolocSchema;
 
 /// Merge batches in memory when the count exceeds this to keep query latency bounded.
 ///
 /// Benchmarks show ~11 µs fixed overhead per batch. At 50 batches of ≥1000 rows each,
 /// time-filter queries stay under ~1 ms. Beyond this threshold, merging pays off.
 const SEGMENT_THRESHOLD: usize = 50;
+
+/// Default staleness window for [`Ledger::current_state`] when `not_before` is not supplied.
+/// Rows older than (latest stored timestamp − this window) are excluded.
+const CURRENT_STATE_WINDOW_NS: u64 = 3_600 * 1_000_000_000; // 1 hour
 
 /// Required field names inside the spacetimestamp struct column.
 const STS_REQUIRED_FIELDS: &[&str] = &[
@@ -70,6 +76,9 @@ const STS_REQUIRED_FIELDS: &[&str] = &[
 /// ```
 #[derive(Debug)]
 pub struct Ledger {
+    /// The Arrow schema this ledger was created with. Stored so it is always
+    /// available even when the ledger is empty (no batches yet).
+    schema: SchemaRef,
     batches: Vec<RecordBatch>,
     /// Name of the spacetimestamp struct column (e.g. `"spacetimestamp"`).
     sts_column: String,
@@ -88,10 +97,28 @@ impl Ledger {
     pub fn new(schema: &SchemaRef, sts_column: &str, id_column: &str) -> Result<Self, String> {
         Self::validate_schema(schema, sts_column, id_column)?;
         Ok(Self {
+            schema: schema.clone(),
             batches: Vec::new(),
             sts_column: sts_column.to_string(),
             id_column: id_column.to_string(),
         })
+    }
+
+    /// Creates an empty ledger from a [`SolocSchema`] implementor.
+    ///
+    /// This is the preferred constructor when working with a known schema type:
+    ///
+    /// ```rust,ignore
+    /// use soloc::schemas::entity::EntitySchema;
+    /// let ledger = Ledger::for_schema::<EntitySchema>(None)?;
+    /// ```
+    pub fn for_schema<S: SolocSchema>(registry: Option<&FrameRegistry>) -> Result<Self, String> {
+        Self::new(&S::schema(registry), S::sts_column(), S::id_column())
+    }
+
+    /// Returns the Arrow schema this ledger was created with.
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
     }
 
     /// Validates that `schema` is compatible with the given column names.
@@ -140,7 +167,7 @@ impl Ledger {
         if self.batches.len() <= SEGMENT_THRESHOLD {
             return;
         }
-        if let Ok(merged) = arrow::compute::concat_batches(&self.batches[0].schema(), &self.batches) {
+        if let Ok(merged) = arrow::compute::concat_batches(&self.schema, &self.batches) {
             self.batches = vec![merged];
         }
     }
@@ -167,7 +194,6 @@ impl Ledger {
             return Err("Ledger is empty".to_string());
         }
 
-        let schema = self.batches[0].schema();
         let mut kept: Vec<RecordBatch> = Vec::new();
 
         for batch in &self.batches {
@@ -178,10 +204,10 @@ impl Ledger {
         }
 
         if kept.is_empty() {
-            return Ok(RecordBatch::new_empty(schema));
+            return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
 
-        arrow::compute::concat_batches(&schema, &kept)
+        arrow::compute::concat_batches(&self.schema, &kept)
             .map_err(|e| format!("Failed to concatenate filtered batches: {e}"))
     }
 
@@ -439,25 +465,35 @@ impl Ledger {
         Ok(())
     }
 
+    /// Merges all batches into a single [`RecordBatch`] for serialisation.
+    ///
+    /// Arrow IPC's `FileWriter` does not support dictionary replacement — if two batches
+    /// carry different dictionary arrays for the same field (even with identical values),
+    /// the write fails. `concat_batches` unifies dictionaries, so writing the merged
+    /// result as a single batch is always safe.
+    fn merge_for_ipc(&self) -> Result<RecordBatch, String> {
+        if self.batches.len() == 1 {
+            return Ok(self.batches[0].clone());
+        }
+        arrow::compute::concat_batches(&self.schema, &self.batches)
+            .map_err(|e| format!("Failed to merge batches for IPC write: {e}"))
+    }
+
     /// Serializes all batches to an Arrow IPC file at `path`.
     pub fn save_ipc(&self, path: &Path) -> Result<(), String> {
         if self.batches.is_empty() {
             return Err("Cannot save an empty ledger".to_string());
         }
 
-        let schema = self.batches[0].schema();
+        let merged = self.merge_for_ipc()?;
         let file = File::create(path)
             .map_err(|e| format!("Failed to create '{}': {e}", path.display()))?;
 
-        let mut writer = FileWriter::try_new(file, &schema)
+        let mut writer = FileWriter::try_new(file, &self.schema)
             .map_err(|e| format!("Failed to create Arrow IPC writer: {e}"))?;
-
-        for batch in &self.batches {
-            writer
-                .write(batch)
-                .map_err(|e| format!("Failed to write batch to IPC: {e}"))?;
-        }
-
+        writer
+            .write(&merged)
+            .map_err(|e| format!("Failed to write batch to IPC: {e}"))?;
         writer
             .finish()
             .map_err(|e| format!("Failed to finalise IPC file: {e}"))?;
@@ -465,36 +501,67 @@ impl Ledger {
         Ok(())
     }
 
-    /// Returns the single best pose per entity across the entire ledger.
+    /// Returns the maximum stored timestamp as a J2000-relative [`Duration`], or `None`
+    /// if the ledger is empty or contains no parseable timestamps.
+    fn latest_stored_duration(&self) -> Option<Duration> {
+        let mut latest: Option<Duration> = None;
+        for batch in &self.batches {
+            let sts = batch
+                .column_by_name(&self.sts_column)
+                .and_then(|c| c.as_any().downcast_ref::<StructArray>())?;
+            let cent_arr = sts
+                .column_by_name("duration_centuries")
+                .and_then(|c| c.as_any().downcast_ref::<Int16Array>())?;
+            let ns_arr = sts
+                .column_by_name("duration_ns")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())?;
+            for row in 0..batch.num_rows() {
+                let dur = Duration::from_parts(cent_arr.value(row), ns_arr.value(row));
+                latest = Some(match latest {
+                    None => dur,
+                    Some(prev) => prev.max(dur),
+                });
+            }
+        }
+        latest
+    }
+
+    /// Returns the single best pose per row-key across the entire ledger.
     ///
     /// "Best" is determined by:
     /// 1. Most recent timestamp (highest `duration_centuries` / `duration_ns`).
     /// 2. For equal timestamps, source priority: `MEASURED` > `PREDICTED` > `SIMULATED`.
     /// 3. For equal timestamps and equal priority, later insertion order wins.
     ///
-    /// `entity_ids`: if `Some` and this ledger has no `id_column`, returns an empty batch.
+    /// `id_filter`: if `Some`, only rows whose id-column value is in the set are included.
+    ///   If this ledger has no `id_column`, an `id_filter` of `Some(_)` returns an empty batch.
+    ///
     /// `not_before`: rows whose timestamp is strictly before this epoch are excluded.
+    ///   When `None`, defaults to (latest stored timestamp − [`CURRENT_STATE_WINDOW_NS`]).
     pub fn current_state(
         &self,
-        entity_ids: Option<&[&str]>,
+        id_filter: Option<&[&str]>,
         not_before: Option<Epoch>,
     ) -> Result<RecordBatch, String> {
         if self.batches.is_empty() {
             return Err("Ledger is empty".to_string());
         }
 
-        let cutoff: Option<Duration> = not_before.map(|ep| ep - j2000_tai());
-        let entity_filter: Option<HashSet<&str>> =
-            entity_ids.map(|ids| ids.iter().copied().collect());
+        let cutoff: Option<Duration> = match not_before {
+            Some(ep) => Some(ep - j2000_tai()),
+            None => self.latest_stored_duration().map(|latest| {
+                latest - Duration::from_parts(0, CURRENT_STATE_WINDOW_NS)
+            }),
+        };
+        let id_filter_set: Option<HashSet<&str>> =
+            id_filter.map(|ids| ids.iter().copied().collect());
 
-        let schema = self.batches[0].schema();
-
-        // If caller asked for specific entities but we have no id column, return empty.
-        if entity_filter.is_some() && self.id_column.is_empty() {
-            return Ok(RecordBatch::new_empty(schema));
+        // If caller asked for specific ids but we have no id column, return empty.
+        if id_filter_set.is_some() && self.id_column.is_empty() {
+            return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
 
-        // entity_id → (epoch_dur, priority, batch_idx, row_idx)
+        // row_key → (epoch_dur, priority, batch_idx, row_idx)
         let mut best: HashMap<String, (Duration, u8, usize, usize)> = HashMap::new();
 
         for (batch_idx, batch) in self.batches.iter().enumerate() {
@@ -547,7 +614,7 @@ impl Ledger {
                     row.to_string()
                 };
 
-                if let Some(ref filter) = entity_filter {
+                if let Some(ref filter) = id_filter_set {
                     if !filter.contains(row_key.as_str()) {
                         continue;
                     }
@@ -578,7 +645,7 @@ impl Ledger {
         }
 
         if best.is_empty() {
-            return Ok(RecordBatch::new_empty(schema));
+            return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
 
         let mut rows: Vec<RecordBatch> = Vec::with_capacity(best.len());
@@ -601,7 +668,7 @@ impl Ledger {
             );
         }
 
-        arrow::compute::concat_batches(&schema, &rows)
+        arrow::compute::concat_batches(&self.schema, &rows)
             .map_err(|e| format!("failed to concatenate current_state rows: {e}"))
     }
 
@@ -630,6 +697,7 @@ impl Ledger {
         }
 
         Ok(Self {
+            schema,
             batches,
             sts_column: sts_column.to_string(),
             id_column: id_column.to_string(),
@@ -641,14 +709,12 @@ impl Ledger {
         if self.batches.is_empty() {
             return Err("Cannot save an empty ledger".to_string());
         }
-        let schema = self.batches[0].schema();
+        let merged = self.merge_for_ipc()?;
         let mut buf: Vec<u8> = Vec::new();
         {
-            let mut writer = FileWriter::try_new(&mut buf, &schema)
+            let mut writer = FileWriter::try_new(&mut buf, &self.schema)
                 .map_err(|e| format!("Failed to create Arrow IPC writer: {e}"))?;
-            for batch in &self.batches {
-                writer.write(batch).map_err(|e| format!("Failed to write batch: {e}"))?;
-            }
+            writer.write(&merged).map_err(|e| format!("Failed to write batch: {e}"))?;
             writer.finish().map_err(|e| format!("Failed to finalise IPC: {e}"))?;
         }
         Ok(buf)
@@ -673,6 +739,7 @@ impl Ledger {
             return Err("IPC bytes contained no record batches".to_string());
         }
         Ok(Self {
+            schema,
             batches,
             sts_column: sts_column.to_string(),
             id_column: id_column.to_string(),
@@ -786,7 +853,7 @@ mod tests {
     }
 
     fn make_entity_ledger() -> Ledger {
-        use crate::entity::entity_schema;
+        use crate::schemas::entity::entity_schema;
         Ledger::new(&entity_schema(None), "spacetimestamp", "entity_id").unwrap()
     }
 
@@ -898,7 +965,11 @@ mod tests {
 
         let bytes = ledger.save_ipc_to_bytes().unwrap();
         let loaded = Ledger::load_ipc_from_bytes(&bytes, "spacetimestamp", "").unwrap();
-        assert_eq!(loaded.len(), 2);
+        // Rows are preserved; batches are merged into 1 during save to avoid
+        // Arrow IPC "dictionary replacement" errors across separate batches.
+        assert_eq!(loaded.len(), 1);
+        let total_rows: usize = loaded.batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
     }
 
     #[test]
@@ -911,7 +982,11 @@ mod tests {
         ledger.save_ipc(&path).unwrap();
 
         let loaded = Ledger::load_ipc(&path, "spacetimestamp", "").unwrap();
-        assert_eq!(loaded.len(), 2);
+        // Rows are preserved; batches are merged into 1 during save to avoid
+        // Arrow IPC "dictionary replacement" errors across separate batches.
+        assert_eq!(loaded.len(), 1);
+        let total_rows: usize = loaded.batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
         std::fs::remove_file(path).ok();
     }
 
@@ -950,7 +1025,7 @@ mod tests {
         quat: [f64; 4],
         ns: u64,
     ) -> RecordBatch {
-        use crate::entity::EntityBuilder;
+        use crate::schemas::entity::EntityBuilder;
         let mut b = EntityBuilder::new(1, None);
         b.append_entity(
             entity_id, frame_id, "km", "TAI", "test:src", "MEASURED",
@@ -1041,7 +1116,7 @@ mod tests {
         ns: u64,
         estimate_type: &str,
     ) -> RecordBatch {
-        use crate::entity::EntityBuilder;
+        use crate::schemas::entity::EntityBuilder;
         let mut b = EntityBuilder::new(1, None);
         b.append_entity(
             entity_id, "ICRF", "km", "TAI", "test:src", estimate_type,
@@ -1129,7 +1204,7 @@ mod tests {
     #[test]
     fn test_current_state_all_entities() {
         let mut ledger = make_entity_ledger();
-        use crate::entity::EntityBuilder;
+        use crate::schemas::entity::EntityBuilder;
         let batch0 = {
             let mut b = EntityBuilder::new(2, None);
             b.append_entity("demo:A", "ICRF", "km", "TAI", "src", "MEASURED",

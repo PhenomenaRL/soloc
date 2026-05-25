@@ -19,7 +19,7 @@ use arrow::record_batch::RecordBatch;
 use hifitime::Epoch;
 use spacetimestamp::ephemeris::{epoch_to_parts, query_celestial_state, query_naif_state};
 
-use crate::entity::EntityBuilder;
+use crate::schemas::entity::EntityBuilder;
 use crate::ledger::Ledger;
 
 // Re-export CelestialBody so existing callers (`soloc::ephemeris::CelestialBody`) are unaffected.
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn test_append_celestial_does_not_mutate_ledger_on_error() {
         let mut ledger = crate::ledger::Ledger::new(
-            &crate::entity::entity_schema(None),
+            &crate::schemas::entity::entity_schema(None),
             "spacetimestamp",
             "entity_id",
         )

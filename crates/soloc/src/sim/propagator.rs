@@ -43,7 +43,7 @@ use arrow::record_batch::RecordBatch;
 use hifitime::{Duration, Epoch};
 use std::str::FromStr;
 
-use crate::entity::EntityBuilder;
+use crate::schemas::entity::EntityBuilder;
 use super::integrator::{rk4_step, State6};
 
 // ---------------------------------------------------------------------------

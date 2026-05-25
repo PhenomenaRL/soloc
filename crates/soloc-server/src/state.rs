@@ -1,5 +1,5 @@
 use anise::almanac::Almanac;
-use soloc::entity::entity_schema;
+use soloc::schemas::entity::entity_schema;
 use soloc::ledger::Ledger;
 use spacetimestamp::schema::FrameRegistry;
 use std::path::PathBuf;

@@ -13,9 +13,12 @@ use anise::constants::celestial_objects::{
 };
 use anise::constants::frames::SSB_J2000;
 use anise::prelude::{Almanac, Frame};
+use arrow::record_batch::RecordBatch;
 use hifitime::Epoch;
 use nalgebra::{Rotation3, UnitQuaternion};
 use std::str::FromStr;
+
+use crate::schema::SpaceTimestampBuilder;
 
 // ---------------------------------------------------------------------------
 // Epoch helpers
@@ -300,6 +303,48 @@ pub fn query_naif_state(
         duration_centuries,
         duration_ns,
     })
+}
+
+// ---------------------------------------------------------------------------
+// STS snapshot
+// ---------------------------------------------------------------------------
+
+/// Queries the ephemeris for the given bodies at `epoch` and returns a plain
+/// SpaceTimestamp [`RecordBatch`].
+///
+/// Each row contains position, orientation, and time in ICRF/TAI/km — the core
+/// spatiotemporal data only. There are no schema-specific fields (velocity, mass,
+/// entity_id). Use `soloc::ephemeris::celestial_snapshot` when you need those.
+///
+/// # Errors
+/// Returns `Err` if `bodies` is empty or the almanac cannot resolve any body.
+pub fn celestial_sts_snapshot(
+    almanac: &Almanac,
+    bodies: &[CelestialBody],
+    epoch: Epoch,
+) -> Result<RecordBatch, String> {
+    if bodies.is_empty() {
+        return Err("bodies list is empty — provide at least one CelestialBody".to_string());
+    }
+    let (centuries, ns) = epoch_to_parts(epoch);
+    let mut builder = SpaceTimestampBuilder::new(bodies.len(), None);
+    for &body in bodies {
+        let cs = query_celestial_state(almanac, body, epoch)?;
+        builder.append_spacetimestamp(
+            "ICRF",
+            "km",
+            "TAI",
+            "naif:de440s",
+            "MEASURED",
+            cs.position_km,
+            cs.orientation,
+            centuries,
+            ns,
+            None,
+            None,
+        );
+    }
+    Ok(builder.flush())
 }
 
 // ---------------------------------------------------------------------------
