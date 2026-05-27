@@ -41,7 +41,7 @@ use anise::prelude::Almanac;
 use spacetimestamp::ephemeris::j2000_tai;
 use spacetimestamp::query::{SpatiotemporalFilter, filter_batch};
 use spacetimestamp::schema::{FrameRegistry, is_entity_uri};
-use spacetimestamp::transforms::transform_batch;
+use spacetimestamp::transforms::{normalize_batch_to_tai, transform_batch};
 
 use crate::schemas::SolocSchema;
 
@@ -153,9 +153,17 @@ impl Ledger {
         Ok(())
     }
 
-    /// Appends a batch to the ledger. Existing data is never modified.
+    /// Appends a batch to the ledger, normalizing all timestamps to TAI before storing.
+    ///
+    /// Rows whose `timescale_id` is already `"TAI"` are passed through with no allocation.
+    /// Rows in other timescales (UTC, GPS, TDB, …) are converted to TAI-relative
+    /// `(duration_centuries, duration_ns)` using the declared `timescale_id` as the J2000
+    /// reference. After this call all stored data uses a single timescale, making temporal
+    /// comparisons and almanac queries unambiguous.
     pub fn append(&mut self, batch: RecordBatch) {
-        self.batches.push(batch);
+        let normalized = normalize_batch_to_tai(&batch, &self.sts_column)
+            .expect("normalize_batch_to_tai failed — schema was validated at Ledger construction");
+        self.batches.push(normalized);
         self.seal_and_flush_if_needed();
     }
 

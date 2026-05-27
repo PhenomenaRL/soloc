@@ -11,4 +11,6 @@ pub mod transforms;
 pub mod validation;
 
 // Re-export canonical schema items to the crate root for a clean API.
+pub use crate::ephemeris::{epoch_from_parts, epoch_to_parts, j2000_in_timescale, j2000_tai};
 pub use crate::schema::{SpaceTimestampBuilder, export_sts_schema_to_file, sts_schema};
+pub use crate::transforms::normalize_batch_to_tai;

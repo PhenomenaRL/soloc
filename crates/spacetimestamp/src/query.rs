@@ -20,10 +20,12 @@ use arrow::array::{
 };
 use arrow::datatypes::UInt32Type;
 use arrow::record_batch::RecordBatch;
-use hifitime::{Duration, Epoch};
+use hifitime::{Epoch, TimeScale};
+use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::ephemeris::j2000_tai;
+use crate::ephemeris::epoch_from_parts;
+
 
 /// A spatiotemporal filter for use with [`filter_batch`] and ledger query APIs.
 ///
@@ -129,6 +131,25 @@ pub fn filter_batch(
         .downcast_ref::<UInt64Array>()
         .ok_or("'duration_ns' is not UInt64")?;
 
+    // Extract timescale_id for the time filter — only looked up when time_range is active.
+    let timescale_data: Option<(&DictionaryArray<UInt32Type>, &StringArray)> =
+        if filter.time_range.is_some() {
+            let tc = struct_array
+                .column_by_name("timescale_id")
+                .ok_or("'timescale_id' missing from spacetimestamp struct")?
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+                .ok_or("'timescale_id' is not Dictionary<UInt32, Utf8>")?;
+            let td = tc
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or("'timescale_id' dictionary values are not Utf8")?;
+            Some((tc, td))
+        } else {
+            None
+        };
+
     // Extract position array for spatial filter.
     // We Arc-clone the values array so it outlives the temporary FixedSizeListArray reference.
     let pos_data: Option<(usize, Arc<dyn Array>)> = if filter.spatial_origin.is_some() {
@@ -153,15 +174,17 @@ pub fn filter_batch(
         )
     });
 
-    let j2000 = j2000_tai();
     let mut mask = BooleanBuilder::with_capacity(num_rows);
 
     for i in 0..num_rows {
         let mut keep = true;
 
-        // Time filter: reconstruct epoch from stored duration offset and compare.
-        if let Some((t_start, t_end)) = filter.time_range {
-            let epoch = j2000 + Duration::from_parts(cent_arr.value(i), ns_arr.value(i));
+        // Time filter: reconstruct the physical epoch using the row's declared timescale so
+        // comparisons against the caller-supplied Epoch bounds are always physically correct.
+        if let (Some((t_start, t_end)), Some((tc, td))) = (filter.time_range, timescale_data) {
+            let ts_str = td.value(tc.keys().value(i) as usize);
+            let ts = TimeScale::from_str(ts_str).unwrap_or(TimeScale::TAI);
+            let epoch = epoch_from_parts(cent_arr.value(i), ns_arr.value(i), ts);
             if epoch < t_start || epoch > t_end {
                 keep = false;
             }
@@ -250,7 +273,9 @@ fn apply_boolean_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ephemeris::j2000_tai;
     use crate::schema::{FrameRegistry, SpaceTimestampBuilder, sts_schema};
+    use hifitime::Duration;
     use arrow::datatypes::{DataType, Field, Schema};
 
     fn make_sts_batch(

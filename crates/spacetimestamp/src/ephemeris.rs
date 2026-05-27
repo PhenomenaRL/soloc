@@ -14,7 +14,7 @@ use anise::constants::celestial_objects::{
 use anise::constants::frames::SSB_J2000;
 use anise::prelude::{Almanac, Frame};
 use arrow::record_batch::RecordBatch;
-use hifitime::Epoch;
+use hifitime::{Duration, Epoch, TimeScale};
 use nalgebra::{Rotation3, UnitQuaternion};
 use std::str::FromStr;
 
@@ -31,6 +31,26 @@ use crate::schema::SpaceTimestampBuilder;
 /// offsets from this epoch.
 pub fn j2000_tai() -> Epoch {
     Epoch::from_str("2000-01-01T12:00:00 TAI").expect("J2000 TAI is a valid epoch string")
+}
+
+/// Returns the J2000 reference epoch in the given timescale.
+///
+/// `(duration_centuries, duration_ns)` stored with `timescale_id` equal to `ts` are
+/// SI-second offsets from this calendar moment — `2000-01-01T12:00:00` in that timescale.
+/// Each timescale's J2000 is a different physical moment (e.g. J2000 UTC is 32 SI seconds
+/// earlier than J2000 TAI due to the leap-second offset in 2000).
+pub fn j2000_in_timescale(ts: TimeScale) -> Epoch {
+    Epoch::from_gregorian(2000, 1, 1, 12, 0, 0, 0, ts)
+}
+
+/// Reconstructs a physical [`Epoch`] from stored `(duration_centuries, duration_ns)` and
+/// the timescale that was used as the J2000 reference when those values were computed.
+///
+/// This is the read-side complement to `epoch_to_parts_in`: given the stored raw integers
+/// and their declared `timescale_id`, return the unambiguous physical moment as a hifitime
+/// `Epoch` (internally always TAI-equivalent), suitable for almanac queries or comparison.
+pub fn epoch_from_parts(centuries: i16, ns: u64, ts: TimeScale) -> Epoch {
+    j2000_in_timescale(ts) + Duration::from_parts(centuries, ns)
 }
 
 /// Converts an [`Epoch`] to the `(duration_centuries, duration_ns)` offset from J2000 TAI
@@ -381,6 +401,59 @@ mod tests {
         let (c, n) = epoch_to_parts(before);
         let recovered = j2000 + Duration::from_parts(c, n);
         assert_eq!(recovered, before);
+    }
+
+    #[test]
+    fn test_j2000_in_timescale_tai_matches_j2000_tai() {
+        // J2000 in TAI must exactly equal j2000_tai().
+        assert_eq!(j2000_in_timescale(TimeScale::TAI), j2000_tai());
+    }
+
+    #[test]
+    fn test_j2000_utc_differs_from_j2000_tai() {
+        // TAI leads UTC by 32 s in 2000, so the TAI clock reads noon 32 s before the UTC clock.
+        // J2000 UTC (noon UTC) is therefore a physical moment 32 s AFTER J2000 TAI (noon TAI).
+        let tai = j2000_tai();
+        let utc = j2000_in_timescale(TimeScale::UTC);
+        let diff_s = (tai - utc).to_seconds();
+        // tai < utc in physical time, so (tai − utc) ≈ −32 s.
+        assert!((diff_s + 32.0).abs() < 1.0, "J2000 UTC should be ~32s after J2000 TAI, got diff = {diff_s}s");
+    }
+
+    #[test]
+    fn test_epoch_from_parts_tai_round_trips() {
+        let original = j2000_tai() + Duration::from_parts(0, 500_000_000_000u64);
+        let (c, n) = epoch_to_parts(original);
+        let recovered = epoch_from_parts(c, n, TimeScale::TAI);
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn test_epoch_from_parts_utc_gives_correct_physical_moment() {
+        // A UTC timestamp: compute parts relative to J2000 UTC, then reconstruct.
+        // The recovered Epoch should match the original physical moment.
+        let j2000_utc = j2000_in_timescale(TimeScale::UTC);
+        let offset = Duration::from_parts(0, 1_000_000_000u64); // 1 second
+        let utc_epoch = j2000_utc + offset;
+        let (c, n) = (utc_epoch - j2000_utc).to_parts();
+        let recovered = epoch_from_parts(c, n, TimeScale::UTC);
+        assert_eq!(recovered, utc_epoch);
+    }
+
+    #[test]
+    fn test_tai_and_utc_parts_for_same_moment_differ() {
+        // For the same physical moment, parts relative to J2000 TAI vs J2000 UTC differ.
+        // J2000 UTC is 32 s LATER than J2000 TAI, so UTC parts are ~32 s SMALLER
+        // (closer to zero) than TAI parts for any epoch after both J2000 references.
+        let physical_moment = j2000_tai() + Duration::from_parts(0, 1_000_000_000u64);
+        let (tai_c, tai_n) = epoch_to_parts(physical_moment);
+        let utc_j2000 = j2000_in_timescale(TimeScale::UTC);
+        let (utc_c, utc_n) = (physical_moment - utc_j2000).to_parts();
+        let tai_ns_total = tai_c as i64 * 36_525i64 * 86_400 * 1_000_000_000 + tai_n as i64;
+        let utc_ns_total = utc_c as i64 * 36_525i64 * 86_400 * 1_000_000_000 + utc_n as i64;
+        // utc_parts < tai_parts because the UTC reference is later: utc_ns - tai_ns ≈ -32 s.
+        let diff_s = (utc_ns_total - tai_ns_total) as f64 / 1e9;
+        assert!((diff_s + 32.0).abs() < 1.0, "UTC parts should be ~32s less than TAI parts, got {diff_s}s");
     }
 
     #[test]

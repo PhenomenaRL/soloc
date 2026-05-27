@@ -42,17 +42,18 @@
 use anise::prelude::*;
 use arrow::array::{
     Array, DictionaryArray, FixedSizeListArray, FixedSizeListBuilder, Float64Array, Float64Builder,
-    Int16Array, StringArray, StructArray, UInt64Array,
+    Int16Array, Int16Builder, StringArray, StringDictionaryBuilder, StructArray, UInt64Array,
+    UInt64Builder,
 };
 use arrow::datatypes::{UInt16Type, UInt32Type};
 use arrow::record_batch::RecordBatch;
-use hifitime::{Duration, TimeScale};
+use hifitime::TimeScale;
 use nalgebra::{Isometry3, Point3, Quaternion, Rotation3, Translation3, UnitQuaternion, Vector3};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::ephemeris::j2000_tai;
+use crate::ephemeris::{epoch_from_parts, epoch_to_parts};
 use crate::schema::{FrameRegistry, STS_REGISTRY_METADATA_KEY, SpaceTimestampBuilder};
 
 /// Converts a position/velocity unit string to a multiplier yielding kilometers.
@@ -337,7 +338,6 @@ pub fn transform_batch(
     let num_rows = batch.num_rows();
     let mut sts_builder = SpaceTimestampBuilder::new(num_rows, registry.clone());
 
-    let j2000_epoch = j2000_tai();
     let to_target_factor = 1.0 / unit_to_km_factor(target_unit);
 
     // 4. Iterate over the data and apply transformations.
@@ -368,11 +368,11 @@ pub fn transform_batch(
             None
         };
 
-        // Construct epoch from TAI duration offset from J2000.
-        // timescale_id identifies the original measurement context but is not applied here.
-        let _timescale = TimeScale::from_str(ts_str).unwrap_or(TimeScale::TAI);
-        let duration = Duration::from_parts(centuries, ns);
-        let epoch = j2000_epoch + duration;
+        // Reconstruct the physical epoch from the stored (centuries, ns) and their declared
+        // timescale. epoch_from_parts applies the correct J2000 reference for that timescale
+        // so the resulting Epoch is always physically correct regardless of storage timescale.
+        let timescale = TimeScale::from_str(ts_str).unwrap_or(TimeScale::TAI);
+        let epoch = epoch_from_parts(centuries, ns, timescale);
 
         let to_km = unit_to_km_factor(current_unit);
 
@@ -498,6 +498,103 @@ pub fn transform_batch(
     }
 
     RecordBatch::try_new(schema, final_columns).map_err(|e| format!("Batch rebuild error: {e}"))
+}
+
+/// Rewrites the time fields in the named spacetimestamp struct column so every row is stored
+/// relative to J2000 TAI, regardless of the original `timescale_id`.
+///
+/// After normalization, `timescale_id` is `"TAI"` for all rows and `(duration_centuries,
+/// duration_ns)` are SI-second offsets from `2000-01-01T12:00:00 TAI`. Rows already in TAI
+/// are passed through unchanged (fast path when all rows are TAI — returns a cheap clone).
+///
+/// This is called by [`soloc::ledger::Ledger::append`] so that all stored data shares a
+/// single timescale, making temporal comparisons and almanac queries unambiguous.
+pub fn normalize_batch_to_tai(
+    batch: &RecordBatch,
+    sts_column_name: &str,
+) -> Result<RecordBatch, String> {
+    let schema = batch.schema();
+    let col_idx = schema
+        .index_of(sts_column_name)
+        .map_err(|_| format!("Column '{}' not found in batch", sts_column_name))?;
+
+    let struct_array = batch
+        .column(col_idx)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| format!("'{}' is not a StructArray", sts_column_name))?;
+
+    let timescales = struct_array
+        .column_by_name("timescale_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt32Type>>()
+        .unwrap();
+    let ts_dict = timescales.values().as_any().downcast_ref::<StringArray>().unwrap();
+
+    // Fast path: every row is already TAI — nothing to do.
+    let all_tai = (0..timescales.len()).all(|i| {
+        ts_dict.value(timescales.keys().value(i) as usize) == "TAI"
+    });
+    if all_tai {
+        return Ok(batch.clone());
+    }
+
+    let cent_arr = struct_array
+        .column_by_name("duration_centuries")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .unwrap();
+    let ns_arr = struct_array
+        .column_by_name("duration_ns")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+
+    let num_rows = batch.num_rows();
+    let mut new_cents = Int16Builder::with_capacity(num_rows);
+    let mut new_ns = UInt64Builder::with_capacity(num_rows);
+    let mut new_ts: StringDictionaryBuilder<UInt32Type> =
+        StringDictionaryBuilder::with_capacity(num_rows, 1, 3);
+
+    for i in 0..num_rows {
+        let ts_str = ts_dict.value(timescales.keys().value(i) as usize);
+        let (c, n) = if ts_str == "TAI" {
+            (cent_arr.value(i), ns_arr.value(i))
+        } else {
+            let ts = TimeScale::from_str(ts_str).unwrap_or(TimeScale::TAI);
+            let epoch = epoch_from_parts(cent_arr.value(i), ns_arr.value(i), ts);
+            epoch_to_parts(epoch)
+        };
+        new_cents.append_value(c);
+        new_ns.append_value(n);
+        new_ts.append_value("TAI");
+    }
+
+    // Rebuild the struct: replace only the three time-related child arrays.
+    let struct_fields = struct_array.fields().clone();
+    let mut new_children: Vec<Arc<dyn Array>> =
+        struct_array.columns().iter().map(Arc::clone).collect();
+
+    let ts_idx = struct_fields.iter().position(|f| f.name() == "timescale_id").unwrap();
+    let cent_idx = struct_fields.iter().position(|f| f.name() == "duration_centuries").unwrap();
+    let ns_idx = struct_fields.iter().position(|f| f.name() == "duration_ns").unwrap();
+
+    new_children[ts_idx] = Arc::new(new_ts.finish());
+    new_children[cent_idx] = Arc::new(new_cents.finish());
+    new_children[ns_idx] = Arc::new(new_ns.finish());
+
+    let new_struct =
+        StructArray::try_new(struct_fields, new_children, struct_array.nulls().cloned())
+            .map_err(|e| format!("Failed to rebuild spacetimestamp struct: {e}"))?;
+
+    let mut final_columns = batch.columns().to_vec();
+    final_columns[col_idx] = Arc::new(new_struct);
+
+    RecordBatch::try_new(schema, final_columns)
+        .map_err(|e| format!("Failed to rebuild batch after TAI normalization: {e}"))
 }
 
 #[cfg(test)]
@@ -722,5 +819,90 @@ mod tests {
             .and_then(iau_frame_from_name);
         assert!(titan_frame.is_some(), "IAU_TITAN should resolve via strip_prefix path");
         assert_eq!(titan_frame.unwrap().ephemeris_id, 606);
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_batch_to_tai tests
+    // -----------------------------------------------------------------------
+
+    fn read_timescale(batch: &RecordBatch, row: usize) -> String {
+        let sts = batch.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+        let ts_col = sts.column_by_name("timescale_id").unwrap()
+            .as_any().downcast_ref::<DictionaryArray<UInt32Type>>().unwrap();
+        let ts_dict = ts_col.values().as_any().downcast_ref::<StringArray>().unwrap();
+        ts_dict.value(ts_col.keys().value(row) as usize).to_string()
+    }
+
+    fn read_centuries_ns(batch: &RecordBatch, row: usize) -> (i16, u64) {
+        let sts = batch.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+        let c = sts.column_by_name("duration_centuries").unwrap()
+            .as_any().downcast_ref::<Int16Array>().unwrap().value(row);
+        let n = sts.column_by_name("duration_ns").unwrap()
+            .as_any().downcast_ref::<UInt64Array>().unwrap().value(row);
+        (c, n)
+    }
+
+    #[test]
+    fn test_normalize_tai_is_noop() {
+        let mut builder = SpaceTimestampBuilder::new(2, None);
+        builder.append_spacetimestamp("ICRF", "km", "TAI", "s", "MEASURED", [0.0; 3], [1.0, 0.0, 0.0, 0.0], 0, 1000, None, None);
+        builder.append_spacetimestamp("ICRF", "km", "TAI", "s", "MEASURED", [0.0; 3], [1.0, 0.0, 0.0, 0.0], 0, 2000, None, None);
+        let batch = make_sts_batch(&mut builder, None);
+        let result = normalize_batch_to_tai(&batch, "spacetimestamp").unwrap();
+        // Should be a cheap clone — same pointer
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(read_timescale(&result, 0), "TAI");
+        assert_eq!(read_centuries_ns(&result, 0), (0, 1000));
+    }
+
+    #[test]
+    fn test_normalize_utc_to_tai_shifts_by_leap_seconds() {
+        use crate::ephemeris::{epoch_from_parts, epoch_to_parts, j2000_in_timescale};
+        // Build a batch with timescale_id = "UTC" and parts relative to J2000 UTC.
+        let j2000_utc = j2000_in_timescale(TimeScale::UTC);
+        let offset = hifitime::Duration::from_parts(0, 5_000_000_000u64); // 5 seconds
+        let utc_epoch = j2000_utc + offset;
+        let (utc_c, utc_n) = (utc_epoch - j2000_utc).to_parts();
+
+        let mut builder = SpaceTimestampBuilder::new(1, None);
+        builder.append_spacetimestamp("ICRF", "km", "UTC", "s", "MEASURED", [0.0; 3], [1.0, 0.0, 0.0, 0.0], utc_c, utc_n, None, None);
+        let batch = make_sts_batch(&mut builder, None);
+
+        let result = normalize_batch_to_tai(&batch, "spacetimestamp").unwrap();
+
+        // After normalization: timescale_id should be TAI.
+        assert_eq!(read_timescale(&result, 0), "TAI");
+
+        // The stored TAI parts should represent the same physical moment.
+        let (tai_c, tai_n) = read_centuries_ns(&result, 0);
+        let recovered = epoch_from_parts(tai_c, tai_n, TimeScale::TAI);
+        assert_eq!(recovered, utc_epoch, "normalized TAI epoch should equal original UTC epoch");
+
+        // The TAI parts differ from the UTC parts (TAI J2000 ≠ UTC J2000).
+        let expected_tai_parts = epoch_to_parts(utc_epoch);
+        assert_eq!((tai_c, tai_n), expected_tai_parts);
+    }
+
+    #[test]
+    fn test_normalize_mixed_timescales() {
+        use crate::ephemeris::{epoch_from_parts, j2000_in_timescale};
+        // Row 0: TAI — should be unchanged.
+        // Row 1: UTC — should be converted.
+        let j2000_utc = j2000_in_timescale(TimeScale::UTC);
+        let utc_epoch = j2000_utc + hifitime::Duration::from_parts(0, 10_000_000_000u64);
+        let (utc_c, utc_n) = (utc_epoch - j2000_utc).to_parts();
+
+        let mut builder = SpaceTimestampBuilder::new(2, None);
+        builder.append_spacetimestamp("ICRF", "km", "TAI", "s", "MEASURED", [0.0; 3], [1.0, 0.0, 0.0, 0.0], 0, 500, None, None);
+        builder.append_spacetimestamp("ICRF", "km", "UTC", "s", "MEASURED", [0.0; 3], [1.0, 0.0, 0.0, 0.0], utc_c, utc_n, None, None);
+        let batch = make_sts_batch(&mut builder, None);
+
+        let result = normalize_batch_to_tai(&batch, "spacetimestamp").unwrap();
+
+        assert_eq!(read_timescale(&result, 0), "TAI");
+        assert_eq!(read_timescale(&result, 1), "TAI");
+        assert_eq!(read_centuries_ns(&result, 0), (0, 500));
+        let (c1, n1) = read_centuries_ns(&result, 1);
+        assert_eq!(epoch_from_parts(c1, n1, TimeScale::TAI), utc_epoch);
     }
 }
