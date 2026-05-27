@@ -490,7 +490,7 @@ impl Ledger {
     /// Serializes all batches to an Arrow IPC file at `path`.
     pub fn save_ipc(&self, path: &Path) -> Result<(), String> {
         if self.batches.is_empty() {
-            return Err("Cannot save an empty ledger".to_string());
+            return Err("Cannot save an empty ledger — use save_schema_ipc to persist just the schema".to_string());
         }
 
         let merged = self.merge_for_ipc()?;
@@ -507,6 +507,85 @@ impl Ledger {
             .map_err(|e| format!("Failed to finalise IPC file: {e}"))?;
 
         Ok(())
+    }
+
+    /// Writes the ledger's schema (and embedded [`FrameRegistry`] metadata) to an Arrow IPC
+    /// file with zero data batches.
+    ///
+    /// The file can be read back by [`Ledger::load_schema_ipc`] or by any language that
+    /// speaks Arrow IPC (Python `pyarrow`, Java, Go, …) — the schema and all metadata are
+    /// preserved in the file header.
+    ///
+    /// Intended use: bake the output file into a Docker image so a freshly started
+    /// `soloc-server` can call [`Ledger::load_schema_ipc`] at startup and be ready to
+    /// accept data without any prior knowledge of the schema at the call-site.
+    pub fn save_schema_ipc(&self, path: &Path) -> Result<(), String> {
+        let file = File::create(path)
+            .map_err(|e| format!("Failed to create '{}': {e}", path.display()))?;
+        let mut writer = FileWriter::try_new(file, &self.schema)
+            .map_err(|e| format!("Failed to create Arrow IPC writer: {e}"))?;
+        writer
+            .finish()
+            .map_err(|e| format!("Failed to finalise schema IPC file: {e}"))?;
+        Ok(())
+    }
+
+    /// Reads the Arrow schema from an IPC file and returns an empty [`Ledger`] configured
+    /// with that schema.
+    ///
+    /// Any data batches present in the file are ignored — this function only cares about
+    /// the schema and its metadata (e.g. an embedded [`FrameRegistry`]).
+    ///
+    /// Pair with [`Ledger::save_schema_ipc`] for schema distribution (e.g. baking a
+    /// schema file into a Docker image).
+    pub fn load_schema_ipc(path: &Path, sts_column: &str, id_column: &str) -> Result<Self, String> {
+        let file = File::open(path)
+            .map_err(|e| format!("Failed to open '{}': {e}", path.display()))?;
+        let reader = FileReader::try_new(file, None)
+            .map_err(|e| format!("Failed to open Arrow IPC reader: {e}"))?;
+        let schema = reader.schema();
+        Self::validate_schema(&schema, sts_column, id_column)?;
+        Ok(Self {
+            schema,
+            batches: Vec::new(),
+            sts_column: sts_column.to_string(),
+            id_column: id_column.to_string(),
+        })
+    }
+
+    /// Serializes the ledger's schema to an in-memory Arrow IPC buffer with zero data batches.
+    ///
+    /// The bytes are in exactly the same format as [`Ledger::save_schema_ipc`] produces.
+    /// Useful for transmitting a schema over the network or embedding it in another format
+    /// without writing a temporary file.
+    pub fn schema_to_ipc_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = FileWriter::try_new(&mut buf, &self.schema)
+                .map_err(|e| format!("Failed to create Arrow IPC writer: {e}"))?;
+            writer
+                .finish()
+                .map_err(|e| format!("Failed to finalise schema IPC bytes: {e}"))?;
+        }
+        Ok(buf)
+    }
+
+    /// Deserializes a schema from an in-memory Arrow IPC buffer and returns an empty
+    /// [`Ledger`] configured with that schema.
+    ///
+    /// Any data batches present in the buffer are ignored.
+    pub fn from_schema_ipc_bytes(bytes: &[u8], sts_column: &str, id_column: &str) -> Result<Self, String> {
+        let cursor = Cursor::new(bytes);
+        let reader = FileReader::try_new(cursor, None)
+            .map_err(|e| format!("Failed to open Arrow IPC reader: {e}"))?;
+        let schema = reader.schema();
+        Self::validate_schema(&schema, sts_column, id_column)?;
+        Ok(Self {
+            schema,
+            batches: Vec::new(),
+            sts_column: sts_column.to_string(),
+            id_column: id_column.to_string(),
+        })
     }
 
     /// Returns the maximum stored timestamp as a J2000-relative [`Duration`], or `None`
@@ -715,7 +794,7 @@ impl Ledger {
     /// Serializes all batches to an in-memory Arrow IPC buffer.
     pub fn save_ipc_to_bytes(&self) -> Result<Vec<u8>, String> {
         if self.batches.is_empty() {
-            return Err("Cannot save an empty ledger".to_string());
+            return Err("Cannot save an empty ledger — use schema_to_ipc_bytes to persist just the schema".to_string());
         }
         let merged = self.merge_for_ipc()?;
         let mut buf: Vec<u8> = Vec::new();
@@ -996,6 +1075,88 @@ mod tests {
         let total_rows: usize = loaded.batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
         std::fs::remove_file(path).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // schema IPC round-trip tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_save_and_load_schema_ipc_round_trip() {
+        let ledger = make_sts_ledger();
+        let path = std::env::temp_dir().join("soloc_schema_test.arrows");
+        ledger.save_schema_ipc(&path).unwrap();
+        let loaded = Ledger::load_schema_ipc(&path, "spacetimestamp", "").unwrap();
+        assert!(loaded.is_empty(), "schema-loaded ledger must be empty");
+        assert_eq!(loaded.schema(), ledger.schema());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_schema_to_and_from_ipc_bytes_round_trip() {
+        let ledger = make_sts_ledger();
+        let bytes = ledger.schema_to_ipc_bytes().unwrap();
+        let loaded = Ledger::from_schema_ipc_bytes(&bytes, "spacetimestamp", "").unwrap();
+        assert!(loaded.is_empty());
+        assert_eq!(loaded.schema(), ledger.schema());
+    }
+
+    #[test]
+    fn test_load_schema_ipc_ignores_data_batches() {
+        // Save a ledger that has data, then reload it as schema-only.
+        // The resulting ledger should be empty regardless of what was in the file.
+        let mut ledger = make_sts_ledger();
+        ledger.append(make_batch([1.0, 2.0, 3.0], 0));
+        let path = std::env::temp_dir().join("soloc_schema_data_test.arrows");
+        ledger.save_ipc(&path).unwrap();
+        let schema_only = Ledger::load_schema_ipc(&path, "spacetimestamp", "").unwrap();
+        assert!(schema_only.is_empty(), "load_schema_ipc must ignore data batches");
+        assert_eq!(schema_only.schema(), ledger.schema());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_schema_ipc_preserves_frame_registry_metadata() {
+        use spacetimestamp::schema::{FrameRegistry, sts_schema};
+        let mut reg = FrameRegistry::new_with_namespace("test_ns");
+        reg.add_frame("cam", "ICRF", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
+        let sts_ref = sts_schema(Some(&reg));
+        let schema = Arc::new(
+            Schema::new(vec![Field::new(
+                "spacetimestamp",
+                DataType::Struct(sts_ref.fields().clone()),
+                false,
+            )])
+            .with_metadata(sts_ref.metadata().clone()),
+        );
+        let ledger = Ledger::new(&schema, "spacetimestamp", "").unwrap();
+
+        let bytes = ledger.schema_to_ipc_bytes().unwrap();
+        let loaded = Ledger::from_schema_ipc_bytes(&bytes, "spacetimestamp", "").unwrap();
+
+        let meta = loaded.schema().metadata().get("soloc.frame_registry").cloned();
+        assert!(meta.is_some(), "FrameRegistry metadata must survive schema IPC round-trip");
+        let recovered = FrameRegistry::from_json(&meta.unwrap()).unwrap();
+        assert_eq!(recovered.namespace, "test_ns");
+        assert!(recovered.frames.contains_key("test_ns:cam"));
+    }
+
+    #[test]
+    fn test_save_schema_ipc_accepts_empty_ledger() {
+        // Unlike save_ipc, save_schema_ipc must not error on an empty ledger.
+        let ledger = make_sts_ledger();
+        assert!(ledger.is_empty());
+        let path = std::env::temp_dir().join("soloc_schema_empty_test.arrows");
+        ledger.save_schema_ipc(&path).unwrap();
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_save_ipc_still_rejects_empty_ledger() {
+        let ledger = make_sts_ledger();
+        assert!(ledger.save_ipc_to_bytes().is_err(), "save_ipc_to_bytes must error on empty ledger");
+        let path = std::env::temp_dir().join("soloc_save_empty_reject.arrows");
+        assert!(ledger.save_ipc(&path).is_err(), "save_ipc must error on empty ledger");
     }
 
     #[test]
