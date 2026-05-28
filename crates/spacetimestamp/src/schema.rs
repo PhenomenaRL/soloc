@@ -21,6 +21,13 @@ use std::collections::{HashMap, HashSet};
 /// The metadata key used to store the serialized `FrameRegistry` in the Arrow schema.
 pub const STS_REGISTRY_METADATA_KEY: &str = "soloc.frame_registry";
 
+/// The fixed name of the spacetimestamp struct column in any soloc schema.
+///
+/// All Arrow schemas that embed a spacetimestamp must use this exact column name.
+/// The name is fixed (not configurable) so that validation, querying, and transforms
+/// can locate the column without caller-supplied parameters.
+pub const STS_COLUMN: &str = "spacetimestamp";
+
 /// Astronomical frame names recognized as external roots by `anise`.
 ///
 /// Any name in this list (or matching `*_IAU` or containing `:`) is treated as an

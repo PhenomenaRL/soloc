@@ -74,16 +74,12 @@ struct StorageConfig {
     /// Ignored when an existing ledger is loaded (schema comes from the IPC file).
     /// When absent and no existing ledger is found, defaults to the standard entity schema.
     schema_path: Option<String>,
-    /// Name of the spacetimestamp struct column. Default: `"spacetimestamp"`.
-    #[serde(default = "default_sts_column")]
-    sts_column: String,
     /// Name of the entity-identity column. Default: `"entity_id"`.
     #[serde(default = "default_id_column")]
     id_column: String,
 }
 
-fn default_sts_column() -> String { "spacetimestamp".to_string() }
-fn default_id_column()  -> String { "entity_id".to_string() }
+fn default_id_column() -> String { "entity_id".to_string() }
 
 /// Ephemeris kernel configuration.
 ///
@@ -190,11 +186,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ledger_path   = cfg.storage.ledger_path.map(PathBuf::from);
     let ledger_url    = cfg.storage.ledger_url;
     let schema_path   = cfg.storage.schema_path.map(PathBuf::from);
-    let sts_column    = cfg.storage.sts_column;
     let id_column     = cfg.storage.id_column;
 
     let state = Arc::new(
-        ServerState::new(almanac, registry_path, ledger_path, ledger_url, schema_path, sts_column, id_column).await,
+        ServerState::new(almanac, registry_path, ledger_path, ledger_url, schema_path, id_column).await,
     );
     let service = SolocFlightService::new(state.clone());
 

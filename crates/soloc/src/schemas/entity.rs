@@ -45,9 +45,6 @@ impl SolocSchema for EntitySchema {
     fn schema(registry: Option<&FrameRegistry>) -> SchemaRef {
         entity_schema(registry)
     }
-    fn sts_column() -> &'static str {
-        "spacetimestamp"
-    }
     fn id_column() -> &'static str {
         "entity_id"
     }
@@ -273,7 +270,6 @@ mod tests {
     #[test]
     fn test_entity_schema_impl() {
         let schema = EntitySchema::schema(None);
-        assert_eq!(EntitySchema::sts_column(), "spacetimestamp");
         assert_eq!(EntitySchema::id_column(), "entity_id");
         assert!(schema.field_with_name("spacetimestamp").is_ok());
     }

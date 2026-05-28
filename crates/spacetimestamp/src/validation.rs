@@ -1,83 +1,90 @@
-use arrow::record_batch::RecordBatch;
-use arrow::array::{Array, AsArray, DictionaryArray};
+use arrow::array::{Array, AsArray, DictionaryArray, StructArray};
 use arrow::datatypes::UInt32Type;
+use arrow::record_batch::RecordBatch;
 use hifitime::TimeScale;
 use std::str::FromStr;
-use crate::schema::{FrameRegistry, STS_REGISTRY_METADATA_KEY};
+use crate::schema::{FrameRegistry, STS_COLUMN, STS_REGISTRY_METADATA_KEY};
 use anise::prelude::Frame;
 
-/// Validates that the dictionary strings for timescale_id and frame_id
-/// comply with hifitime and anise standards, and the local FrameRegistry.
+/// Validates `timescale_id` and `frame_id` values in a batch against hifitime and anise standards.
+///
+/// The batch may be either:
+/// - A nested entity/ledger batch — containing a `"spacetimestamp"` [`StructArray`] column.
+///   The STS fields are read from inside that struct.
+/// - A flat STS batch — produced by [`crate::schema::SpaceTimestampBuilder::flush`].
+///   The STS fields are top-level columns.
+///
+/// Detection is automatic: if a `"spacetimestamp"` struct column is present, the nested
+/// path is taken; otherwise the top-level columns are checked.
 pub fn validate_spacetimestamp_batch(batch: &RecordBatch) -> Result<(), String> {
-    // 1. Extract the optional FrameRegistry from the schema metadata
     let schema = batch.schema();
     let registry = schema
         .metadata()
         .get(STS_REGISTRY_METADATA_KEY)
         .and_then(|json| FrameRegistry::from_json(json).ok());
 
-    // 2. Validate Timescales
-    if let Some(timescale_col) = batch.column_by_name("timescale_id") {
-        let dict_array = timescale_col.as_any().downcast_ref::<DictionaryArray<UInt32Type>>()
+    // Locate the STS fields — either nested inside STS_COLUMN or at the top level.
+    let (timescale_col, frame_col) = match batch.column_by_name(STS_COLUMN) {
+        Some(col) => {
+            let s = col
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| format!("'{}' column is not a StructArray", STS_COLUMN))?;
+            (s.column_by_name("timescale_id"), s.column_by_name("frame_id"))
+        }
+        None => (
+            batch.column_by_name("timescale_id"),
+            batch.column_by_name("frame_id"),
+        ),
+    };
+
+    // Validate timescales.
+    if let Some(col) = timescale_col {
+        let dict = col
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
             .ok_or_else(|| "timescale_id is not a UInt32 Dictionary".to_string())?;
-        
-        let values = dict_array.values().as_string::<i32>();
-        
+        let values = dict.values().as_string::<i32>();
         for i in 0..values.len() {
             if values.is_null(i) { continue; }
             let ts_str = values.value(i);
-            
-            // hifitime validation
             if TimeScale::from_str(ts_str).is_err() {
                 return Err(format!("Invalid timescale: '{}' is not recognized by hifitime", ts_str));
             }
         }
     }
 
-    // 3. Validate Frames
-    if let Some(frame_col) = batch.column_by_name("frame_id") {
-        let dict_array = frame_col.as_any().downcast_ref::<DictionaryArray<UInt32Type>>()
+    // Validate frame IDs.
+    if let Some(col) = frame_col {
+        let dict = col
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
             .ok_or_else(|| "frame_id is not a UInt32 Dictionary".to_string())?;
-            
-        let values = dict_array.values().as_string::<i32>();
-        
+        let values = dict.values().as_string::<i32>();
         for i in 0..values.len() {
             if values.is_null(i) { continue; }
             let frame_str = values.value(i);
-            
-            // a) Is it in the local FrameRegistry?
+
             if let Some(reg) = &registry
                 && reg.frames.contains_key(frame_str) {
-                    continue;
-                }
-
-            // b) Is it a raw NAIF ID?
-            if frame_str.parse::<i32>().is_ok() {
                 continue;
             }
-
-            // c) ICRF/J2000 standard fallbacks
-            if frame_str == "ICRF" || frame_str == "J2000" || frame_str == "EME2000" || frame_str == "IAU_MARS" || frame_str == "IAU_EARTH" {
+            if frame_str.parse::<i32>().is_ok() { continue; }
+            if frame_str == "ICRF" || frame_str == "J2000" || frame_str == "EME2000"
+                || frame_str == "IAU_MARS" || frame_str == "IAU_EARTH" {
                 continue;
             }
+            if crate::schema::is_entity_uri(frame_str) { continue; }
+            let is_compound = frame_str
+                .split_once('_')
+                .map(|(center, orient)| Frame::from_name(center, orient).is_ok())
+                .unwrap_or(false);
+            if is_compound { continue; }
 
-            // d) Entity URI — a forward-reference to another entity in the ledger whose pose
-            // defines this frame at query time. Resolution is deferred to transform_batch /
-            // Ledger::build_dynamic_frame_map; we accept it here unconditionally.
-            if crate::schema::is_entity_uri(frame_str) {
-                continue;
-            }
-
-            // e) Validate via Anise if it's a compound name like "Earth_J2000"
-            let is_compound = frame_str.split_once('_').map(|(center, orient)| {
-                Frame::from_name(center, orient).is_ok()
-            }).unwrap_or(false);
-
-            if is_compound {
-                continue;
-            }
-
-            return Err(format!("Invalid frame_id: '{}' is not recognized by anise or the FrameRegistry", frame_str));
+            return Err(format!(
+                "Invalid frame_id: '{}' is not recognized by anise or the FrameRegistry",
+                frame_str
+            ));
         }
     }
 
@@ -87,110 +94,87 @@ pub fn validate_spacetimestamp_batch(batch: &RecordBatch) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::SpaceTimestampBuilder;
+    use crate::schema::{FrameRegistry, SpaceTimestampBuilder, sts_schema};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
 
-    #[test]
-    fn test_valid_batch() {
-        let mut builder = SpaceTimestampBuilder::new(10, None);
-        builder.append_spacetimestamp(
-            "ICRF",
-            "m",
-            "TAI",
-            "sensor_1",
-            "MEASURED",
-            [0.0; 3],
-            [1.0, 0.0, 0.0, 0.0],
-            0,
-            0,
-            None, None,
-        );
-        let batch = builder.flush();
-        assert!(validate_spacetimestamp_batch(&batch).is_ok());
-    }
-
-    #[test]
-    fn test_invalid_timescale() {
-        let mut builder = SpaceTimestampBuilder::new(10, None);
-        builder.append_spacetimestamp(
-            "ICRF",
-            "m",
-            "NOT_A_TIMESCALE",
-            "sensor_1",
-            "MEASURED",
-            [0.0; 3],
-            [1.0, 0.0, 0.0, 0.0],
-            0,
-            0,
-            None, None,
-        );
-        let batch = builder.flush();
-        let result = validate_spacetimestamp_batch(&batch);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Invalid timescale: 'NOT_A_TIMESCALE'"));
-    }
-
-    #[test]
-    fn test_invalid_frame() {
-        let mut builder = SpaceTimestampBuilder::new(10, None);
-        builder.append_spacetimestamp(
-            "INVALID_FRAME",
-            "m",
-            "TAI",
-            "sensor_1",
-            "MEASURED",
-            [0.0; 3],
-            [1.0, 0.0, 0.0, 0.0],
-            0,
-            0,
-            None, None,
-        );
-        let batch = builder.flush();
-        let result = validate_spacetimestamp_batch(&batch);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Invalid frame_id: 'INVALID_FRAME'"));
-    }
-    
-    #[test]
-    fn test_entity_uri_frame_is_valid() {
+    fn make_flat_batch(frame: &str, timescale: &str) -> RecordBatch {
         let mut builder = SpaceTimestampBuilder::new(1, None);
         builder.append_spacetimestamp(
-            "demo:truck_A",
-            "m",
-            "TAI",
-            "sensor_1",
-            "MEASURED",
-            [1.0, 2.0, 3.0],
-            [1.0, 0.0, 0.0, 0.0],
-            0,
-            0,
-            None, None,
+            frame, "km", timescale, "sensor_1", "MEASURED",
+            [0.0; 3], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None,
         );
-        let batch = builder.flush();
-        assert!(
-            validate_spacetimestamp_batch(&batch).is_ok(),
-            "entity URI frame_id should be accepted as a deferred ledger reference"
+        builder.flush()
+    }
+
+    fn make_nested_batch(frame: &str, timescale: &str) -> RecordBatch {
+        let mut builder = SpaceTimestampBuilder::new(1, None);
+        builder.append_spacetimestamp(
+            frame, "km", timescale, "sensor_1", "MEASURED",
+            [0.0; 3], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None,
         );
+        let struct_array = builder.finish_as_struct();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(STS_COLUMN, DataType::Struct(sts_schema(None).fields().clone()), false),
+        ]));
+        RecordBatch::try_new(schema, vec![Arc::new(struct_array)]).unwrap()
+    }
+
+    #[test]
+    fn test_valid_flat_batch() {
+        assert!(validate_spacetimestamp_batch(&make_flat_batch("ICRF", "TAI")).is_ok());
+    }
+
+    #[test]
+    fn test_valid_nested_batch() {
+        assert!(validate_spacetimestamp_batch(&make_nested_batch("ICRF", "TAI")).is_ok());
+    }
+
+    #[test]
+    fn test_invalid_timescale_flat() {
+        let result = validate_spacetimestamp_batch(&make_flat_batch("ICRF", "NOT_A_TIMESCALE"));
+        assert!(result.unwrap_err().contains("Invalid timescale"));
+    }
+
+    #[test]
+    fn test_invalid_timescale_nested() {
+        let result = validate_spacetimestamp_batch(&make_nested_batch("ICRF", "NOT_A_TIMESCALE"));
+        assert!(result.unwrap_err().contains("Invalid timescale"));
+    }
+
+    #[test]
+    fn test_invalid_frame_flat() {
+        let result = validate_spacetimestamp_batch(&make_flat_batch("INVALID_FRAME", "TAI"));
+        assert!(result.unwrap_err().contains("Invalid frame_id"));
+    }
+
+    #[test]
+    fn test_invalid_frame_nested() {
+        let result = validate_spacetimestamp_batch(&make_nested_batch("INVALID_FRAME", "TAI"));
+        assert!(result.unwrap_err().contains("Invalid frame_id"));
+    }
+
+    #[test]
+    fn test_entity_uri_frame_is_valid() {
+        assert!(validate_spacetimestamp_batch(&make_flat_batch("demo:truck_A", "TAI")).is_ok());
+        assert!(validate_spacetimestamp_batch(&make_nested_batch("demo:truck_A", "TAI")).is_ok());
     }
 
     #[test]
     fn test_valid_custom_frame() {
         let mut reg = FrameRegistry::new_with_namespace("robot");
         reg.add_frame("cam", "ICRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
-        
-        let mut builder = SpaceTimestampBuilder::new(10, Some(reg));
+        let qualified = reg.qualify("cam");
+
+        let mut builder = SpaceTimestampBuilder::new(1, Some(reg));
         builder.append_spacetimestamp(
-            "cam", // will become "robot:cam"
-            "m",
-            "UTC",
-            "sensor_1",
-            "MEASURED",
-            [0.0; 3],
-            [1.0, 0.0, 0.0, 0.0],
-            0,
-            0,
-            None, None,
+            "cam", "km", "UTC", "sensor_1", "MEASURED",
+            [0.0; 3], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None,
         );
         let batch = builder.flush();
+        // The builder qualifies "cam" → "robot:cam" automatically.
+        let _ = qualified;
         assert!(validate_spacetimestamp_batch(&batch).is_ok());
     }
 }

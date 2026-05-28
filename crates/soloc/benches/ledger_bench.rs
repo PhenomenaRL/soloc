@@ -16,23 +16,32 @@ fn make_entity_batch(n_rows: usize, t_offset_ns: u64) -> arrow::record_batch::Re
         let angle = (i as f64) * 2.0 * std::f64::consts::PI / (n_rows as f64);
         builder.append_entity(
             "demo:bench_sat",
-            "ICRF", "km", "TAI", "demo:bench_sat", "SIMULATED",
+            "ICRF",
+            "km",
+            "TAI",
+            "demo:bench_sat",
+            "SIMULATED",
             [6800.0 * angle.cos(), 6800.0 * angle.sin(), 0.0],
             [1.0, 0.0, 0.0, 0.0],
             0,
             t_offset_ns + (i as u64) * 1_000_000,
             Some([0.0, 7.8, 0.0]),
-            None, None, Some(500.0), None,
+            None,
+            None,
+            Some(500.0),
+            None,
         );
     }
     builder.flush()
 }
 
 fn make_ledger(n_batches: usize, rows_per_batch: usize) -> Ledger {
-    let mut ledger = Ledger::new(&entity_schema(None), "spacetimestamp", "entity_id").unwrap();
+    let mut ledger = Ledger::new(&entity_schema(None), "entity_id").unwrap();
     for i in 0..n_batches {
         let t_offset = (i as u64) * (rows_per_batch as u64) * 1_000_000;
-        ledger.append(make_entity_batch(rows_per_batch, t_offset));
+        ledger
+            .append(make_entity_batch(rows_per_batch, t_offset))
+            .unwrap();
     }
     ledger
 }
@@ -53,15 +62,19 @@ fn bench_append(c: &mut Criterion) {
     let batch = make_entity_batch(1_000, 0);
     let mut group = c.benchmark_group("ledger_append");
     for n_batches in [10usize, 100, 1_000] {
-        group.bench_with_input(BenchmarkId::new("n_batches", n_batches), &n_batches, |b, &n| {
-            b.iter(|| {
-                let mut ledger = Ledger::new(&entity_schema(None), "spacetimestamp", "entity_id").unwrap();
-                for _ in 0..n {
-                    ledger.append(black_box(batch.clone()));
-                }
-                ledger
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("n_batches", n_batches),
+            &n_batches,
+            |b, &n| {
+                b.iter(|| {
+                    let mut ledger = Ledger::new(&entity_schema(None), "entity_id").unwrap();
+                    for _ in 0..n {
+                        ledger.append(black_box(batch.clone())).unwrap();
+                    }
+                    ledger
+                })
+            },
+        );
     }
     group.finish();
 }
@@ -101,8 +114,8 @@ fn bench_query_combined_filter(c: &mut Criterion) {
     let mut group = c.benchmark_group("ledger_query_combined_filter");
     for &(n_batches, rows_per_batch) in configs {
         let ledger = make_ledger(n_batches, rows_per_batch);
-        let filter = time_filter_10pct(n_batches, rows_per_batch)
-            .with_spatial([6800.0, 0.0, 0.0], 4000.0);
+        let filter =
+            time_filter_10pct(n_batches, rows_per_batch).with_spatial([6800.0, 0.0, 0.0], 4000.0);
         group.bench_with_input(
             BenchmarkId::new("batches_x_rows", format!("{n_batches}x{rows_per_batch}")),
             &(n_batches, rows_per_batch),
@@ -150,8 +163,7 @@ fn bench_ipc_roundtrip(c: &mut Criterion) {
     for &(n_batches, rows_per_batch) in configs {
         let label = format!("{n_batches}x{rows_per_batch}");
         let ledger = make_ledger(n_batches, rows_per_batch);
-        let path = std::env::temp_dir()
-            .join(format!("soloc_ledger_bench_{label}.arrows"));
+        let path = std::env::temp_dir().join(format!("soloc_ledger_bench_{label}.arrows"));
 
         group.bench_with_input(BenchmarkId::new("save", &label), &label, |b, _| {
             b.iter(|| ledger.save_ipc(black_box(&path)).unwrap())
@@ -160,7 +172,7 @@ fn bench_ipc_roundtrip(c: &mut Criterion) {
         ledger.save_ipc(&path).unwrap();
 
         group.bench_with_input(BenchmarkId::new("load", &label), &label, |b, _| {
-            b.iter(|| Ledger::load_ipc(black_box(&path), "spacetimestamp", "entity_id").unwrap())
+            b.iter(|| Ledger::load_ipc(black_box(&path), "entity_id").unwrap())
         });
 
         std::fs::remove_file(&path).ok();

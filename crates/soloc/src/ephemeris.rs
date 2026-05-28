@@ -167,7 +167,7 @@ pub fn append_naif(
     epoch: Epoch,
 ) -> Result<(), String> {
     let batch = naif_snapshot(almanac, bodies, epoch)?;
-    ledger.append(batch);
+    ledger.append(batch)?;
     Ok(())
 }
 
@@ -182,7 +182,7 @@ pub fn append_celestial(
     epoch: Epoch,
 ) -> Result<(), String> {
     let batch = celestial_snapshot(almanac, bodies, epoch)?;
-    ledger.append(batch);
+    ledger.append(batch)?;
     Ok(())
 }
 
@@ -305,7 +305,6 @@ mod tests {
     fn test_append_celestial_does_not_mutate_ledger_on_error() {
         let mut ledger = crate::ledger::Ledger::new(
             &crate::schemas::entity::entity_schema(None),
-            "spacetimestamp",
             "entity_id",
         )
         .unwrap();

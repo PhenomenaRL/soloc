@@ -23,8 +23,8 @@
 //! are serialized to a single file in insertion order and reconstructed on load.
 
 use arrow::array::{
-    Array, BooleanBuilder, DictionaryArray, FixedSizeListArray, Float64Array,
-    Int16Array, StringArray, StructArray, UInt64Array,
+    Array, BooleanBuilder, DictionaryArray, FixedSizeListArray, Float64Array, Int16Array,
+    StringArray, StructArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Fields, SchemaRef, UInt16Type, UInt32Type};
 use arrow::ipc::reader::FileReader;
@@ -40,8 +40,9 @@ use std::path::Path;
 use anise::prelude::Almanac;
 use spacetimestamp::ephemeris::j2000_tai;
 use spacetimestamp::query::{SpatiotemporalFilter, filter_batch};
-use spacetimestamp::schema::{FrameRegistry, is_entity_uri};
+use spacetimestamp::schema::{FrameRegistry, STS_COLUMN, is_entity_uri};
 use spacetimestamp::transforms::{normalize_batch_to_tai, transform_batch};
+use spacetimestamp::validation::validate_spacetimestamp_batch;
 
 use crate::schemas::SolocSchema;
 
@@ -57,14 +58,21 @@ const CURRENT_STATE_WINDOW_NS: u64 = 3_600 * 1_000_000_000; // 1 hour
 
 /// Required field names inside the spacetimestamp struct column.
 const STS_REQUIRED_FIELDS: &[&str] = &[
-    "frame_id", "units_pos", "timescale_id", "source_id", "estimate_type",
-    "position", "quaternion", "duration_centuries", "duration_ns",
+    "frame_id",
+    "units_pos",
+    "timescale_id",
+    "source_id",
+    "estimate_type",
+    "position",
+    "quaternion",
+    "duration_centuries",
+    "duration_ns",
 ];
 
 /// An append-only store of [`RecordBatch`]es forming the soloc Universal Ledger.
 ///
 /// Schema-agnostic: works with any Arrow schema that embeds a spacetimestamp struct column.
-/// The schema, `sts_column` name, and `id_column` name are fixed at construction and
+/// The schema and `id_column` name are fixed at construction and
 /// validated against the provided schema before the ledger is created.
 ///
 /// For the standard entity schema, construct with:
@@ -80,26 +88,19 @@ pub struct Ledger {
     /// available even when the ledger is empty (no batches yet).
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
-    /// Name of the spacetimestamp struct column (e.g. `"spacetimestamp"`).
-    sts_column: String,
     /// Name of the entity-identity column (e.g. `"entity_id"`). Empty string = no id column.
     id_column: String,
 }
 
 impl Ledger {
-    /// Creates an empty ledger, validating `sts_column` and (if non-empty) `id_column`
-    /// against `schema`.
-    ///
-    /// Validation checks:
-    /// - `sts_column` exists in `schema` and its type is `Struct`.
-    /// - The struct contains all required STS sub-fields.
-    /// - If `id_column` is non-empty, it exists in `schema`.
-    pub fn new(schema: &SchemaRef, sts_column: &str, id_column: &str) -> Result<Self, String> {
-        Self::validate_schema(schema, sts_column, id_column)?;
+    /// Creates an empty ledger from `schema`, validating that it contains a `"spacetimestamp"`
+    /// struct column with all required STS sub-fields, and (if non-empty) that `id_column`
+    /// exists in the schema.
+    pub fn new(schema: &SchemaRef, id_column: &str) -> Result<Self, String> {
+        Self::validate_schema(schema, id_column)?;
         Ok(Self {
             schema: schema.clone(),
             batches: Vec::new(),
-            sts_column: sts_column.to_string(),
             id_column: id_column.to_string(),
         })
     }
@@ -113,7 +114,7 @@ impl Ledger {
     /// let ledger = Ledger::for_schema::<EntitySchema>(None)?;
     /// ```
     pub fn for_schema<S: SolocSchema>(registry: Option<&FrameRegistry>) -> Result<Self, String> {
-        Self::new(&S::schema(registry), S::sts_column(), S::id_column())
+        Self::new(&S::schema(registry), S::id_column())
     }
 
     /// Returns the Arrow schema this ledger was created with.
@@ -121,25 +122,28 @@ impl Ledger {
         &self.schema
     }
 
-    /// Validates that `schema` is compatible with the given column names.
-    fn validate_schema(schema: &SchemaRef, sts_column: &str, id_column: &str) -> Result<(), String> {
+    /// Validates that `schema` contains a `"spacetimestamp"` struct with all required STS fields
+    /// and (if non-empty) that `id_column` exists.
+    fn validate_schema(schema: &SchemaRef, id_column: &str) -> Result<(), String> {
         let sts_field = schema
-            .field_with_name(sts_column)
-            .map_err(|_| format!("sts_column '{sts_column}' not found in schema"))?;
+            .field_with_name(STS_COLUMN)
+            .map_err(|_| format!("'{}' column not found in schema", STS_COLUMN))?;
 
         let sts_fields: &Fields = match sts_field.data_type() {
             DataType::Struct(f) => f,
             other => {
                 return Err(format!(
-                    "sts_column '{sts_column}' must be Struct, got {other:?}"
-                ))
+                    "'{}' must be a Struct column, got {other:?}",
+                    STS_COLUMN
+                ));
             }
         };
 
         for &name in STS_REQUIRED_FIELDS {
             if sts_fields.find(name).is_none() {
                 return Err(format!(
-                    "'{sts_column}' struct is missing required STS field '{name}'"
+                    "'{}' struct is missing required STS field '{name}'",
+                    STS_COLUMN
                 ));
             }
         }
@@ -153,18 +157,20 @@ impl Ledger {
         Ok(())
     }
 
-    /// Appends a batch to the ledger, normalizing all timestamps to TAI before storing.
+    /// Validates and appends a batch to the ledger, normalizing all timestamps to TAI.
+    ///
+    /// Validation checks `timescale_id` and `frame_id` values against hifitime and anise
+    /// standards. Returns `Err` if any value is unrecognized — the ledger is unchanged.
     ///
     /// Rows whose `timescale_id` is already `"TAI"` are passed through with no allocation.
     /// Rows in other timescales (UTC, GPS, TDB, …) are converted to TAI-relative
-    /// `(duration_centuries, duration_ns)` using the declared `timescale_id` as the J2000
-    /// reference. After this call all stored data uses a single timescale, making temporal
-    /// comparisons and almanac queries unambiguous.
-    pub fn append(&mut self, batch: RecordBatch) {
-        let normalized = normalize_batch_to_tai(&batch, &self.sts_column)
-            .expect("normalize_batch_to_tai failed — schema was validated at Ledger construction");
+    /// `(duration_centuries, duration_ns)`. After this call all stored data is TAI.
+    pub fn append(&mut self, batch: RecordBatch) -> Result<(), String> {
+        validate_spacetimestamp_batch(&batch)?;
+        let normalized = normalize_batch_to_tai(&batch)?;
         self.batches.push(normalized);
         self.seal_and_flush_if_needed();
+        Ok(())
     }
 
     /// Merges all batches into one when the batch count exceeds [`SEGMENT_THRESHOLD`].
@@ -205,7 +211,7 @@ impl Ledger {
         let mut kept: Vec<RecordBatch> = Vec::new();
 
         for batch in &self.batches {
-            let filtered = filter_batch(batch, &self.sts_column, filter)?;
+            let filtered = filter_batch(batch, filter)?;
             if filtered.num_rows() > 0 {
                 kept.push(filtered);
             }
@@ -229,7 +235,7 @@ impl Ledger {
     ) -> impl Iterator<Item = Result<RecordBatch, String>> + 'a {
         self.batches
             .iter()
-            .map(move |batch| filter_batch(batch, &self.sts_column, filter))
+            .map(move |batch| filter_batch(batch, filter))
     }
 
     /// Returns the most recent batch in the ledger, optionally filtered to specific entity IDs.
@@ -248,10 +254,7 @@ impl Ledger {
             .column_by_name(&self.id_column)?
             .as_any()
             .downcast_ref::<DictionaryArray<UInt32Type>>()?;
-        let entity_dict = entity_col
-            .values()
-            .as_any()
-            .downcast_ref::<StringArray>()?;
+        let entity_dict = entity_col.values().as_any().downcast_ref::<StringArray>()?;
 
         let mut mask = BooleanBuilder::with_capacity(last.num_rows());
         for row in 0..last.num_rows() {
@@ -287,7 +290,7 @@ impl Ledger {
         epoch: Epoch,
     ) -> Result<(), String> {
         let batch = crate::ephemeris::celestial_snapshot(almanac, bodies, epoch)?;
-        self.append(batch);
+        self.append(batch)?;
         Ok(())
     }
 
@@ -312,8 +315,8 @@ impl Ledger {
         target_units: &str,
         almanac: &Almanac,
     ) -> Result<RecordBatch, String> {
-        let epoch = epoch_from_batch(batch, &self.sts_column);
-        let uri_frames = collect_uri_frames(batch, &self.sts_column);
+        let epoch = epoch_from_batch(batch);
+        let uri_frames = collect_uri_frames(batch);
 
         let dynamic_frames = if uri_frames.is_empty() {
             None
@@ -322,7 +325,13 @@ impl Ledger {
             Some(self.build_dynamic_frame_map(&ids, epoch)?)
         };
 
-        transform_batch(batch, &self.sts_column, target_frame, almanac, target_units, dynamic_frames.as_ref())
+        transform_batch(
+            batch,
+            target_frame,
+            almanac,
+            target_units,
+            dynamic_frames.as_ref(),
+        )
     }
 
     /// Returns the pose of `entity_id` at the latest timestamp ≤ `epoch` as an
@@ -345,36 +354,87 @@ impl Ledger {
         let mut best: Option<(String, Isometry3<f64>)> = None;
 
         for batch in &self.batches {
-            let Some(eid_raw) = batch.column_by_name(&self.id_column) else { continue };
-            let Some(eid_col) = eid_raw.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() else { continue };
-            let Some(eid_dict) = eid_col.values().as_any().downcast_ref::<StringArray>() else { continue };
+            let Some(eid_raw) = batch.column_by_name(&self.id_column) else {
+                continue;
+            };
+            let Some(eid_col) = eid_raw
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+            else {
+                continue;
+            };
+            let Some(eid_dict) = eid_col.values().as_any().downcast_ref::<StringArray>() else {
+                continue;
+            };
 
-            let Some(sts_raw) = batch.column_by_name(&self.sts_column) else { continue };
-            let Some(sts) = sts_raw.as_any().downcast_ref::<StructArray>() else { continue };
+            let Some(sts_raw) = batch.column_by_name(STS_COLUMN) else {
+                continue;
+            };
+            let Some(sts) = sts_raw.as_any().downcast_ref::<StructArray>() else {
+                continue;
+            };
 
-            let Some(frame_raw) = sts.column_by_name("frame_id") else { continue };
-            let Some(frame_col) = frame_raw.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() else { continue };
-            let Some(frame_dict) = frame_col.values().as_any().downcast_ref::<StringArray>() else { continue };
+            let Some(frame_raw) = sts.column_by_name("frame_id") else {
+                continue;
+            };
+            let Some(frame_col) = frame_raw
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+            else {
+                continue;
+            };
+            let Some(frame_dict) = frame_col.values().as_any().downcast_ref::<StringArray>() else {
+                continue;
+            };
 
-            let Some(units_raw) = sts.column_by_name("units_pos") else { continue };
-            let Some(units_col) = units_raw.as_any().downcast_ref::<DictionaryArray<UInt16Type>>() else { continue };
-            let Some(units_dict) = units_col.values().as_any().downcast_ref::<StringArray>() else { continue };
+            let Some(units_raw) = sts.column_by_name("units_pos") else {
+                continue;
+            };
+            let Some(units_col) = units_raw
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt16Type>>()
+            else {
+                continue;
+            };
+            let Some(units_dict) = units_col.values().as_any().downcast_ref::<StringArray>() else {
+                continue;
+            };
 
-            let Some(pos_raw) = sts.column_by_name("position") else { continue };
-            let Some(pos_list) = pos_raw.as_any().downcast_ref::<FixedSizeListArray>() else { continue };
-            let Some(pos_vals) = pos_list.values().as_any().downcast_ref::<Float64Array>() else { continue };
+            let Some(pos_raw) = sts.column_by_name("position") else {
+                continue;
+            };
+            let Some(pos_list) = pos_raw.as_any().downcast_ref::<FixedSizeListArray>() else {
+                continue;
+            };
+            let Some(pos_vals) = pos_list.values().as_any().downcast_ref::<Float64Array>() else {
+                continue;
+            };
             let pos_offset = pos_list.offset();
 
-            let Some(quat_raw) = sts.column_by_name("quaternion") else { continue };
-            let Some(quat_list) = quat_raw.as_any().downcast_ref::<FixedSizeListArray>() else { continue };
-            let Some(quat_vals) = quat_list.values().as_any().downcast_ref::<Float64Array>() else { continue };
+            let Some(quat_raw) = sts.column_by_name("quaternion") else {
+                continue;
+            };
+            let Some(quat_list) = quat_raw.as_any().downcast_ref::<FixedSizeListArray>() else {
+                continue;
+            };
+            let Some(quat_vals) = quat_list.values().as_any().downcast_ref::<Float64Array>() else {
+                continue;
+            };
             let quat_offset = quat_list.offset();
 
-            let Some(cent_raw) = sts.column_by_name("duration_centuries") else { continue };
-            let Some(cent_arr) = cent_raw.as_any().downcast_ref::<Int16Array>() else { continue };
+            let Some(cent_raw) = sts.column_by_name("duration_centuries") else {
+                continue;
+            };
+            let Some(cent_arr) = cent_raw.as_any().downcast_ref::<Int16Array>() else {
+                continue;
+            };
 
-            let Some(ns_raw) = sts.column_by_name("duration_ns") else { continue };
-            let Some(ns_arr) = ns_raw.as_any().downcast_ref::<UInt64Array>() else { continue };
+            let Some(ns_raw) = sts.column_by_name("duration_ns") else {
+                continue;
+            };
+            let Some(ns_arr) = ns_raw.as_any().downcast_ref::<UInt64Array>() else {
+                continue;
+            };
 
             for i in 0..batch.num_rows() {
                 let eid = eid_dict.value(eid_col.keys().value(i) as usize);
@@ -415,7 +475,9 @@ impl Ledger {
                     quat_vals.value(qb + 3),
                 ));
 
-                let frame_id = frame_dict.value(frame_col.keys().value(i) as usize).to_string();
+                let frame_id = frame_dict
+                    .value(frame_col.keys().value(i) as usize)
+                    .to_string();
                 best_dur = Some(row_dur);
                 best = Some((frame_id, Isometry3::from_parts(translation, rotation)));
             }
@@ -455,11 +517,9 @@ impl Ledger {
             ));
         }
 
-        let (parent_frame, iso) = self
-            .resolve_frame_at(entity_id, epoch)
-            .ok_or_else(|| format!(
-                "Entity '{entity_id}' not found in ledger at or before {epoch}"
-            ))?;
+        let (parent_frame, iso) = self.resolve_frame_at(entity_id, epoch).ok_or_else(|| {
+            format!("Entity '{entity_id}' not found in ledger at or before {epoch}")
+        })?;
 
         if spacetimestamp::schema::is_entity_uri(&parent_frame) {
             self.resolve_chain(&parent_frame, epoch, result, visiting)?;
@@ -490,7 +550,10 @@ impl Ledger {
     /// Serializes all batches to an Arrow IPC file at `path`.
     pub fn save_ipc(&self, path: &Path) -> Result<(), String> {
         if self.batches.is_empty() {
-            return Err("Cannot save an empty ledger — use save_schema_ipc to persist just the schema".to_string());
+            return Err(
+                "Cannot save an empty ledger — use save_schema_ipc to persist just the schema"
+                    .to_string(),
+            );
         }
 
         let merged = self.merge_for_ipc()?;
@@ -538,17 +601,16 @@ impl Ledger {
     ///
     /// Pair with [`Ledger::save_schema_ipc`] for schema distribution (e.g. baking a
     /// schema file into a Docker image).
-    pub fn load_schema_ipc(path: &Path, sts_column: &str, id_column: &str) -> Result<Self, String> {
-        let file = File::open(path)
-            .map_err(|e| format!("Failed to open '{}': {e}", path.display()))?;
+    pub fn load_schema_ipc(path: &Path, id_column: &str) -> Result<Self, String> {
+        let file =
+            File::open(path).map_err(|e| format!("Failed to open '{}': {e}", path.display()))?;
         let reader = FileReader::try_new(file, None)
             .map_err(|e| format!("Failed to open Arrow IPC reader: {e}"))?;
         let schema = reader.schema();
-        Self::validate_schema(&schema, sts_column, id_column)?;
+        Self::validate_schema(&schema, id_column)?;
         Ok(Self {
             schema,
             batches: Vec::new(),
-            sts_column: sts_column.to_string(),
             id_column: id_column.to_string(),
         })
     }
@@ -574,16 +636,15 @@ impl Ledger {
     /// [`Ledger`] configured with that schema.
     ///
     /// Any data batches present in the buffer are ignored.
-    pub fn from_schema_ipc_bytes(bytes: &[u8], sts_column: &str, id_column: &str) -> Result<Self, String> {
+    pub fn from_schema_ipc_bytes(bytes: &[u8], id_column: &str) -> Result<Self, String> {
         let cursor = Cursor::new(bytes);
         let reader = FileReader::try_new(cursor, None)
             .map_err(|e| format!("Failed to open Arrow IPC reader: {e}"))?;
         let schema = reader.schema();
-        Self::validate_schema(&schema, sts_column, id_column)?;
+        Self::validate_schema(&schema, id_column)?;
         Ok(Self {
             schema,
             batches: Vec::new(),
-            sts_column: sts_column.to_string(),
             id_column: id_column.to_string(),
         })
     }
@@ -594,7 +655,7 @@ impl Ledger {
         let mut latest: Option<Duration> = None;
         for batch in &self.batches {
             let sts = batch
-                .column_by_name(&self.sts_column)
+                .column_by_name(STS_COLUMN)
                 .and_then(|c| c.as_any().downcast_ref::<StructArray>())?;
             let cent_arr = sts
                 .column_by_name("duration_centuries")
@@ -636,9 +697,9 @@ impl Ledger {
 
         let cutoff: Option<Duration> = match not_before {
             Some(ep) => Some(ep - j2000_tai()),
-            None => self.latest_stored_duration().map(|latest| {
-                latest - Duration::from_parts(0, CURRENT_STATE_WINDOW_NS)
-            }),
+            None => self
+                .latest_stored_duration()
+                .map(|latest| latest - Duration::from_parts(0, CURRENT_STATE_WINDOW_NS)),
         };
         let id_filter_set: Option<HashSet<&str>> =
             id_filter.map(|ids| ids.iter().copied().collect());
@@ -661,12 +722,12 @@ impl Ledger {
                     .and_then(|c| c.as_any().downcast_ref::<DictionaryArray<UInt32Type>>())
             };
 
-            let eid_dict_opt = eid_col_opt.as_ref().and_then(|col| {
-                col.values().as_any().downcast_ref::<StringArray>()
-            });
+            let eid_dict_opt = eid_col_opt
+                .as_ref()
+                .and_then(|col| col.values().as_any().downcast_ref::<StringArray>());
 
             let Some(sts) = batch
-                .column_by_name(&self.sts_column)
+                .column_by_name(STS_COLUMN)
                 .and_then(|c| c.as_any().downcast_ref::<StructArray>())
             else {
                 continue;
@@ -762,21 +823,19 @@ impl Ledger {
     /// Loads a ledger from an Arrow IPC file previously saved with [`Ledger::save_ipc`].
     ///
     /// Reads the schema from the IPC file and validates it against `sts_column` and `id_column`.
-    pub fn load_ipc(path: &Path, sts_column: &str, id_column: &str) -> Result<Self, String> {
-        let file = File::open(path)
-            .map_err(|e| format!("Failed to open '{}': {e}", path.display()))?;
+    pub fn load_ipc(path: &Path, id_column: &str) -> Result<Self, String> {
+        let file =
+            File::open(path).map_err(|e| format!("Failed to open '{}': {e}", path.display()))?;
 
         let reader = FileReader::try_new(file, None)
             .map_err(|e| format!("Failed to open Arrow IPC reader: {e}"))?;
 
         let schema = reader.schema();
-        Self::validate_schema(&schema, sts_column, id_column)?;
+        Self::validate_schema(&schema, id_column)?;
 
         let mut batches = Vec::new();
         for result in reader {
-            batches.push(
-                result.map_err(|e| format!("Failed to read batch from IPC file: {e}"))?,
-            );
+            batches.push(result.map_err(|e| format!("Failed to read batch from IPC file: {e}"))?);
         }
 
         if batches.is_empty() {
@@ -786,7 +845,6 @@ impl Ledger {
         Ok(Self {
             schema,
             batches,
-            sts_column: sts_column.to_string(),
             id_column: id_column.to_string(),
         })
     }
@@ -794,15 +852,22 @@ impl Ledger {
     /// Serializes all batches to an in-memory Arrow IPC buffer.
     pub fn save_ipc_to_bytes(&self) -> Result<Vec<u8>, String> {
         if self.batches.is_empty() {
-            return Err("Cannot save an empty ledger — use schema_to_ipc_bytes to persist just the schema".to_string());
+            return Err(
+                "Cannot save an empty ledger — use schema_to_ipc_bytes to persist just the schema"
+                    .to_string(),
+            );
         }
         let merged = self.merge_for_ipc()?;
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut writer = FileWriter::try_new(&mut buf, &self.schema)
                 .map_err(|e| format!("Failed to create Arrow IPC writer: {e}"))?;
-            writer.write(&merged).map_err(|e| format!("Failed to write batch: {e}"))?;
-            writer.finish().map_err(|e| format!("Failed to finalise IPC: {e}"))?;
+            writer
+                .write(&merged)
+                .map_err(|e| format!("Failed to write batch: {e}"))?;
+            writer
+                .finish()
+                .map_err(|e| format!("Failed to finalise IPC: {e}"))?;
         }
         Ok(buf)
     }
@@ -810,13 +875,13 @@ impl Ledger {
     /// Deserializes a ledger from an in-memory Arrow IPC buffer.
     ///
     /// Reads the schema from the IPC bytes and validates it against `sts_column` and `id_column`.
-    pub fn load_ipc_from_bytes(bytes: &[u8], sts_column: &str, id_column: &str) -> Result<Self, String> {
+    pub fn load_ipc_from_bytes(bytes: &[u8], id_column: &str) -> Result<Self, String> {
         let cursor = Cursor::new(bytes);
         let reader = FileReader::try_new(cursor, None)
             .map_err(|e| format!("Failed to open Arrow IPC reader: {e}"))?;
 
         let schema = reader.schema();
-        Self::validate_schema(&schema, sts_column, id_column)?;
+        Self::validate_schema(&schema, id_column)?;
 
         let mut batches = Vec::new();
         for result in reader {
@@ -828,7 +893,6 @@ impl Ledger {
         Ok(Self {
             schema,
             batches,
-            sts_column: sts_column.to_string(),
             id_column: id_column.to_string(),
         })
     }
@@ -844,13 +908,13 @@ fn estimate_type_priority(s: &str) -> u8 {
 
 /// Extracts the epoch from the first row of the spacetimestamp struct column.
 /// Falls back to J2000 TAI if the column or fields are absent.
-fn epoch_from_batch(batch: &RecordBatch, sts_column: &str) -> Epoch {
+fn epoch_from_batch(batch: &RecordBatch) -> Epoch {
     let j2000 = j2000_tai();
     if batch.num_rows() == 0 {
         return j2000;
     }
     let Some(sts) = batch
-        .column_by_name(sts_column)
+        .column_by_name(STS_COLUMN)
         .and_then(|c| c.as_any().downcast_ref::<StructArray>())
     else {
         return j2000;
@@ -869,9 +933,9 @@ fn epoch_from_batch(batch: &RecordBatch, sts_column: &str) -> Epoch {
 }
 
 /// Returns unique entity-URI values in the frame_id dictionary of the spacetimestamp struct.
-fn collect_uri_frames(batch: &RecordBatch, sts_column: &str) -> Vec<String> {
+fn collect_uri_frames(batch: &RecordBatch) -> Vec<String> {
     let Some(sts) = batch
-        .column_by_name(sts_column)
+        .column_by_name(STS_COLUMN)
         .and_then(|c| c.as_any().downcast_ref::<StructArray>())
     else {
         return vec![];
@@ -926,9 +990,17 @@ mod tests {
     fn make_batch(pos: [f64; 3], ns: u64) -> RecordBatch {
         let mut builder = SpaceTimestampBuilder::new(1, None);
         builder.append_spacetimestamp(
-            "ICRF", "km", "TAI", "src", "MEASURED",
-            pos, [1.0, 0.0, 0.0, 0.0], 0, ns,
-            None, None,
+            "ICRF",
+            "km",
+            "TAI",
+            "src",
+            "MEASURED",
+            pos,
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            ns,
+            None,
+            None,
         );
         let struct_array = builder.finish_as_struct();
         let schema = sts_only_schema();
@@ -936,28 +1008,28 @@ mod tests {
     }
 
     fn make_sts_ledger() -> Ledger {
-        Ledger::new(&sts_only_schema(), "spacetimestamp", "").unwrap()
+        Ledger::new(&sts_only_schema(), "").unwrap()
     }
 
     fn make_entity_ledger() -> Ledger {
         use crate::schemas::entity::entity_schema;
-        Ledger::new(&entity_schema(None), "spacetimestamp", "entity_id").unwrap()
+        Ledger::new(&entity_schema(None), "entity_id").unwrap()
     }
 
     #[test]
     fn test_append_and_len() {
         let mut ledger = make_sts_ledger();
         assert!(ledger.is_empty());
-        ledger.append(make_batch([0.0, 0.0, 0.0], 0));
-        ledger.append(make_batch([1.0, 0.0, 0.0], 1000));
+        ledger.append(make_batch([0.0, 0.0, 0.0], 0)).unwrap();
+        ledger.append(make_batch([1.0, 0.0, 0.0], 1000)).unwrap();
         assert_eq!(ledger.len(), 2);
     }
 
     #[test]
     fn test_query_no_filter_returns_all_rows() {
         let mut ledger = make_sts_ledger();
-        ledger.append(make_batch([0.0, 0.0, 0.0], 0));
-        ledger.append(make_batch([10.0, 0.0, 0.0], 1000));
+        ledger.append(make_batch([0.0, 0.0, 0.0], 0)).unwrap();
+        ledger.append(make_batch([10.0, 0.0, 0.0], 1000)).unwrap();
         let result = ledger.query(&SpatiotemporalFilter::new()).unwrap();
         assert_eq!(result.num_rows(), 2);
     }
@@ -965,8 +1037,8 @@ mod tests {
     #[test]
     fn test_query_spatial_filter() {
         let mut ledger = make_sts_ledger();
-        ledger.append(make_batch([1.0, 0.0, 0.0], 0));
-        ledger.append(make_batch([100.0, 0.0, 0.0], 0));
+        ledger.append(make_batch([1.0, 0.0, 0.0], 0)).unwrap();
+        ledger.append(make_batch([100.0, 0.0, 0.0], 0)).unwrap();
         let filter = SpatiotemporalFilter::new().with_spatial([0.0, 0.0, 0.0], 5.0);
         let result = ledger.query(&filter).unwrap();
         assert_eq!(result.num_rows(), 1);
@@ -979,9 +1051,9 @@ mod tests {
         let t2 = j2000 + Duration::from_parts(0, 600);
 
         let mut ledger = make_sts_ledger();
-        ledger.append(make_batch([0.0, 0.0, 0.0], 0));
-        ledger.append(make_batch([1.0, 0.0, 0.0], 500));
-        ledger.append(make_batch([2.0, 0.0, 0.0], 9999));
+        ledger.append(make_batch([0.0, 0.0, 0.0], 0)).unwrap();
+        ledger.append(make_batch([1.0, 0.0, 0.0], 500)).unwrap();
+        ledger.append(make_batch([2.0, 0.0, 0.0], 9999)).unwrap();
 
         let filter = SpatiotemporalFilter::new().with_time_range(t1, t2);
         let result = ledger.query(&filter).unwrap();
@@ -991,8 +1063,8 @@ mod tests {
     #[test]
     fn test_stream_query_yields_per_batch() {
         let mut ledger = make_sts_ledger();
-        ledger.append(make_batch([0.0, 0.0, 0.0], 0));
-        ledger.append(make_batch([1.0, 0.0, 0.0], 1000));
+        ledger.append(make_batch([0.0, 0.0, 0.0], 0)).unwrap();
+        ledger.append(make_batch([1.0, 0.0, 0.0], 1000)).unwrap();
 
         let total_rows: usize = ledger
             .stream_query(&SpatiotemporalFilter::new())
@@ -1005,8 +1077,8 @@ mod tests {
     #[test]
     fn test_latest_snapshot_returns_last_batch() {
         let mut ledger = make_sts_ledger();
-        ledger.append(make_batch([0.0, 0.0, 0.0], 0));
-        ledger.append(make_batch([99.0, 0.0, 0.0], 9999));
+        ledger.append(make_batch([0.0, 0.0, 0.0], 0)).unwrap();
+        ledger.append(make_batch([99.0, 0.0, 0.0], 9999)).unwrap();
         let snap = ledger.latest_snapshot(None).unwrap();
         assert_eq!(snap.num_rows(), 1);
     }
@@ -1015,7 +1087,9 @@ mod tests {
     fn test_seal_merges_batches_at_threshold() {
         let mut ledger = make_sts_ledger();
         for i in 0..=SEGMENT_THRESHOLD {
-            ledger.append(make_batch([i as f64, 0.0, 0.0], i as u64));
+            ledger
+                .append(make_batch([i as f64, 0.0, 0.0], i as u64))
+                .unwrap();
         }
         assert_eq!(ledger.len(), 1);
     }
@@ -1025,7 +1099,9 @@ mod tests {
         let mut ledger = make_sts_ledger();
         let n = SEGMENT_THRESHOLD + 1;
         for i in 0..n {
-            ledger.append(make_batch([i as f64, 0.0, 0.0], i as u64));
+            ledger
+                .append(make_batch([i as f64, 0.0, 0.0], i as u64))
+                .unwrap();
         }
         let total: usize = ledger
             .stream_query(&SpatiotemporalFilter::new())
@@ -1039,7 +1115,9 @@ mod tests {
     fn test_no_seal_below_threshold() {
         let mut ledger = make_sts_ledger();
         for i in 0..SEGMENT_THRESHOLD {
-            ledger.append(make_batch([i as f64, 0.0, 0.0], i as u64));
+            ledger
+                .append(make_batch([i as f64, 0.0, 0.0], i as u64))
+                .unwrap();
         }
         assert_eq!(ledger.len(), SEGMENT_THRESHOLD);
     }
@@ -1047,11 +1125,11 @@ mod tests {
     #[test]
     fn test_save_and_load_ipc_from_bytes_round_trip() {
         let mut ledger = make_sts_ledger();
-        ledger.append(make_batch([1.0, 2.0, 3.0], 0));
-        ledger.append(make_batch([4.0, 5.0, 6.0], 1000));
+        ledger.append(make_batch([1.0, 2.0, 3.0], 0)).unwrap();
+        ledger.append(make_batch([4.0, 5.0, 6.0], 1000)).unwrap();
 
         let bytes = ledger.save_ipc_to_bytes().unwrap();
-        let loaded = Ledger::load_ipc_from_bytes(&bytes, "spacetimestamp", "").unwrap();
+        let loaded = Ledger::load_ipc_from_bytes(&bytes, "").unwrap();
         // Rows are preserved; batches are merged into 1 during save to avoid
         // Arrow IPC "dictionary replacement" errors across separate batches.
         assert_eq!(loaded.len(), 1);
@@ -1062,13 +1140,13 @@ mod tests {
     #[test]
     fn test_save_and_load_ipc_preserves_batches() {
         let mut ledger = make_sts_ledger();
-        ledger.append(make_batch([1.0, 2.0, 3.0], 0));
-        ledger.append(make_batch([4.0, 5.0, 6.0], 1000));
+        ledger.append(make_batch([1.0, 2.0, 3.0], 0)).unwrap();
+        ledger.append(make_batch([4.0, 5.0, 6.0], 1000)).unwrap();
 
         let path = std::env::temp_dir().join("soloc_ledger_test.arrows");
         ledger.save_ipc(&path).unwrap();
 
-        let loaded = Ledger::load_ipc(&path, "spacetimestamp", "").unwrap();
+        let loaded = Ledger::load_ipc(&path, "").unwrap();
         // Rows are preserved; batches are merged into 1 during save to avoid
         // Arrow IPC "dictionary replacement" errors across separate batches.
         assert_eq!(loaded.len(), 1);
@@ -1086,7 +1164,7 @@ mod tests {
         let ledger = make_sts_ledger();
         let path = std::env::temp_dir().join("soloc_schema_test.arrows");
         ledger.save_schema_ipc(&path).unwrap();
-        let loaded = Ledger::load_schema_ipc(&path, "spacetimestamp", "").unwrap();
+        let loaded = Ledger::load_schema_ipc(&path, "").unwrap();
         assert!(loaded.is_empty(), "schema-loaded ledger must be empty");
         assert_eq!(loaded.schema(), ledger.schema());
         std::fs::remove_file(path).ok();
@@ -1096,7 +1174,7 @@ mod tests {
     fn test_schema_to_and_from_ipc_bytes_round_trip() {
         let ledger = make_sts_ledger();
         let bytes = ledger.schema_to_ipc_bytes().unwrap();
-        let loaded = Ledger::from_schema_ipc_bytes(&bytes, "spacetimestamp", "").unwrap();
+        let loaded = Ledger::from_schema_ipc_bytes(&bytes, "").unwrap();
         assert!(loaded.is_empty());
         assert_eq!(loaded.schema(), ledger.schema());
     }
@@ -1106,11 +1184,14 @@ mod tests {
         // Save a ledger that has data, then reload it as schema-only.
         // The resulting ledger should be empty regardless of what was in the file.
         let mut ledger = make_sts_ledger();
-        ledger.append(make_batch([1.0, 2.0, 3.0], 0));
+        ledger.append(make_batch([1.0, 2.0, 3.0], 0)).unwrap();
         let path = std::env::temp_dir().join("soloc_schema_data_test.arrows");
         ledger.save_ipc(&path).unwrap();
-        let schema_only = Ledger::load_schema_ipc(&path, "spacetimestamp", "").unwrap();
-        assert!(schema_only.is_empty(), "load_schema_ipc must ignore data batches");
+        let schema_only = Ledger::load_schema_ipc(&path, "").unwrap();
+        assert!(
+            schema_only.is_empty(),
+            "load_schema_ipc must ignore data batches"
+        );
         assert_eq!(schema_only.schema(), ledger.schema());
         std::fs::remove_file(path).ok();
     }
@@ -1129,13 +1210,20 @@ mod tests {
             )])
             .with_metadata(sts_ref.metadata().clone()),
         );
-        let ledger = Ledger::new(&schema, "spacetimestamp", "").unwrap();
+        let ledger = Ledger::new(&schema, "").unwrap();
 
         let bytes = ledger.schema_to_ipc_bytes().unwrap();
-        let loaded = Ledger::from_schema_ipc_bytes(&bytes, "spacetimestamp", "").unwrap();
+        let loaded = Ledger::from_schema_ipc_bytes(&bytes, "").unwrap();
 
-        let meta = loaded.schema().metadata().get("soloc.frame_registry").cloned();
-        assert!(meta.is_some(), "FrameRegistry metadata must survive schema IPC round-trip");
+        let meta = loaded
+            .schema()
+            .metadata()
+            .get("soloc.frame_registry")
+            .cloned();
+        assert!(
+            meta.is_some(),
+            "FrameRegistry metadata must survive schema IPC round-trip"
+        );
         let recovered = FrameRegistry::from_json(&meta.unwrap()).unwrap();
         assert_eq!(recovered.namespace, "test_ns");
         assert!(recovered.frames.contains_key("test_ns:cam"));
@@ -1154,32 +1242,46 @@ mod tests {
     #[test]
     fn test_save_ipc_still_rejects_empty_ledger() {
         let ledger = make_sts_ledger();
-        assert!(ledger.save_ipc_to_bytes().is_err(), "save_ipc_to_bytes must error on empty ledger");
+        assert!(
+            ledger.save_ipc_to_bytes().is_err(),
+            "save_ipc_to_bytes must error on empty ledger"
+        );
         let path = std::env::temp_dir().join("soloc_save_empty_reject.arrows");
-        assert!(ledger.save_ipc(&path).is_err(), "save_ipc must error on empty ledger");
+        assert!(
+            ledger.save_ipc(&path).is_err(),
+            "save_ipc must error on empty ledger"
+        );
     }
 
     #[test]
     fn test_new_rejects_missing_sts_column() {
-        let schema = sts_only_schema();
-        let err = Ledger::new(&schema, "nonexistent", "").unwrap_err();
-        assert!(err.contains("nonexistent"), "got: {err}");
+        // A schema with no "spacetimestamp" column must be rejected.
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "other_col",
+            DataType::Utf8,
+            false,
+        )]));
+        let err = Ledger::new(&schema, "").unwrap_err();
+        assert!(err.contains("spacetimestamp"), "got: {err}");
     }
 
     #[test]
     fn test_new_rejects_non_struct_sts_column() {
         use arrow::datatypes::{DataType, Field, Schema};
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("spacetimestamp", DataType::Utf8, false),
-        ]));
-        let err = Ledger::new(&schema, "spacetimestamp", "").unwrap_err();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "spacetimestamp",
+            DataType::Utf8,
+            false,
+        )]));
+        let err = Ledger::new(&schema, "").unwrap_err();
         assert!(err.contains("Struct"), "got: {err}");
     }
 
     #[test]
     fn test_new_rejects_missing_id_column() {
         let schema = sts_only_schema();
-        let err = Ledger::new(&schema, "spacetimestamp", "entity_id").unwrap_err();
+        let err = Ledger::new(&schema, "entity_id").unwrap_err();
         assert!(err.contains("entity_id"), "got: {err}");
     }
 
@@ -1197,9 +1299,8 @@ mod tests {
         use crate::schemas::entity::EntityBuilder;
         let mut b = EntityBuilder::new(1, None);
         b.append_entity(
-            entity_id, frame_id, "km", "TAI", "test:src", "MEASURED",
-            pos, quat, 0, ns,
-            None, None, None, None, None,
+            entity_id, frame_id, "km", "TAI", "test:src", "MEASURED", pos, quat, 0, ns, None, None,
+            None, None, None,
         );
         b.flush()
     }
@@ -1207,24 +1308,40 @@ mod tests {
     #[test]
     fn test_build_dynamic_frame_map_single_hop() {
         let mut ledger = make_entity_ledger();
-        ledger.append(make_entity_batch(
-            "demo:truck_A", "IAU_EARTH",
-            [100.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
-        ));
-        ledger.append(make_entity_batch(
-            "demo:robot_truck", "demo:truck_A",
-            [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
-        ));
+        ledger
+            .append(make_entity_batch(
+                "demo:truck_A",
+                "IAU_EARTH",
+                [100.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
+        ledger
+            .append(make_entity_batch(
+                "demo:robot_truck",
+                "demo:truck_A",
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
 
         let epoch = j2000();
-        let map = ledger.build_dynamic_frame_map(&["demo:robot_truck"], epoch).unwrap();
+        let map = ledger
+            .build_dynamic_frame_map(&["demo:robot_truck"], epoch)
+            .unwrap();
 
         let (root, iso) = map.get("demo:robot_truck").unwrap();
         assert_eq!(root, "IAU_EARTH");
 
         let origin = nalgebra::Point3::new(0.0, 0.0, 0.0);
         let result = iso.transform_point(&origin);
-        assert!((result.x - 101.0).abs() < 1e-9, "expected x≈101, got {}", result.x);
+        assert!(
+            (result.x - 101.0).abs() < 1e-9,
+            "expected x≈101, got {}",
+            result.x
+        );
         assert!(result.y.abs() < 1e-9);
         assert!(result.z.abs() < 1e-9);
     }
@@ -1232,47 +1349,85 @@ mod tests {
     #[test]
     fn test_build_dynamic_frame_map_two_hop() {
         let mut ledger = make_entity_ledger();
-        ledger.append(make_entity_batch(
-            "demo:facility", "IAU_EARTH",
-            [50.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
-        ));
-        ledger.append(make_entity_batch(
-            "demo:robot", "demo:facility",
-            [5.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
-        ));
+        ledger
+            .append(make_entity_batch(
+                "demo:facility",
+                "IAU_EARTH",
+                [50.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
+        ledger
+            .append(make_entity_batch(
+                "demo:robot",
+                "demo:facility",
+                [5.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
 
         let epoch = j2000();
-        let map = ledger.build_dynamic_frame_map(&["demo:robot"], epoch).unwrap();
+        let map = ledger
+            .build_dynamic_frame_map(&["demo:robot"], epoch)
+            .unwrap();
 
         let (root, iso) = map.get("demo:robot").unwrap();
         assert_eq!(root, "IAU_EARTH");
 
         let origin = nalgebra::Point3::new(0.0, 0.0, 0.0);
         let result = iso.transform_point(&origin);
-        assert!((result.x - 55.0).abs() < 1e-9, "expected x≈55, got {}", result.x);
+        assert!(
+            (result.x - 55.0).abs() < 1e-9,
+            "expected x≈55, got {}",
+            result.x
+        );
     }
 
     #[test]
     fn test_build_dynamic_frame_map_entity_not_found() {
         let ledger = make_entity_ledger();
         let epoch = j2000();
-        let err = ledger.build_dynamic_frame_map(&["demo:ghost"], epoch).unwrap_err();
-        assert!(err.contains("demo:ghost"), "error should name the missing entity: {err}");
+        let err = ledger
+            .build_dynamic_frame_map(&["demo:ghost"], epoch)
+            .unwrap_err();
+        assert!(
+            err.contains("demo:ghost"),
+            "error should name the missing entity: {err}"
+        );
     }
 
     #[test]
     fn test_build_dynamic_frame_map_cycle_detected() {
         let mut ledger = make_entity_ledger();
-        ledger.append(make_entity_batch(
-            "demo:A", "demo:B", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
-        ));
-        ledger.append(make_entity_batch(
-            "demo:B", "demo:A", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0,
-        ));
+        ledger
+            .append(make_entity_batch(
+                "demo:A",
+                "demo:B",
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
+        ledger
+            .append(make_entity_batch(
+                "demo:B",
+                "demo:A",
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
 
         let epoch = j2000();
-        let err = ledger.build_dynamic_frame_map(&["demo:A"], epoch).unwrap_err();
-        assert!(err.to_lowercase().contains("cycle"), "expected cycle error: {err}");
+        let err = ledger
+            .build_dynamic_frame_map(&["demo:A"], epoch)
+            .unwrap_err();
+        assert!(
+            err.to_lowercase().contains("cycle"),
+            "expected cycle error: {err}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1288,9 +1443,21 @@ mod tests {
         use crate::schemas::entity::EntityBuilder;
         let mut b = EntityBuilder::new(1, None);
         b.append_entity(
-            entity_id, "ICRF", "km", "TAI", "test:src", estimate_type,
-            pos, [1.0, 0.0, 0.0, 0.0], 0, ns,
-            None, None, None, None, None,
+            entity_id,
+            "ICRF",
+            "km",
+            "TAI",
+            "test:src",
+            estimate_type,
+            pos,
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            ns,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         b.flush()
     }
@@ -1298,8 +1465,22 @@ mod tests {
     #[test]
     fn test_current_state_latest_wins() {
         let mut ledger = make_entity_ledger();
-        ledger.append(make_entity_batch_et("demo:sat", [1.0, 0.0, 0.0], 1000, "MEASURED"));
-        ledger.append(make_entity_batch_et("demo:sat", [2.0, 0.0, 0.0], 5000, "MEASURED"));
+        ledger
+            .append(make_entity_batch_et(
+                "demo:sat",
+                [1.0, 0.0, 0.0],
+                1000,
+                "MEASURED",
+            ))
+            .unwrap();
+        ledger
+            .append(make_entity_batch_et(
+                "demo:sat",
+                [2.0, 0.0, 0.0],
+                5000,
+                "MEASURED",
+            ))
+            .unwrap();
 
         let result = ledger.current_state(None, None).unwrap();
         assert_eq!(result.num_rows(), 1);
@@ -1322,8 +1503,22 @@ mod tests {
     #[test]
     fn test_current_state_priority_wins_same_epoch() {
         let mut ledger = make_entity_ledger();
-        ledger.append(make_entity_batch_et("demo:sat", [1.0, 0.0, 0.0], 3000, "MEASURED"));
-        ledger.append(make_entity_batch_et("demo:sat", [9.0, 0.0, 0.0], 3000, "SIMULATED"));
+        ledger
+            .append(make_entity_batch_et(
+                "demo:sat",
+                [1.0, 0.0, 0.0],
+                3000,
+                "MEASURED",
+            ))
+            .unwrap();
+        ledger
+            .append(make_entity_batch_et(
+                "demo:sat",
+                [9.0, 0.0, 0.0],
+                3000,
+                "SIMULATED",
+            ))
+            .unwrap();
 
         let result = ledger.current_state(None, None).unwrap();
         assert_eq!(result.num_rows(), 1);
@@ -1340,7 +1535,11 @@ mod tests {
             .as_any()
             .downcast_ref::<DictionaryArray<UInt16Type>>()
             .unwrap();
-        let et_dict = et_col.values().as_any().downcast_ref::<StringArray>().unwrap();
+        let et_dict = et_col
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         let et = et_dict.value(et_col.keys().value(0) as usize);
         assert_eq!(et, "MEASURED");
     }
@@ -1348,8 +1547,22 @@ mod tests {
     #[test]
     fn test_current_state_staleness_cutoff() {
         let mut ledger = make_entity_ledger();
-        ledger.append(make_entity_batch_et("demo:sat", [1.0, 0.0, 0.0], 100, "MEASURED"));
-        ledger.append(make_entity_batch_et("demo:sat", [2.0, 0.0, 0.0], 2000, "MEASURED"));
+        ledger
+            .append(make_entity_batch_et(
+                "demo:sat",
+                [1.0, 0.0, 0.0],
+                100,
+                "MEASURED",
+            ))
+            .unwrap();
+        ledger
+            .append(make_entity_batch_et(
+                "demo:sat",
+                [2.0, 0.0, 0.0],
+                2000,
+                "MEASURED",
+            ))
+            .unwrap();
 
         let cutoff = j2000() + Duration::from_parts(0, 500);
         let result = ledger.current_state(None, Some(cutoff)).unwrap();
@@ -1376,16 +1589,51 @@ mod tests {
         use crate::schemas::entity::EntityBuilder;
         let batch0 = {
             let mut b = EntityBuilder::new(2, None);
-            b.append_entity("demo:A", "ICRF", "km", "TAI", "src", "MEASURED",
-                [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 100,
-                None, None, None, None, None);
-            b.append_entity("demo:B", "ICRF", "km", "TAI", "src", "MEASURED",
-                [2.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 100,
-                None, None, None, None, None);
+            b.append_entity(
+                "demo:A",
+                "ICRF",
+                "km",
+                "TAI",
+                "src",
+                "MEASURED",
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+                100,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            b.append_entity(
+                "demo:B",
+                "ICRF",
+                "km",
+                "TAI",
+                "src",
+                "MEASURED",
+                [2.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+                100,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
             b.flush()
         };
-        ledger.append(batch0);
-        ledger.append(make_entity_batch_et("demo:C", [3.0, 0.0, 0.0], 200, "SIMULATED"));
+        ledger.append(batch0).unwrap();
+        ledger
+            .append(make_entity_batch_et(
+                "demo:C",
+                [3.0, 0.0, 0.0],
+                200,
+                "SIMULATED",
+            ))
+            .unwrap();
 
         let result = ledger.current_state(None, None).unwrap();
         assert_eq!(result.num_rows(), 3, "expected one row per entity");
@@ -1396,10 +1644,18 @@ mod tests {
             .as_any()
             .downcast_ref::<DictionaryArray<UInt32Type>>()
             .unwrap();
-        let eid_dict = eid_col.values().as_any().downcast_ref::<StringArray>().unwrap();
+        let eid_dict = eid_col
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for row in 0..result.num_rows() {
-            seen.insert(eid_dict.value(eid_col.keys().value(row) as usize).to_string());
+            seen.insert(
+                eid_dict
+                    .value(eid_col.keys().value(row) as usize)
+                    .to_string(),
+            );
         }
         assert!(seen.contains("demo:A"));
         assert!(seen.contains("demo:B"));

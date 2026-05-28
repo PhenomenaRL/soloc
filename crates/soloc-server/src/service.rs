@@ -19,7 +19,7 @@ use tonic::{Request, Response, Status, Streaming};
 use anise::almanac::metaload::MetaFile;
 use soloc::ephemeris::naif_snapshot;
 use spacetimestamp::query::SpatiotemporalFilter;
-use spacetimestamp::schema::{FrameRegistry, STS_REGISTRY_METADATA_KEY};
+use spacetimestamp::schema::{FrameRegistry, STS_COLUMN, STS_REGISTRY_METADATA_KEY};
 use spacetimestamp::transforms::transform_batch;
 
 use arrow::array::{Array, DictionaryArray, Int16Array, StringArray, StructArray, UInt64Array};
@@ -75,8 +75,6 @@ struct ExchangeDescriptor {
     target_frame: String,
     #[serde(default = "default_km")]
     target_units: String,
-    #[serde(default = "default_sts_column")]
-    sts_column: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -95,10 +93,6 @@ struct GetTicket {
     spatial_origin: Option<[f64; 3]>,
     #[serde(default)]
     spatial_radius: Option<f64>,
-    /// Accepted for protocol backward-compatibility; the ledger's stored column name is used.
-    #[serde(default = "default_sts_column")]
-    #[allow(dead_code)]
-    sts_column: String,
     #[serde(default)]
     query_type: QueryType,
     #[serde(default)]
@@ -109,9 +103,6 @@ struct GetTicket {
 
 fn default_km() -> String {
     "km".to_string()
-}
-fn default_sts_column() -> String {
-    "spacetimestamp".to_string()
 }
 
 pub struct SolocFlightService {
@@ -170,7 +161,7 @@ fn transform_with_server_registry(
     let patched = inject_registry(batch, &merged)?;
 
     // Scan for entity-URI frame IDs and build a dynamic frame map from the ledger.
-    let dynamic_frames = build_dynamic_frames_for_batch(&patched, &desc.sts_column, state)?;
+    let dynamic_frames = build_dynamic_frames_for_batch(&patched, state)?;
 
     let almanac = state
         .almanac
@@ -178,7 +169,6 @@ fn transform_with_server_registry(
         .map_err(|_| Status::internal("almanac lock poisoned"))?;
     transform_batch(
         &patched,
-        &desc.sts_column,
         &desc.target_frame,
         &almanac,
         &desc.target_units,
@@ -192,11 +182,10 @@ fn transform_with_server_registry(
 /// Returns `None` when no entity-URI frames are present (fast path for the common case).
 fn build_dynamic_frames_for_batch(
     batch: &RecordBatch,
-    sts_column_name: &str,
     state: &ServerState,
 ) -> Result<Option<HashMap<String, (String, Isometry3<f64>)>>, Status> {
     let sts_col = match batch
-        .column_by_name(sts_column_name)
+        .column_by_name(STS_COLUMN)
         .and_then(|c| c.as_any().downcast_ref::<StructArray>())
     {
         Some(s) => s,
@@ -432,7 +421,8 @@ impl FlightService for SolocFlightService {
                 .ledger
                 .write()
                 .map_err(|_| Status::internal("ledger lock poisoned"))?
-                .append(tagged);
+                .append(tagged)
+                .map_err(|e| Status::invalid_argument(format!("append failed: {e}")))?;
         }
 
         Ok(Response::new(Box::pin(futures::stream::empty())))
@@ -629,7 +619,6 @@ impl FlightService for SolocFlightService {
                     .map_err(|e| Status::invalid_argument(format!("invalid load_ledger body: {e}")))?;
                 let new_ledger = soloc::ledger::Ledger::load_ipc(
                     std::path::Path::new(&body.path),
-                    &self.state.sts_column,
                     &self.state.id_column,
                 )
                 .map_err(|e| Status::internal(format!("load_ledger failed: {e}")))?;
@@ -719,7 +708,8 @@ impl FlightService for SolocFlightService {
                     .ledger
                     .write()
                     .map_err(|_| Status::internal("ledger lock poisoned"))?
-                    .append(batch);
+                    .append(batch)
+                    .map_err(|e| Status::invalid_argument(format!("append failed: {e}")))?;
 
                 let result = arrow_flight::Result {
                     body: format!("appended {n} rows").into_bytes().into(),

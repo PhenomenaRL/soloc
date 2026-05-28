@@ -25,7 +25,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::ephemeris::epoch_from_parts;
-
+use crate::schema::STS_COLUMN;
 
 /// A spatiotemporal filter for use with [`filter_batch`] and ledger query APIs.
 ///
@@ -71,26 +71,19 @@ impl SpatiotemporalFilter {
     }
 }
 
-/// Filters a [`RecordBatch`] by a [`SpatiotemporalFilter`], operating on the named
-/// `sts_column_name` struct column that holds the embedded `spacetimestamp` fields.
+/// Filters a [`RecordBatch`] by a [`SpatiotemporalFilter`], operating on the
+/// `"spacetimestamp"` struct column that holds the embedded STS fields.
 ///
 /// Returns a new [`RecordBatch`] with only the rows that satisfy all active filter
 /// conditions. If no filter fields are set, a cheap clone of the input is returned.
 ///
-/// # Arguments
-/// * `batch` — The source batch to filter.
-/// * `sts_column_name` — Name of the `StructArray` column containing `spacetimestamp` fields
-///   (e.g., `"spacetimestamp"` for entity batches).
-/// * `filter` — The spatiotemporal filter to apply.
-///
 /// # Errors
 /// Returns `Err` if:
-/// - `sts_column_name` is not found in the batch.
+/// - The `"spacetimestamp"` column is not found in the batch.
 /// - The column is not a `StructArray`.
 /// - A spatial filter is set but the batch contains rows in mixed reference frames.
 pub fn filter_batch(
     batch: &RecordBatch,
-    sts_column_name: &str,
     filter: &SpatiotemporalFilter,
 ) -> Result<RecordBatch, String> {
     // Nothing to filter — return a cheap Arc-clone of the batch.
@@ -100,14 +93,14 @@ pub fn filter_batch(
 
     let schema = batch.schema();
     let col_idx = schema
-        .index_of(sts_column_name)
-        .map_err(|_| format!("Column '{}' not found in batch schema", sts_column_name))?;
+        .index_of(STS_COLUMN)
+        .map_err(|_| format!("Column '{}' not found in batch schema", STS_COLUMN))?;
 
     let struct_array = batch
         .column(col_idx)
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| format!("Column '{}' is not a StructArray", sts_column_name))?;
+        .ok_or_else(|| format!("Column '{}' is not a StructArray", STS_COLUMN))?;
 
     // Frame uniformity is required for spatial filtering to be meaningful.
     if filter.spatial_origin.is_some() {
@@ -310,7 +303,7 @@ mod tests {
         );
         let batch = make_sts_batch(&mut builder, None);
         let result =
-            filter_batch(&batch, "spacetimestamp", &SpatiotemporalFilter::new()).unwrap();
+            filter_batch(&batch, &SpatiotemporalFilter::new()).unwrap();
         assert_eq!(result.num_rows(), 2);
     }
 
@@ -343,7 +336,6 @@ mod tests {
         let batch = make_sts_batch(&mut builder, None);
         let result = filter_batch(
             &batch,
-            "spacetimestamp",
             &SpatiotemporalFilter::new().with_time_range(t1, t2),
         )
         .unwrap();
@@ -375,7 +367,6 @@ mod tests {
         let batch = make_sts_batch(&mut builder, None);
         let result = filter_batch(
             &batch,
-            "spacetimestamp",
             &SpatiotemporalFilter::new().with_spatial([0.0, 0.0, 0.0], 5.0),
         )
         .unwrap();
@@ -399,7 +390,6 @@ mod tests {
         let batch = make_sts_batch(&mut builder, None);
         let err = filter_batch(
             &batch,
-            "spacetimestamp",
             &SpatiotemporalFilter::new().with_spatial([0.0, 0.0, 0.0], 100.0),
         )
         .unwrap_err();
@@ -437,7 +427,6 @@ mod tests {
         let batch = make_sts_batch(&mut builder, None);
         let result = filter_batch(
             &batch,
-            "spacetimestamp",
             &SpatiotemporalFilter::new()
                 .with_time_range(t_start, t_end)
                 .with_spatial([0.0, 0.0, 0.0], 10.0),

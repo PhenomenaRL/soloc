@@ -18,10 +18,8 @@ use spacetimestamp::schema::FrameRegistry;
 /// let ledger = Ledger::for_schema::<EntitySchema>(None)?;
 /// ```
 pub trait SolocSchema {
-    /// Returns the full Arrow schema, which must embed a `spacetimestamp` struct column.
+    /// Returns the full Arrow schema, which must embed a `"spacetimestamp"` struct column.
     fn schema(registry: Option<&FrameRegistry>) -> SchemaRef;
-    /// Name of the `spacetimestamp` struct column in this schema.
-    fn sts_column() -> &'static str;
     /// Name of the entity-identity column, or `""` when this schema has no identity column.
     fn id_column() -> &'static str {
         ""

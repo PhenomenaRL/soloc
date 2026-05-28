@@ -15,7 +15,6 @@ pub struct ServerState {
     /// `az://container/key`, `file:///abs/path`).  When set, takes priority over
     /// `ledger_path` for both load-on-startup and save-on-shutdown.
     pub ledger_url: Option<String>,
-    pub sts_column: String,
     pub id_column: String,
 }
 
@@ -26,7 +25,6 @@ impl ServerState {
         ledger_path: Option<PathBuf>,
         ledger_url: Option<String>,
         schema_path: Option<PathBuf>,
-        sts_column: String,
         id_column: String,
     ) -> Self {
         let registry = registry_path
@@ -37,7 +35,7 @@ impl ServerState {
             .unwrap_or_default();
 
         let ledger = if let Some(ref url) = ledger_url {
-            match object_store_download(url, &sts_column, &id_column).await {
+            match object_store_download(url, &id_column).await {
                 Ok(l) => {
                     eprintln!("soloc-server: ledger loaded from {url} ({} batches)", l.len());
                     l
@@ -47,12 +45,12 @@ impl ServerState {
                         "soloc-server: WARNING — object-store load failed: {e}. \
                          Starting with empty ledger."
                     );
-                    new_empty_ledger(&schema_path, &sts_column, &id_column)
+                    new_empty_ledger(&schema_path, &id_column)
                 }
             }
         } else {
             let loaded = ledger_path.as_ref().filter(|p| p.exists()).and_then(|p| {
-                match Ledger::load_ipc(p, &sts_column, &id_column) {
+                match Ledger::load_ipc(p, &id_column) {
                     Ok(l) => {
                         eprintln!(
                             "soloc-server: ledger loaded from {:?} ({} batches)",
@@ -70,7 +68,7 @@ impl ServerState {
                     }
                 }
             });
-            loaded.unwrap_or_else(|| new_empty_ledger(&schema_path, &sts_column, &id_column))
+            loaded.unwrap_or_else(|| new_empty_ledger(&schema_path, &id_column))
         };
 
         Self {
@@ -80,7 +78,6 @@ impl ServerState {
             registry_path,
             ledger_path,
             ledger_url,
-            sts_column,
             id_column,
         }
     }
@@ -140,11 +137,11 @@ impl ServerState {
 }
 
 /// Creates an empty ledger using `schema_path` (if provided) or the default entity schema.
-fn new_empty_ledger(schema_path: &Option<PathBuf>, sts_column: &str, id_column: &str) -> Ledger {
+fn new_empty_ledger(schema_path: &Option<PathBuf>, id_column: &str) -> Ledger {
     if let Some(ref path) = schema_path {
         match read_schema_from_ipc(path) {
             Ok(schema) => {
-                match Ledger::new(&schema, sts_column, id_column) {
+                match Ledger::new(&schema, id_column) {
                     Ok(l) => {
                         eprintln!("soloc-server: empty ledger created from schema {:?}", path);
                         return l;
@@ -163,7 +160,7 @@ fn new_empty_ledger(schema_path: &Option<PathBuf>, sts_column: &str, id_column: 
         }
     }
 
-    Ledger::new(&entity_schema(None), sts_column, id_column)
+    Ledger::new(&entity_schema(None), id_column)
         .expect("entity_schema is always valid for 'spacetimestamp'/'entity_id'")
 }
 
@@ -179,7 +176,7 @@ fn read_schema_from_ipc(path: &PathBuf) -> Result<arrow::datatypes::SchemaRef, S
 }
 
 /// Downloads and deserialises a ledger from any object-store URL.
-async fn object_store_download(url_str: &str, sts_column: &str, id_column: &str) -> Result<Ledger, String> {
+async fn object_store_download(url_str: &str, id_column: &str) -> Result<Ledger, String> {
     use object_store::ObjectStore;
 
     let url =
@@ -195,7 +192,7 @@ async fn object_store_download(url_str: &str, sts_column: &str, id_column: &str)
         .await
         .map_err(|e| format!("object-store read bytes failed: {e}"))?;
 
-    Ledger::load_ipc_from_bytes(&bytes, sts_column, id_column)
+    Ledger::load_ipc_from_bytes(&bytes, id_column)
 }
 
 /// Serialises and uploads the ledger to any object-store URL.

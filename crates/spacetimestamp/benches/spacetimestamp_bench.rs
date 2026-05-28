@@ -71,7 +71,7 @@ fn bench_filter_batch_time(c: &mut Criterion) {
         let batch = make_filter_bench_batch(n_rows);
         let filter = time_filter_10pct(n_rows);
         group.bench_with_input(BenchmarkId::new("rows", n_rows), &n_rows, |b, _| {
-            b.iter(|| filter_batch(black_box(&batch), "spacetimestamp", black_box(&filter)).unwrap())
+            b.iter(|| filter_batch(black_box(&batch), black_box(&filter)).unwrap())
         });
     }
     group.finish();
@@ -83,7 +83,7 @@ fn bench_filter_batch_spatial(c: &mut Criterion) {
     for n_rows in [1_000usize, 10_000, 100_000] {
         let batch = make_filter_bench_batch(n_rows);
         group.bench_with_input(BenchmarkId::new("rows", n_rows), &n_rows, |b, _| {
-            b.iter(|| filter_batch(black_box(&batch), "spacetimestamp", black_box(&filter)).unwrap())
+            b.iter(|| filter_batch(black_box(&batch), black_box(&filter)).unwrap())
         });
     }
     group.finish();
@@ -95,7 +95,7 @@ fn bench_filter_batch_combined(c: &mut Criterion) {
         let batch = make_filter_bench_batch(n_rows);
         let filter = time_filter_10pct(n_rows).with_spatial([6800.0, 0.0, 0.0], 4000.0);
         group.bench_with_input(BenchmarkId::new("rows", n_rows), &n_rows, |b, _| {
-            b.iter(|| filter_batch(black_box(&batch), "spacetimestamp", black_box(&filter)).unwrap())
+            b.iter(|| filter_batch(black_box(&batch), black_box(&filter)).unwrap())
         });
     }
     group.finish();

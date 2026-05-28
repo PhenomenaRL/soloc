@@ -54,7 +54,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::ephemeris::{epoch_from_parts, epoch_to_parts};
-use crate::schema::{FrameRegistry, STS_REGISTRY_METADATA_KEY, SpaceTimestampBuilder};
+use crate::schema::{FrameRegistry, STS_COLUMN, STS_REGISTRY_METADATA_KEY, SpaceTimestampBuilder};
 
 /// Converts a position/velocity unit string to a multiplier yielding kilometers.
 fn unit_to_km_factor(unit: &str) -> f64 {
@@ -148,8 +148,7 @@ fn read_vec4(values: &Float64Array, list_offset: usize, row: usize) -> [f64; 4] 
 /// and velocities, with all other custom domain columns preserved exactly as they were.
 ///
 /// # Arguments
-/// * `batch` - The immutable source data.
-/// * `sts_column_name` - The name of the struct column containing the spacetimestamp (e.g. "spacetimestamp").
+/// * `batch` - The immutable source data. Must contain a `"spacetimestamp"` struct column.
 /// * `target_frame_name` - The target `anise` frame (e.g. "ICRF", "Earth").
 /// * `almanac` - The `anise` ephemeris engine holding planetary data.
 /// * `target_unit` - The desired output unit for position and velocity (e.g. "km" or "m").
@@ -163,7 +162,6 @@ fn read_vec4(values: &Float64Array, list_offset: usize, row: usize) -> [f64; 4] 
 ///   Static [`FrameRegistry`] entries are checked first; dynamic frames are the fallback.
 pub fn transform_batch(
     batch: &RecordBatch,
-    sts_column_name: &str,
     target_frame_name: &str,
     almanac: &Almanac,
     target_unit: &str,
@@ -184,14 +182,14 @@ pub fn transform_batch(
 
     let schema = batch.schema();
     let col_idx = schema
-        .index_of(sts_column_name)
-        .map_err(|_| format!("Column '{}' not found", sts_column_name))?;
+        .index_of(STS_COLUMN)
+        .map_err(|_| format!("Column '{}' not found", STS_COLUMN))?;
 
     let sts_col = batch.column(col_idx);
     let struct_array = sts_col
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| format!("'{}' column is not a StructArray", sts_column_name))?;
+        .ok_or_else(|| format!("'{}' column is not a StructArray", STS_COLUMN))?;
 
     // 1. Extract the registry from the schema's root metadata
     let registry = schema
@@ -511,18 +509,17 @@ pub fn transform_batch(
 /// single timescale, making temporal comparisons and almanac queries unambiguous.
 pub fn normalize_batch_to_tai(
     batch: &RecordBatch,
-    sts_column_name: &str,
 ) -> Result<RecordBatch, String> {
     let schema = batch.schema();
     let col_idx = schema
-        .index_of(sts_column_name)
-        .map_err(|_| format!("Column '{}' not found in batch", sts_column_name))?;
+        .index_of(STS_COLUMN)
+        .map_err(|_| format!("Column '{}' not found in batch", STS_COLUMN))?;
 
     let struct_array = batch
         .column(col_idx)
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| format!("'{}' is not a StructArray", sts_column_name))?;
+        .ok_or_else(|| format!("'{}' is not a StructArray", STS_COLUMN))?;
 
     let timescales = struct_array
         .column_by_name("timescale_id")
@@ -659,7 +656,7 @@ mod tests {
         builder.append_spacetimestamp("cam", "m", "TAI", "s", "MEASURED", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
-        let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "m", None).unwrap();
+        let result = transform_batch(&batch, "Earth", &Almanac::default(), "m", None).unwrap();
 
         let pos = read_output_pos(&result, 0);
         assert_eq!(pos, [1.0, 0.0, 0.0]);
@@ -679,7 +676,7 @@ mod tests {
         builder.append_spacetimestamp("cam", "m", "TAI", "s", "MEASURED", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
-        let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "m", None).unwrap();
+        let result = transform_batch(&batch, "Earth", &Almanac::default(), "m", None).unwrap();
 
         let pos = read_output_pos(&result, 0);
         assert!((pos[0] - 1.0).abs() < 1e-10, "x={}", pos[0]);
@@ -711,7 +708,7 @@ mod tests {
         );
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
-        let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "m", None).unwrap();
+        let result = transform_batch(&batch, "Earth", &Almanac::default(), "m", None).unwrap();
 
         let pos = read_output_pos(&result, 0);
         assert!(pos[0].abs() < 1e-10, "x should be ~0, got {}", pos[0]);
@@ -741,7 +738,7 @@ mod tests {
         builder.append_spacetimestamp("arm", "m", "TAI", "s", "MEASURED", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
-        let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "m", None).unwrap();
+        let result = transform_batch(&batch, "Earth", &Almanac::default(), "m", None).unwrap();
 
         let pos0 = read_output_pos(&result, 0);
         assert!((pos0[0] - 5.0).abs() < 1e-10, "row0 x={}", pos0[0]);
@@ -758,7 +755,7 @@ mod tests {
         builder.append_spacetimestamp("Earth", "m", "TAI", "s", "MEASURED", [1000.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
 
         let batch = make_sts_batch(&mut builder, None);
-        let result = transform_batch(&batch, "spacetimestamp", "Earth", &Almanac::default(), "km", None).unwrap();
+        let result = transform_batch(&batch, "Earth", &Almanac::default(), "km", None).unwrap();
 
         let pos = read_output_pos(&result, 0);
         assert!((pos[0] - 1.0).abs() < 1e-10, "expected 1.0 km, got {}", pos[0]);
@@ -848,7 +845,7 @@ mod tests {
         builder.append_spacetimestamp("ICRF", "km", "TAI", "s", "MEASURED", [0.0; 3], [1.0, 0.0, 0.0, 0.0], 0, 1000, None, None);
         builder.append_spacetimestamp("ICRF", "km", "TAI", "s", "MEASURED", [0.0; 3], [1.0, 0.0, 0.0, 0.0], 0, 2000, None, None);
         let batch = make_sts_batch(&mut builder, None);
-        let result = normalize_batch_to_tai(&batch, "spacetimestamp").unwrap();
+        let result = normalize_batch_to_tai(&batch).unwrap();
         // Should be a cheap clone — same pointer
         assert_eq!(result.num_rows(), 2);
         assert_eq!(read_timescale(&result, 0), "TAI");
@@ -868,7 +865,7 @@ mod tests {
         builder.append_spacetimestamp("ICRF", "km", "UTC", "s", "MEASURED", [0.0; 3], [1.0, 0.0, 0.0, 0.0], utc_c, utc_n, None, None);
         let batch = make_sts_batch(&mut builder, None);
 
-        let result = normalize_batch_to_tai(&batch, "spacetimestamp").unwrap();
+        let result = normalize_batch_to_tai(&batch).unwrap();
 
         // After normalization: timescale_id should be TAI.
         assert_eq!(read_timescale(&result, 0), "TAI");
@@ -897,7 +894,7 @@ mod tests {
         builder.append_spacetimestamp("ICRF", "km", "UTC", "s", "MEASURED", [0.0; 3], [1.0, 0.0, 0.0, 0.0], utc_c, utc_n, None, None);
         let batch = make_sts_batch(&mut builder, None);
 
-        let result = normalize_batch_to_tai(&batch, "spacetimestamp").unwrap();
+        let result = normalize_batch_to_tai(&batch).unwrap();
 
         assert_eq!(read_timescale(&result, 0), "TAI");
         assert_eq!(read_timescale(&result, 1), "TAI");
