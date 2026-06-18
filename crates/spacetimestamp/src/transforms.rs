@@ -66,59 +66,6 @@ fn unit_to_km_factor(unit: &str) -> f64 {
     }
 }
 
-/// Resolves "IAU_BODY" strings (e.g. "IAU_EARTH", "IAU_TITAN") to the corresponding anise
-/// IAU body-fixed frame by mapping the body name to its NAIF integer ID and constructing
-/// `Frame::new(naif_id, naif_id)`.
-///
-/// Covers all planets, Earth's Moon, and the major moons of Mars, Jupiter, and Saturn
-/// that carry PCK rotation models in DE440/pck11.
-///
-/// Returns `None` for unrecognised body names.
-fn iau_frame_from_name(body_upper: &str) -> Option<Frame> {
-    let naif_id: i32 = match body_upper {
-        // Planets
-        "SUN"      => 10,
-        "MERCURY"  => 199,
-        "VENUS"    => 299,
-        "EARTH"    => 399,
-        "MOON"     => 301,
-        "MARS"     => 499,
-        "JUPITER"  => 599,
-        "SATURN"   => 699,
-        "URANUS"   => 799,
-        "NEPTUNE"  => 899,
-        // Mars system
-        "PHOBOS"   => 401,
-        "DEIMOS"   => 402,
-        // Jupiter system
-        "IO"       => 501,
-        "EUROPA"   => 502,
-        "GANYMEDE" => 503,
-        "CALLISTO" => 504,
-        // Saturn system
-        "MIMAS"    => 601,
-        "ENCELADUS"=> 602,
-        "TETHYS"   => 603,
-        "DIONE"    => 604,
-        "RHEA"     => 605,
-        "TITAN"    => 606,
-        "IAPETUS"  => 608,
-        // Uranus system
-        "MIRANDA"  => 705,
-        "ARIEL"    => 701,
-        "UMBRIEL"  => 702,
-        "TITANIA"  => 703,
-        "OBERON"   => 704,
-        // Neptune system
-        "TRITON"   => 801,
-        // Pluto system
-        "PLUTO"    => 999,
-        "CHARON"   => 901,
-        _          => return None,
-    };
-    Some(Frame::new(naif_id, naif_id))
-}
-
 /// Reads a flat `[x, y, z]` triple from the raw values buffer of a `FixedSizeListArray`,
 /// correctly accounting for the list array's Arrow offset (present in sliced batches).
 #[inline]
@@ -170,15 +117,8 @@ pub fn transform_batch(
     // Attempt to resolve the target frame in anise. We default to assuming J2000 orientation
     // if the user simply passed a planetary center like "Mars".  Also handles "IAU_BODY" strings
     // (e.g. "IAU_EARTH") by mapping to the corresponding anise body-fixed frame.
-    let target_frame = Frame::from_name(target_frame_name, "J2000")
-        .or_else(|_| Frame::from_name("SSB", target_frame_name))
-        .or_else(|last_err| {
-            target_frame_name
-                .strip_prefix("IAU_")
-                .and_then(iau_frame_from_name)
-                .ok_or(last_err)
-        })
-        .map_err(|e| format!("Invalid target_frame_name '{}': {}", target_frame_name, e))?;
+    let target_frame = crate::ephemeris::resolve_astronomical_frame(target_frame_name)
+        .ok_or_else(|| format!("Invalid target_frame_name '{}': not recognized by anise", target_frame_name))?;
 
     let schema = batch.schema();
     let col_idx = schema
@@ -413,15 +353,8 @@ pub fn transform_batch(
         // Root frame names are always bare astronomical identifiers: "ICRF", "IAU_EARTH",
         // "IAU_TITAN", etc. Entity URIs are resolved before reaching this point and never
         // appear here as root_frame_name.
-        let root_frame = Frame::from_name(root_frame_name.as_str(), "J2000")
-            .or_else(|_| Frame::from_name("SSB", root_frame_name.as_str()))
-            .or_else(|last_err| {
-                root_frame_name
-                    .strip_prefix("IAU_")
-                    .and_then(iau_frame_from_name)
-                    .ok_or(last_err)
-            })
-            .map_err(|e| format!("Failed resolving root frame '{}': {}", root_frame_name, e))?;
+        let root_frame = crate::ephemeris::resolve_astronomical_frame(&root_frame_name)
+            .ok_or_else(|| format!("Failed resolving root frame '{}': not recognized by anise", root_frame_name))?;
 
         // almanac.translate(from, to, epoch) → radius_km is the position of `from`'s origin
         // expressed in `to` frame coordinates. This is the additive shift that maps a vector
@@ -766,56 +699,39 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_iau_frame_from_name_planets() {
-        // All ten planets/Moon must resolve.
+    fn test_iau_resolve_planets() {
         let cases = [
-            ("SUN", 10), ("MERCURY", 199), ("VENUS", 299),
-            ("EARTH", 399), ("MOON", 301), ("MARS", 499),
-            ("JUPITER", 599), ("SATURN", 699), ("URANUS", 799), ("NEPTUNE", 899),
+            ("IAU_SUN", 10), ("IAU_MERCURY", 199), ("IAU_VENUS", 299),
+            ("IAU_EARTH", 399), ("IAU_MOON", 301), ("IAU_MARS", 499),
+            ("IAU_JUPITER", 599), ("IAU_SATURN", 699), ("IAU_URANUS", 799), ("IAU_NEPTUNE", 899),
         ];
         for (name, naif_id) in cases {
-            let frame = iau_frame_from_name(name)
-                .unwrap_or_else(|| panic!("iau_frame_from_name({name:?}) returned None"));
+            let frame = crate::ephemeris::resolve_astronomical_frame(name)
+                .unwrap_or_else(|| panic!("resolve_astronomical_frame({name:?}) returned None"));
             assert_eq!(frame.ephemeris_id, naif_id, "{name}: wrong ephemeris_id");
             assert_eq!(frame.orientation_id, naif_id, "{name}: wrong orientation_id");
         }
     }
 
     #[test]
-    fn test_iau_frame_from_name_major_moons() {
-        // Key moons that users will reference as body-fixed frames.
+    fn test_iau_resolve_major_moons() {
         let cases = [
-            ("TITAN", 606), ("EUROPA", 502), ("GANYMEDE", 503),
-            ("CALLISTO", 504), ("IO", 501), ("TRITON", 801),
-            ("PHOBOS", 401), ("DEIMOS", 402),
+            ("IAU_TITAN", 606), ("IAU_EUROPA", 502), ("IAU_GANYMEDE", 503),
+            ("IAU_CALLISTO", 504), ("IAU_IO", 501), ("IAU_TRITON", 801),
+            ("IAU_PHOBOS", 401), ("IAU_DEIMOS", 402),
         ];
         for (name, naif_id) in cases {
-            let frame = iau_frame_from_name(name)
-                .unwrap_or_else(|| panic!("iau_frame_from_name({name:?}) returned None"));
+            let frame = crate::ephemeris::resolve_astronomical_frame(name)
+                .unwrap_or_else(|| panic!("resolve_astronomical_frame({name:?}) returned None"));
             assert_eq!(frame.ephemeris_id, naif_id, "{name}: wrong ephemeris_id");
         }
     }
 
     #[test]
-    fn test_iau_frame_from_name_unknown() {
-        assert!(iau_frame_from_name("UNKNOWN").is_none());
-        assert!(iau_frame_from_name("").is_none());
-        assert!(iau_frame_from_name("earth").is_none(), "must be uppercase");
-    }
-
-    #[test]
-    fn test_iau_prefix_strip_resolves_frame() {
-        // Verify the IAU_BODY → iau_frame_from_name path used in transform_batch.
-        let frame = "IAU_EARTH"
-            .strip_prefix("IAU_")
-            .and_then(iau_frame_from_name);
-        assert!(frame.is_some(), "IAU_EARTH should resolve via strip_prefix path");
-
-        let titan_frame = "IAU_TITAN"
-            .strip_prefix("IAU_")
-            .and_then(iau_frame_from_name);
-        assert!(titan_frame.is_some(), "IAU_TITAN should resolve via strip_prefix path");
-        assert_eq!(titan_frame.unwrap().ephemeris_id, 606);
+    fn test_iau_resolve_unknown() {
+        assert!(crate::ephemeris::resolve_astronomical_frame("IAU_UNKNOWN").is_none());
+        assert!(crate::ephemeris::resolve_astronomical_frame("IAU_").is_none());
+        assert!(crate::ephemeris::resolve_astronomical_frame("IAU_earth").is_none(), "must be uppercase");
     }
 
     // -----------------------------------------------------------------------

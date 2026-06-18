@@ -3,8 +3,8 @@ use arrow::datatypes::UInt32Type;
 use arrow::record_batch::RecordBatch;
 use hifitime::TimeScale;
 use std::str::FromStr;
+use crate::ephemeris::is_valid_astronomical_frame;
 use crate::schema::{FrameRegistry, STS_COLUMN, STS_REGISTRY_METADATA_KEY};
-use anise::prelude::Frame;
 
 /// Validates `timescale_id` and `frame_id` values in a batch against hifitime and anise standards.
 ///
@@ -70,16 +70,8 @@ pub fn validate_spacetimestamp_batch(batch: &RecordBatch) -> Result<(), String> 
                 continue;
             }
             if frame_str.parse::<i32>().is_ok() { continue; }
-            if frame_str == "ICRF" || frame_str == "J2000" || frame_str == "EME2000"
-                || frame_str == "IAU_MARS" || frame_str == "IAU_EARTH" {
-                continue;
-            }
             if crate::schema::is_entity_uri(frame_str) { continue; }
-            let is_compound = frame_str
-                .split_once('_')
-                .map(|(center, orient)| Frame::from_name(center, orient).is_ok())
-                .unwrap_or(false);
-            if is_compound { continue; }
+            if is_valid_astronomical_frame(frame_str) { continue; }
 
             return Err(format!(
                 "Invalid frame_id: '{}' is not recognized by anise or the FrameRegistry",

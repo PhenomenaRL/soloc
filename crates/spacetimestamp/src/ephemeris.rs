@@ -18,7 +18,7 @@ use hifitime::{Duration, Epoch, TimeScale};
 use nalgebra::{Rotation3, UnitQuaternion};
 use std::str::FromStr;
 
-use crate::schema::SpaceTimestampBuilder;
+use crate::schema::{KNOWN_EXTERNAL_FRAMES, SpaceTimestampBuilder};
 
 // ---------------------------------------------------------------------------
 // Epoch helpers
@@ -57,6 +57,79 @@ pub fn epoch_from_parts(centuries: i16, ns: u64, ts: TimeScale) -> Epoch {
 /// used throughout the spacetimestamp schema.
 pub fn epoch_to_parts(epoch: Epoch) -> (i16, u64) {
     (epoch - j2000_tai()).to_parts()
+}
+
+// ---------------------------------------------------------------------------
+// Astronomical frame resolution
+// ---------------------------------------------------------------------------
+
+/// Resolves an `IAU_BODY` string to an anise body-fixed [`Frame`] by NAIF ID.
+///
+/// The caller must have already stripped the `"IAU_"` prefix, passing only the uppercase
+/// body name (e.g. `"EARTH"`, `"TITAN"`). Returns `None` for unrecognised bodies.
+pub(crate) fn iau_frame_from_name(body_upper: &str) -> Option<Frame> {
+    let naif_id: i32 = match body_upper {
+        "SUN"      => 10,
+        "MERCURY"  => 199,
+        "VENUS"    => 299,
+        "EARTH"    => 399,
+        "MOON"     => 301,
+        "MARS"     => 499,
+        "JUPITER"  => 599,
+        "SATURN"   => 699,
+        "URANUS"   => 799,
+        "NEPTUNE"  => 899,
+        "PLUTO"    => 999,
+        "CHARON"   => 901,
+        "PHOBOS"   => 401,
+        "DEIMOS"   => 402,
+        "IO"       => 501,
+        "EUROPA"   => 502,
+        "GANYMEDE" => 503,
+        "CALLISTO" => 504,
+        "MIMAS"    => 601,
+        "ENCELADUS"=> 602,
+        "TETHYS"   => 603,
+        "DIONE"    => 604,
+        "RHEA"     => 605,
+        "TITAN"    => 606,
+        "IAPETUS"  => 608,
+        "MIRANDA"  => 705,
+        "ARIEL"    => 701,
+        "UMBRIEL"  => 702,
+        "TITANIA"  => 703,
+        "OBERON"   => 704,
+        "TRITON"   => 801,
+        _          => return None,
+    };
+    Some(Frame::new(naif_id, naif_id))
+}
+
+/// Resolves a bare astronomical frame name to an anise [`Frame`].
+///
+/// Tries three paths in order:
+/// 1. `Frame::from_name(name, "J2000")` — body centers with inertial orientation
+/// 2. `Frame::from_name("SSB", name)` — SSB-centred orientation frames
+/// 3. `IAU_BODY` prefix — strips `"IAU_"` and looks up the NAIF body-fixed frame
+///
+/// Returns `None` if none of the three paths succeeds. Note that some entries in
+/// [`KNOWN_EXTERNAL_FRAMES`] (e.g. `"ICRF"`) are orientation frames that anise does not
+/// resolve as a body-center string — those are accepted statically by
+/// [`is_valid_astronomical_frame`]. Use that function for yes/no checks; use this one
+/// when an actual [`Frame`] object is needed for almanac calls.
+pub(crate) fn resolve_astronomical_frame(name: &str) -> Option<Frame> {
+    Frame::from_name(name, "J2000").ok()
+        .or_else(|| Frame::from_name("SSB", name).ok())
+        .or_else(|| name.strip_prefix("IAU_").and_then(iau_frame_from_name))
+}
+
+/// Returns `true` if `name` is a valid astronomical frame identifier.
+///
+/// Accepts entries in [`KNOWN_EXTERNAL_FRAMES`] (statically trusted), any `IAU_BODY` name
+/// resolvable by [`iau_frame_from_name`], and any name resolvable at runtime by anise.
+/// This is the single source of truth shared by validation and `add_frame_validated`.
+pub(crate) fn is_valid_astronomical_frame(name: &str) -> bool {
+    KNOWN_EXTERNAL_FRAMES.contains(&name) || resolve_astronomical_frame(name).is_some()
 }
 
 // ---------------------------------------------------------------------------

@@ -113,12 +113,12 @@ impl FrameRegistry {
     ///
     /// A name is external if it:
     /// - Is already fully qualified (contains `:`),
-    /// - Matches the `*_IAU` body-fixed naming convention,
+    /// - Matches the `IAU_*` body-fixed naming convention (e.g. `"IAU_MARS"`, `"IAU_EARTH"`),
     /// - Appears in [`KNOWN_EXTERNAL_FRAMES`], or
     /// - Was registered via [`add_external_frame`](Self::add_external_frame).
     pub fn is_external_frame(&self, name: &str) -> bool {
         name.contains(':')
-            || name.ends_with("_IAU")
+            || name.starts_with("IAU_")
             || KNOWN_EXTERNAL_FRAMES.contains(&name)
             || self.extra_external_frames.contains(name)
     }
@@ -137,7 +137,7 @@ impl FrameRegistry {
     /// The `local_name` is the name of the new frame.
     /// The `parent_name` can be either:
     /// 1. Another local name within this registry (e.g., "base_link").
-    /// 2. An external astronomical frame (e.g., "MARS_IAU", "GCRF", "Neptune").
+    /// 2. An external astronomical frame (e.g., "IAU_MARS", "GCRF", "Neptune").
     ///
     /// External parents are detected via [`is_external_frame`](Self::is_external_frame)
     /// and passed through unchanged. Local siblings are namespace-qualified automatically.
@@ -193,13 +193,26 @@ impl FrameRegistry {
             // a center). Only user-registered extra frames get runtime validation, since
             // those are arbitrary strings we cannot trust statically.
             if self.extra_external_frames.contains(parent_name) {
-                Frame::from_name(parent_name, "J2000")
-                    .or_else(|_| Frame::from_name("SSB", parent_name))
-                    .map_err(|_| format!(
+                // Direct anise check — schema.rs cannot call ephemeris (circular dep).
+                // Covers body-center names, SSB-relative orientation frames, and IAU_ bodies.
+                let ok = Frame::from_name(parent_name, "J2000").is_ok()
+                    || Frame::from_name("SSB", parent_name).is_ok()
+                    || parent_name.strip_prefix("IAU_")
+                        .map(|body| matches!(body,
+                            "SUN"|"MERCURY"|"VENUS"|"EARTH"|"MOON"|"MARS"|"JUPITER"|"SATURN"
+                            |"URANUS"|"NEPTUNE"|"PLUTO"|"CHARON"|"PHOBOS"|"DEIMOS"
+                            |"IO"|"EUROPA"|"GANYMEDE"|"CALLISTO"|"MIMAS"|"ENCELADUS"
+                            |"TETHYS"|"DIONE"|"RHEA"|"TITAN"|"IAPETUS"
+                            |"MIRANDA"|"ARIEL"|"UMBRIEL"|"TITANIA"|"OBERON"|"TRITON"
+                        ))
+                        .unwrap_or(false);
+                if !ok {
+                    return Err(format!(
                         "parent frame '{}' was registered via add_external_frame() but is \
                          not recognized by anise. Verify the frame name or NAIF ID.",
                         parent_name
-                    ))?;
+                    ));
+                }
             }
             // almanac is reserved for future per-frame SPK availability checks
             // (e.g. a translate() probe to verify SPK data is loaded for this body).
@@ -779,10 +792,10 @@ mod tests {
     fn test_frame_registry_validation() {
         let mut reg = FrameRegistry::new_with_namespace("test_ns");
 
-        // Valid Tree: arm -> base_link -> MARS_IAU
+        // Valid Tree: arm -> base_link -> IAU_MARS
         reg.add_frame(
             "base_link",
-            "MARS_IAU",
+            "IAU_MARS",
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0, 0.0],
         );
@@ -863,8 +876,8 @@ mod tests {
         assert!(reg.is_external_frame("SSB"));
 
         // IAU convention
-        assert!(reg.is_external_frame("EARTH_IAU"));
-        assert!(reg.is_external_frame("MARS_IAU"));
+        assert!(reg.is_external_frame("IAU_EARTH"));
+        assert!(reg.is_external_frame("IAU_MARS"));
 
         // Already fully qualified
         assert!(reg.is_external_frame("ns:cam"));
@@ -922,7 +935,7 @@ mod tests {
         assert!(reg.add_frame_validated("ant",    "ICRF",  [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
         assert!(reg.add_frame_validated("sensor", "GCRF",  [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
         // IAU convention — trusted without anise runtime call
-        assert!(reg.add_frame_validated("imu", "MARS_IAU", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
+        assert!(reg.add_frame_validated("imu", "IAU_MARS", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
         assert_eq!(reg.frames["ns:cam"].parent_id, "Earth");
         assert_eq!(reg.frames["ns:ant"].parent_id, "ICRF");
     }
