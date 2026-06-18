@@ -56,18 +56,6 @@ const SEGMENT_THRESHOLD: usize = 50;
 /// Rows older than (latest stored timestamp − this window) are excluded.
 const CURRENT_STATE_WINDOW_NS: u64 = 3_600 * 1_000_000_000; // 1 hour
 
-/// Required field names inside the spacetimestamp struct column.
-const STS_REQUIRED_FIELDS: &[&str] = &[
-    "frame_id",
-    "units_pos",
-    "timescale_id",
-    "source_id",
-    "estimate_type",
-    "position",
-    "quaternion",
-    "duration_centuries",
-    "duration_ns",
-];
 
 /// An append-only store of [`RecordBatch`]es forming the soloc Universal Ledger.
 ///
@@ -139,12 +127,34 @@ impl Ledger {
             }
         };
 
-        for &name in STS_REQUIRED_FIELDS {
-            if sts_fields.find(name).is_none() {
-                return Err(format!(
-                    "'{}' struct is missing required STS field '{name}'",
-                    STS_COLUMN
-                ));
+        // Check that each required STS field is present with the correct Arrow type.
+        // Type correctness is critical: transform_batch and filter_batch call
+        // downcast_ref().unwrap() on these arrays and panic at runtime on type mismatch.
+        let checks: &[(&str, &str, fn(&DataType) -> bool)] = &[
+            ("frame_id",           "Dictionary(UInt32, Utf8)",  |dt| matches!(dt, DataType::Dictionary(k, v) if **k == DataType::UInt32 && **v == DataType::Utf8)),
+            ("units_pos",          "Dictionary(UInt16, Utf8)",  |dt| matches!(dt, DataType::Dictionary(k, v) if **k == DataType::UInt16 && **v == DataType::Utf8)),
+            ("timescale_id",       "Dictionary(UInt32, Utf8)",  |dt| matches!(dt, DataType::Dictionary(k, v) if **k == DataType::UInt32 && **v == DataType::Utf8)),
+            ("source_id",          "Dictionary(UInt32, Utf8)",  |dt| matches!(dt, DataType::Dictionary(k, v) if **k == DataType::UInt32 && **v == DataType::Utf8)),
+            ("estimate_type",      "Dictionary(UInt16, Utf8)",  |dt| matches!(dt, DataType::Dictionary(k, v) if **k == DataType::UInt16 && **v == DataType::Utf8)),
+            ("position",           "FixedSizeList(3, Float64)", |dt| matches!(dt, DataType::FixedSizeList(f, 3) if f.data_type() == &DataType::Float64)),
+            ("quaternion",         "FixedSizeList(4, Float64)", |dt| matches!(dt, DataType::FixedSizeList(f, 4) if f.data_type() == &DataType::Float64)),
+            ("duration_centuries", "Int16",                     |dt| *dt == DataType::Int16),
+            ("duration_ns",        "UInt64",                    |dt| *dt == DataType::UInt64),
+        ];
+
+        for (name, expected, type_ok) in checks {
+            match sts_fields.find(name) {
+                None => return Err(format!(
+                    "'{STS_COLUMN}' struct is missing required STS field '{name}'"
+                )),
+                Some((_, field)) => {
+                    if !type_ok(field.data_type()) {
+                        return Err(format!(
+                            "'{STS_COLUMN}.{name}' has wrong Arrow type — expected {expected}, got {:?}",
+                            field.data_type()
+                        ));
+                    }
+                }
             }
         }
 
@@ -1283,6 +1293,39 @@ mod tests {
         let schema = sts_only_schema();
         let err = Ledger::new(&schema, "entity_id").unwrap_err();
         assert!(err.contains("entity_id"), "got: {err}");
+    }
+
+    #[test]
+    fn test_new_rejects_wrong_sts_field_type() {
+        // Build a spacetimestamp struct where `duration_ns` is Int32 instead of UInt64.
+        // validate_schema must catch the type mismatch before any runtime downcast panic.
+        use spacetimestamp::schema::sts_schema;
+        let sts_ref = sts_schema(None);
+        let mut fields: Vec<Field> = sts_ref.fields().iter().map(|f| (**f).clone()).collect();
+        let ns_idx = fields.iter().position(|f| f.name() == "duration_ns").unwrap();
+        fields[ns_idx] = Field::new("duration_ns", DataType::Int32, false);
+        let broken_sts = DataType::Struct(Fields::from(fields));
+        let schema = Arc::new(Schema::new(vec![Field::new("spacetimestamp", broken_sts, false)]));
+        let err = Ledger::new(&schema, "").unwrap_err();
+        assert!(err.contains("duration_ns"), "error should name the bad field: {err}");
+        assert!(err.contains("UInt64"), "error should name the expected type: {err}");
+    }
+
+    #[test]
+    fn test_new_rejects_missing_sts_field() {
+        // Build a struct that is missing the `position` field entirely.
+        use spacetimestamp::schema::sts_schema;
+        let sts_ref = sts_schema(None);
+        let fields: Vec<Field> = sts_ref
+            .fields()
+            .iter()
+            .filter(|f| f.name() != "position")
+            .map(|f| (**f).clone())
+            .collect();
+        let broken_sts = DataType::Struct(Fields::from(fields));
+        let schema = Arc::new(Schema::new(vec![Field::new("spacetimestamp", broken_sts, false)]));
+        let err = Ledger::new(&schema, "").unwrap_err();
+        assert!(err.contains("position"), "error should name the missing field: {err}");
     }
 
     // -----------------------------------------------------------------------
