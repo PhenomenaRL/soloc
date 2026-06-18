@@ -18,7 +18,9 @@
 //! ```
 //!
 //! Positions use `Point3` (isometry applies translation + rotation).
-//! Velocities and orientations use `Vector3`/`UnitQuaternion` (rotation only — no origin shift).
+//! Orientations use `UnitQuaternion` (rotation only — no origin shift).
+//! Kinematic fields outside the spacetimestamp struct (velocity, angular_velocity, acceleration)
+//! are passed through unchanged; the caller is responsible for reprojecting those.
 //!
 //! # Anise Convention
 //!
@@ -41,9 +43,8 @@
 
 use anise::prelude::*;
 use arrow::array::{
-    Array, DictionaryArray, FixedSizeListArray, FixedSizeListBuilder, Float64Array, Float64Builder,
-    Int16Array, Int16Builder, StringArray, StringDictionaryBuilder, StructArray, UInt64Array,
-    UInt64Builder,
+    Array, DictionaryArray, FixedSizeListArray, Float64Array, Int16Array, Int16Builder,
+    StringArray, StringDictionaryBuilder, StructArray, UInt64Array, UInt64Builder,
 };
 use arrow::datatypes::{UInt16Type, UInt32Type};
 use arrow::record_batch::RecordBatch;
@@ -71,7 +72,11 @@ fn unit_to_km_factor(unit: &str) -> f64 {
 #[inline]
 fn read_vec3(values: &Float64Array, list_offset: usize, row: usize) -> [f64; 3] {
     let base = (list_offset + row) * 3;
-    [values.value(base), values.value(base + 1), values.value(base + 2)]
+    [
+        values.value(base),
+        values.value(base + 1),
+        values.value(base + 2),
+    ]
 }
 
 /// Reads a flat `[w, x, y, z]` quadruple from the raw values buffer of a `FixedSizeListArray`,
@@ -87,18 +92,19 @@ fn read_vec4(values: &Float64Array, list_offset: usize, row: usize) -> [f64; 4] 
     ]
 }
 
-/// Transforms a batch containing a `spacetimestamp` (and optionally `velocity`)
-/// into a new target astronomical frame.
+/// Transforms the `spacetimestamp` struct column of a batch into a new target astronomical frame.
 ///
 /// This function acts as a pure projection: the original `RecordBatch` is unmodified.
-/// A new `RecordBatch` is returned containing the transformed positions, quaternions,
-/// and velocities, with all other custom domain columns preserved exactly as they were.
+/// A new `RecordBatch` is returned with only the `"spacetimestamp"` struct column replaced
+/// (reprojected position, quaternion, and time fields). All other columns — including
+/// `velocity`, `angular_velocity`, `acceleration`, `entity_id`, etc. — are passed through
+/// unchanged. The caller is responsible for reprojecting those kinematic fields if needed.
 ///
 /// # Arguments
 /// * `batch` - The immutable source data. Must contain a `"spacetimestamp"` struct column.
 /// * `target_frame_name` - The target `anise` frame (e.g. "ICRF", "Earth").
 /// * `almanac` - The `anise` ephemeris engine holding planetary data.
-/// * `target_unit` - The desired output unit for position and velocity (e.g. "km" or "m").
+/// * `target_unit` - The desired output unit for position (e.g. "km" or "m").
 /// * `dynamic_frames` - Optional map from entity URI frame IDs to `(astronomical_root, isometry_km)`.
 ///   Used when a row's `frame_id` is an entity URI (e.g. `"demo:truck_A"`) whose pose
 ///   must be looked up in the ledger. The isometry translates child-frame coordinates (in km)
@@ -117,8 +123,13 @@ pub fn transform_batch(
     // Attempt to resolve the target frame in anise. We default to assuming J2000 orientation
     // if the user simply passed a planetary center like "Mars".  Also handles "IAU_BODY" strings
     // (e.g. "IAU_EARTH") by mapping to the corresponding anise body-fixed frame.
-    let target_frame = crate::ephemeris::resolve_astronomical_frame(target_frame_name)
-        .ok_or_else(|| format!("Invalid target_frame_name '{}': not recognized by anise", target_frame_name))?;
+    let target_frame =
+        crate::ephemeris::resolve_astronomical_frame(target_frame_name).ok_or_else(|| {
+            format!(
+                "Invalid target_frame_name '{}': not recognized by anise",
+                target_frame_name
+            )
+        })?;
 
     let schema = batch.schema();
     let col_idx = schema
@@ -191,7 +202,11 @@ pub fn transform_batch(
         .as_any()
         .downcast_ref::<DictionaryArray<UInt32Type>>()
         .unwrap();
-    let frames_dict = frames.values().as_any().downcast_ref::<StringArray>().unwrap();
+    let frames_dict = frames
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
 
     let units = struct_array
         .column_by_name("units_pos")
@@ -199,7 +214,11 @@ pub fn transform_batch(
         .as_any()
         .downcast_ref::<DictionaryArray<UInt16Type>>()
         .unwrap();
-    let units_dict = units.values().as_any().downcast_ref::<StringArray>().unwrap();
+    let units_dict = units
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
 
     let timescales = struct_array
         .column_by_name("timescale_id")
@@ -207,7 +226,11 @@ pub fn transform_batch(
         .as_any()
         .downcast_ref::<DictionaryArray<UInt32Type>>()
         .unwrap();
-    let timescales_dict = timescales.values().as_any().downcast_ref::<StringArray>().unwrap();
+    let timescales_dict = timescales
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
 
     let sources = struct_array
         .column_by_name("source_id")
@@ -215,7 +238,11 @@ pub fn transform_batch(
         .as_any()
         .downcast_ref::<DictionaryArray<UInt32Type>>()
         .unwrap();
-    let sources_dict = sources.values().as_any().downcast_ref::<StringArray>().unwrap();
+    let sources_dict = sources
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
 
     let estimates = struct_array
         .column_by_name("estimate_type")
@@ -223,7 +250,11 @@ pub fn transform_batch(
         .as_any()
         .downcast_ref::<DictionaryArray<UInt16Type>>()
         .unwrap();
-    let estimates_dict = estimates.values().as_any().downcast_ref::<StringArray>().unwrap();
+    let estimates_dict = estimates
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
 
     let pos_list = struct_array
         .column_by_name("position")
@@ -231,7 +262,11 @@ pub fn transform_batch(
         .as_any()
         .downcast_ref::<FixedSizeListArray>()
         .unwrap();
-    let pos_values = pos_list.values().as_any().downcast_ref::<Float64Array>().unwrap();
+    let pos_values = pos_list
+        .values()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     let pos_offset = pos_list.offset();
 
     let quat_list = struct_array
@@ -240,7 +275,11 @@ pub fn transform_batch(
         .as_any()
         .downcast_ref::<FixedSizeListArray>()
         .unwrap();
-    let quat_values = quat_list.values().as_any().downcast_ref::<Float64Array>().unwrap();
+    let quat_values = quat_list
+        .values()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     let quat_offset = quat_list.offset();
 
     let cent_arr = struct_array
@@ -255,23 +294,6 @@ pub fn transform_batch(
         .as_any()
         .downcast_ref::<UInt64Array>()
         .unwrap();
-
-    // Check if we also need to transform a top-level velocity array.
-    let velocity_col_idx = schema.index_of("velocity").ok();
-    let velocity_list = velocity_col_idx.map(|idx| {
-        batch
-            .column(idx)
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .unwrap()
-    });
-    let velocity_values = velocity_list.map(|list| {
-        list.values().as_any().downcast_ref::<Float64Array>().unwrap()
-    });
-    let vel_offset = velocity_list.map(|l| l.offset()).unwrap_or(0);
-
-    let mut velocity_builder = velocity_col_idx
-        .map(|_| FixedSizeListBuilder::new(Float64Builder::with_capacity(batch.num_rows() * 3), 3));
 
     let num_rows = batch.num_rows();
     let mut sts_builder = SpaceTimestampBuilder::new(num_rows, registry.clone());
@@ -294,18 +316,6 @@ pub fn transform_batch(
         let centuries = cent_arr.value(i);
         let ns = ns_arr.value(i);
 
-        // Extract optional velocity from the top-level column
-        let vel_opt = if let (Some(v_vals), Some(v_list)) = (velocity_values, velocity_list) {
-            if v_list.is_null(i) {
-                None
-            } else {
-                let [vx, vy, vz] = read_vec3(v_vals, vel_offset, i);
-                Some([vx, vy, vz])
-            }
-        } else {
-            None
-        };
-
         // Reconstruct the physical epoch from the stored (centuries, ns) and their declared
         // timescale. epoch_from_parts applies the correct J2000 reference for that timescale
         // so the resulting Epoch is always physically correct regardless of storage timescale.
@@ -321,31 +331,23 @@ pub fn transform_batch(
         //   b) Dynamic frame from caller   — isometry is in km (entity pose from ledger)
         //   c) Passthrough                 — original_frame is already an astronomical root
         let quat_local = UnitQuaternion::from_quaternion(Quaternion::new(qw, qx, qy, qz));
-        let vel_local: Vector3<f64> = match vel_opt {
-            Some([vx, vy, vz]) => Vector3::new(vx, vy, vz) * to_km,
-            None => Vector3::zeros(),
-        };
 
-        let (root_frame_name, pos_root, vel_root, quat_root) =
+        let (root_frame_name, pos_root, quat_root) =
             if let Some((root, iso)) = custom_frame_cache.get(original_frame) {
                 // Static: isometry in batch units; convert to km after applying.
                 let pos_root = (iso * Point3::new(px, py, pz)).coords * to_km;
-                let vel_root = iso.rotation * vel_local;
                 let quat_root = iso.rotation * quat_local;
-                (root.clone(), pos_root, vel_root, quat_root)
-            } else if let Some((root, iso)) =
-                dynamic_frames.and_then(|m| m.get(original_frame))
-            {
+                (root.clone(), pos_root, quat_root)
+            } else if let Some((root, iso)) = dynamic_frames.and_then(|m| m.get(original_frame)) {
                 // Dynamic: isometry in km; normalize coordinates to km first.
                 let pos_km = Point3::new(px * to_km, py * to_km, pz * to_km);
                 let pos_root = (iso * pos_km).coords;
-                let vel_root = iso.rotation * vel_local;
                 let quat_root = iso.rotation * quat_local;
-                (root.clone(), pos_root, vel_root, quat_root)
+                (root.clone(), pos_root, quat_root)
             } else {
                 // Passthrough: original_frame is an astronomical root already.
                 let pos_root = Vector3::new(px, py, pz) * to_km;
-                (original_frame.to_string(), pos_root, vel_local, quat_local)
+                (original_frame.to_string(), pos_root, quat_local)
             };
 
         // --- Stage 2 & 3: Dynamic transform (astronomical root → target) via Almanac ---
@@ -354,39 +356,38 @@ pub fn transform_batch(
         // "IAU_TITAN", etc. Entity URIs are resolved before reaching this point and never
         // appear here as root_frame_name.
         let root_frame = crate::ephemeris::resolve_astronomical_frame(&root_frame_name)
-            .ok_or_else(|| format!("Failed resolving root frame '{}': not recognized by anise", root_frame_name))?;
+            .ok_or_else(|| {
+                format!(
+                    "Failed resolving root frame '{}': not recognized by anise",
+                    root_frame_name
+                )
+            })?;
 
         // almanac.translate(from, to, epoch) → radius_km is the position of `from`'s origin
         // expressed in `to` frame coordinates. This is the additive shift that maps a vector
         // already rotated into `to` orientation from the `from` origin to the `to` origin.
         let translation = almanac
             .translate(root_frame, target_frame, epoch, None)
-            .map_err(|e| format!("Anise translate error ('{root_frame_name}' → '{target_frame_name}'): {e}"))?;
+            .map_err(|e| {
+                format!("Anise translate error ('{root_frame_name}' → '{target_frame_name}'): {e}")
+            })?;
         let pos_root_wrt_target = translation.radius_km;
-        let vel_root_wrt_target = translation.velocity_km_s;
 
         // almanac.rotate(from, to) → DCM R such that v_target = R * v_root
         let dcm = almanac
             .rotate(root_frame, target_frame, epoch)
-            .map_err(|e| format!("Anise rotate error ('{root_frame_name}' → '{target_frame_name}'): {e}"))?;
+            .map_err(|e| {
+                format!("Anise rotate error ('{root_frame_name}' → '{target_frame_name}'): {e}")
+            })?;
         let rot_matrix: Rotation3<f64> = Rotation3::from_matrix_unchecked(dcm.rot_mat);
         let rot_quat: UnitQuaternion<f64> = UnitQuaternion::from_rotation_matrix(&rot_matrix);
 
-        // Compose final states (all quantities in km / km·s⁻¹ at this point)
+        // Compose final position and orientation (all quantities in km at this point)
         let pos_target = rot_matrix * pos_root + pos_root_wrt_target;
         let quat_target = rot_quat * quat_root;
 
-        // Full kinematic velocity:  v_B = R·v_A  +  v_{A→B}  +  dR/dt · p_A
-        // The dR/dt term accounts for the frame's angular velocity; it is non-zero when
-        // rotating between a body-fixed frame (e.g. IAU_Earth) and an inertial frame.
-        let mut vel_target = rot_matrix * vel_root + vel_root_wrt_target;
-        if let Some(r_dt) = dcm.rot_mat_dt {
-            vel_target += r_dt * pos_root;
-        }
-
-        // Convert back to the requested output unit
+        // Convert position back to the requested output unit
         let pos_out = pos_target * to_target_factor;
-        let vel_out = vel_target * to_target_factor;
 
         // TODO(covariance): transform_batch does not currently propagate position_covariance
         // or orientation_covariance. Transforming covariance requires applying the rotation
@@ -405,28 +406,13 @@ pub fn transform_batch(
             None, // position_covariance — see TODO above
             None, // orientation_covariance — see TODO above
         );
-
-        if let Some(ref mut vb) = velocity_builder {
-            if vel_opt.is_some() {
-                vb.values().append_value(vel_out.x);
-                vb.values().append_value(vel_out.y);
-                vb.values().append_value(vel_out.z);
-                vb.append(true);
-            } else {
-                for _ in 0..3 {
-                    vb.values().append_null();
-                }
-                vb.append(false);
-            }
-        }
     }
 
-    // 5. Reconstruct the final RecordBatch, replacing only the transformed columns.
+    // 5. Reconstruct the final RecordBatch, replacing only the spacetimestamp struct column.
+    // All other columns, including in parent schemas are passed through as-is;
+    // the caller is responsible for reprojecting those if needed.
     let mut final_columns = batch.columns().to_vec();
     final_columns[col_idx] = Arc::new(sts_builder.finish_as_struct());
-    if let (Some(idx), Some(mut vb)) = (velocity_col_idx, velocity_builder) {
-        final_columns[idx] = Arc::new(vb.finish());
-    }
 
     RecordBatch::try_new(schema, final_columns).map_err(|e| format!("Batch rebuild error: {e}"))
 }
@@ -440,9 +426,7 @@ pub fn transform_batch(
 ///
 /// This is called by [`soloc::ledger::Ledger::append`] so that all stored data shares a
 /// single timescale, making temporal comparisons and almanac queries unambiguous.
-pub fn normalize_batch_to_tai(
-    batch: &RecordBatch,
-) -> Result<RecordBatch, String> {
+pub fn normalize_batch_to_tai(batch: &RecordBatch) -> Result<RecordBatch, String> {
     let schema = batch.schema();
     let col_idx = schema
         .index_of(STS_COLUMN)
@@ -460,12 +444,15 @@ pub fn normalize_batch_to_tai(
         .as_any()
         .downcast_ref::<DictionaryArray<UInt32Type>>()
         .unwrap();
-    let ts_dict = timescales.values().as_any().downcast_ref::<StringArray>().unwrap();
+    let ts_dict = timescales
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
 
     // Fast path: every row is already TAI — nothing to do.
-    let all_tai = (0..timescales.len()).all(|i| {
-        ts_dict.value(timescales.keys().value(i) as usize) == "TAI"
-    });
+    let all_tai =
+        (0..timescales.len()).all(|i| ts_dict.value(timescales.keys().value(i) as usize) == "TAI");
     if all_tai {
         return Ok(batch.clone());
     }
@@ -508,9 +495,18 @@ pub fn normalize_batch_to_tai(
     let mut new_children: Vec<Arc<dyn Array>> =
         struct_array.columns().iter().map(Arc::clone).collect();
 
-    let ts_idx = struct_fields.iter().position(|f| f.name() == "timescale_id").unwrap();
-    let cent_idx = struct_fields.iter().position(|f| f.name() == "duration_centuries").unwrap();
-    let ns_idx = struct_fields.iter().position(|f| f.name() == "duration_ns").unwrap();
+    let ts_idx = struct_fields
+        .iter()
+        .position(|f| f.name() == "timescale_id")
+        .unwrap();
+    let cent_idx = struct_fields
+        .iter()
+        .position(|f| f.name() == "duration_centuries")
+        .unwrap();
+    let ns_idx = struct_fields
+        .iter()
+        .position(|f| f.name() == "duration_ns")
+        .unwrap();
 
     new_children[ts_idx] = Arc::new(new_ts.finish());
     new_children[cent_idx] = Arc::new(new_cents.finish());
@@ -537,7 +533,10 @@ mod tests {
 
     /// Build a one-column RecordBatch wrapping a SpaceTimestamp StructArray.
     /// The schema metadata carries the FrameRegistry so transform_batch can find it.
-    fn make_sts_batch(builder: &mut SpaceTimestampBuilder, reg: Option<&FrameRegistry>) -> RecordBatch {
+    fn make_sts_batch(
+        builder: &mut SpaceTimestampBuilder,
+        reg: Option<&FrameRegistry>,
+    ) -> RecordBatch {
         let struct_array = builder.finish_as_struct();
         let sts_ref = sts_schema(reg);
         let schema = Arc::new(
@@ -552,29 +551,50 @@ mod tests {
     }
 
     fn read_output_pos(result: &RecordBatch, row: usize) -> [f64; 3] {
-        let sts = result.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+        let sts = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
         let pos_list = sts
             .column_by_name("position")
             .unwrap()
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
             .unwrap();
-        let vals = pos_list.values().as_any().downcast_ref::<Float64Array>().unwrap();
+        let vals = pos_list
+            .values()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         let base = (pos_list.offset() + row) * 3;
         [vals.value(base), vals.value(base + 1), vals.value(base + 2)]
     }
 
     fn read_output_quat(result: &RecordBatch, row: usize) -> [f64; 4] {
-        let sts = result.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+        let sts = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
         let q_list = sts
             .column_by_name("quaternion")
             .unwrap()
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
             .unwrap();
-        let vals = q_list.values().as_any().downcast_ref::<Float64Array>().unwrap();
+        let vals = q_list
+            .values()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         let base = (q_list.offset() + row) * 4;
-        [vals.value(base), vals.value(base + 1), vals.value(base + 2), vals.value(base + 3)]
+        [
+            vals.value(base),
+            vals.value(base + 1),
+            vals.value(base + 2),
+            vals.value(base + 3),
+        ]
     }
 
     /// Translating from one static-offset custom frame to its immediate parent.
@@ -586,7 +606,19 @@ mod tests {
         reg.add_frame("cam", "Earth", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
 
         let mut builder = SpaceTimestampBuilder::new(1, Some(reg.clone()));
-        builder.append_spacetimestamp("cam", "m", "TAI", "s", "MEASURED", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
+        builder.append_spacetimestamp(
+            "cam",
+            "m",
+            "TAI",
+            "s",
+            "MEASURED",
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            0,
+            None,
+            None,
+        );
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
         let result = transform_batch(&batch, "Earth", &Almanac::default(), "m", None).unwrap();
@@ -606,7 +638,19 @@ mod tests {
         reg.add_frame("cam", "base_link", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
 
         let mut builder = SpaceTimestampBuilder::new(1, Some(reg.clone()));
-        builder.append_spacetimestamp("cam", "m", "TAI", "s", "MEASURED", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
+        builder.append_spacetimestamp(
+            "cam",
+            "m",
+            "TAI",
+            "s",
+            "MEASURED",
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            0,
+            None,
+            None,
+        );
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
         let result = transform_batch(&batch, "Earth", &Almanac::default(), "m", None).unwrap();
@@ -634,10 +678,17 @@ mod tests {
         let mut builder = SpaceTimestampBuilder::new(1, Some(reg.clone()));
         // Point at [1, 0, 0] in cam frame; after 90°-Z rotation it should be at [0, 1, 0] in Earth.
         builder.append_spacetimestamp(
-            "cam", "m", "TAI", "s", "MEASURED",
+            "cam",
+            "m",
+            "TAI",
+            "s",
+            "MEASURED",
             [1.0, 0.0, 0.0],
             [1.0, 0.0, 0.0, 0.0], // identity orientation of the sensor itself
-            0, 0, None, None,
+            0,
+            0,
+            None,
+            None,
         );
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
@@ -645,7 +696,11 @@ mod tests {
 
         let pos = read_output_pos(&result, 0);
         assert!(pos[0].abs() < 1e-10, "x should be ~0, got {}", pos[0]);
-        assert!((pos[1] - 1.0).abs() < 1e-10, "y should be ~1, got {}", pos[1]);
+        assert!(
+            (pos[1] - 1.0).abs() < 1e-10,
+            "y should be ~1, got {}",
+            pos[1]
+        );
         assert!(pos[2].abs() < 1e-10, "z should be ~0, got {}", pos[2]);
 
         // The output quaternion should be the sensor orientation composed with the frame rotation.
@@ -666,9 +721,33 @@ mod tests {
 
         let mut builder = SpaceTimestampBuilder::new(2, Some(reg.clone()));
         // Row 0: already in Earth frame at position [5, 0, 0]
-        builder.append_spacetimestamp("Earth", "m", "TAI", "s", "MEASURED", [5.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
+        builder.append_spacetimestamp(
+            "Earth",
+            "m",
+            "TAI",
+            "s",
+            "MEASURED",
+            [5.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            0,
+            None,
+            None,
+        );
         // Row 1: in arm frame at [0, 0, 0] → should become [2, 0, 0] in Earth
-        builder.append_spacetimestamp("arm", "m", "TAI", "s", "MEASURED", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
+        builder.append_spacetimestamp(
+            "arm",
+            "m",
+            "TAI",
+            "s",
+            "MEASURED",
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            0,
+            None,
+            None,
+        );
 
         let batch = make_sts_batch(&mut builder, Some(&reg));
         let result = transform_batch(&batch, "Earth", &Almanac::default(), "m", None).unwrap();
@@ -685,13 +764,29 @@ mod tests {
     #[test]
     fn test_unit_conversion_m_to_km() {
         let mut builder = SpaceTimestampBuilder::new(1, None);
-        builder.append_spacetimestamp("Earth", "m", "TAI", "s", "MEASURED", [1000.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None);
+        builder.append_spacetimestamp(
+            "Earth",
+            "m",
+            "TAI",
+            "s",
+            "MEASURED",
+            [1000.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            0,
+            None,
+            None,
+        );
 
         let batch = make_sts_batch(&mut builder, None);
         let result = transform_batch(&batch, "Earth", &Almanac::default(), "km", None).unwrap();
 
         let pos = read_output_pos(&result, 0);
-        assert!((pos[0] - 1.0).abs() < 1e-10, "expected 1.0 km, got {}", pos[0]);
+        assert!(
+            (pos[0] - 1.0).abs() < 1e-10,
+            "expected 1.0 km, got {}",
+            pos[0]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -701,24 +796,39 @@ mod tests {
     #[test]
     fn test_iau_resolve_planets() {
         let cases = [
-            ("IAU_SUN", 10), ("IAU_MERCURY", 199), ("IAU_VENUS", 299),
-            ("IAU_EARTH", 399), ("IAU_MOON", 301), ("IAU_MARS", 499),
-            ("IAU_JUPITER", 599), ("IAU_SATURN", 699), ("IAU_URANUS", 799), ("IAU_NEPTUNE", 899),
+            ("IAU_SUN", 10),
+            ("IAU_MERCURY", 199),
+            ("IAU_VENUS", 299),
+            ("IAU_EARTH", 399),
+            ("IAU_MOON", 301),
+            ("IAU_MARS", 499),
+            ("IAU_JUPITER", 599),
+            ("IAU_SATURN", 699),
+            ("IAU_URANUS", 799),
+            ("IAU_NEPTUNE", 899),
         ];
         for (name, naif_id) in cases {
             let frame = crate::ephemeris::resolve_astronomical_frame(name)
                 .unwrap_or_else(|| panic!("resolve_astronomical_frame({name:?}) returned None"));
             assert_eq!(frame.ephemeris_id, naif_id, "{name}: wrong ephemeris_id");
-            assert_eq!(frame.orientation_id, naif_id, "{name}: wrong orientation_id");
+            assert_eq!(
+                frame.orientation_id, naif_id,
+                "{name}: wrong orientation_id"
+            );
         }
     }
 
     #[test]
     fn test_iau_resolve_major_moons() {
         let cases = [
-            ("IAU_TITAN", 606), ("IAU_EUROPA", 502), ("IAU_GANYMEDE", 503),
-            ("IAU_CALLISTO", 504), ("IAU_IO", 501), ("IAU_TRITON", 801),
-            ("IAU_PHOBOS", 401), ("IAU_DEIMOS", 402),
+            ("IAU_TITAN", 606),
+            ("IAU_EUROPA", 502),
+            ("IAU_GANYMEDE", 503),
+            ("IAU_CALLISTO", 504),
+            ("IAU_IO", 501),
+            ("IAU_TRITON", 801),
+            ("IAU_PHOBOS", 401),
+            ("IAU_DEIMOS", 402),
         ];
         for (name, naif_id) in cases {
             let frame = crate::ephemeris::resolve_astronomical_frame(name)
@@ -731,7 +841,10 @@ mod tests {
     fn test_iau_resolve_unknown() {
         assert!(crate::ephemeris::resolve_astronomical_frame("IAU_UNKNOWN").is_none());
         assert!(crate::ephemeris::resolve_astronomical_frame("IAU_").is_none());
-        assert!(crate::ephemeris::resolve_astronomical_frame("IAU_earth").is_none(), "must be uppercase");
+        assert!(
+            crate::ephemeris::resolve_astronomical_frame("IAU_earth").is_none(),
+            "must be uppercase"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -739,27 +852,77 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn read_timescale(batch: &RecordBatch, row: usize) -> String {
-        let sts = batch.column(0).as_any().downcast_ref::<StructArray>().unwrap();
-        let ts_col = sts.column_by_name("timescale_id").unwrap()
-            .as_any().downcast_ref::<DictionaryArray<UInt32Type>>().unwrap();
-        let ts_dict = ts_col.values().as_any().downcast_ref::<StringArray>().unwrap();
+        let sts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let ts_col = sts
+            .column_by_name("timescale_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+            .unwrap();
+        let ts_dict = ts_col
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         ts_dict.value(ts_col.keys().value(row) as usize).to_string()
     }
 
     fn read_centuries_ns(batch: &RecordBatch, row: usize) -> (i16, u64) {
-        let sts = batch.column(0).as_any().downcast_ref::<StructArray>().unwrap();
-        let c = sts.column_by_name("duration_centuries").unwrap()
-            .as_any().downcast_ref::<Int16Array>().unwrap().value(row);
-        let n = sts.column_by_name("duration_ns").unwrap()
-            .as_any().downcast_ref::<UInt64Array>().unwrap().value(row);
+        let sts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let c = sts
+            .column_by_name("duration_centuries")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap()
+            .value(row);
+        let n = sts
+            .column_by_name("duration_ns")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(row);
         (c, n)
     }
 
     #[test]
     fn test_normalize_tai_is_noop() {
         let mut builder = SpaceTimestampBuilder::new(2, None);
-        builder.append_spacetimestamp("ICRF", "km", "TAI", "s", "MEASURED", [0.0; 3], [1.0, 0.0, 0.0, 0.0], 0, 1000, None, None);
-        builder.append_spacetimestamp("ICRF", "km", "TAI", "s", "MEASURED", [0.0; 3], [1.0, 0.0, 0.0, 0.0], 0, 2000, None, None);
+        builder.append_spacetimestamp(
+            "ICRF",
+            "km",
+            "TAI",
+            "s",
+            "MEASURED",
+            [0.0; 3],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            1000,
+            None,
+            None,
+        );
+        builder.append_spacetimestamp(
+            "ICRF",
+            "km",
+            "TAI",
+            "s",
+            "MEASURED",
+            [0.0; 3],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            2000,
+            None,
+            None,
+        );
         let batch = make_sts_batch(&mut builder, None);
         let result = normalize_batch_to_tai(&batch).unwrap();
         // Should be a cheap clone — same pointer
@@ -778,7 +941,19 @@ mod tests {
         let (utc_c, utc_n) = (utc_epoch - j2000_utc).to_parts();
 
         let mut builder = SpaceTimestampBuilder::new(1, None);
-        builder.append_spacetimestamp("ICRF", "km", "UTC", "s", "MEASURED", [0.0; 3], [1.0, 0.0, 0.0, 0.0], utc_c, utc_n, None, None);
+        builder.append_spacetimestamp(
+            "ICRF",
+            "km",
+            "UTC",
+            "s",
+            "MEASURED",
+            [0.0; 3],
+            [1.0, 0.0, 0.0, 0.0],
+            utc_c,
+            utc_n,
+            None,
+            None,
+        );
         let batch = make_sts_batch(&mut builder, None);
 
         let result = normalize_batch_to_tai(&batch).unwrap();
@@ -789,7 +964,10 @@ mod tests {
         // The stored TAI parts should represent the same physical moment.
         let (tai_c, tai_n) = read_centuries_ns(&result, 0);
         let recovered = epoch_from_parts(tai_c, tai_n, TimeScale::TAI);
-        assert_eq!(recovered, utc_epoch, "normalized TAI epoch should equal original UTC epoch");
+        assert_eq!(
+            recovered, utc_epoch,
+            "normalized TAI epoch should equal original UTC epoch"
+        );
 
         // The TAI parts differ from the UTC parts (TAI J2000 ≠ UTC J2000).
         let expected_tai_parts = epoch_to_parts(utc_epoch);
@@ -806,8 +984,32 @@ mod tests {
         let (utc_c, utc_n) = (utc_epoch - j2000_utc).to_parts();
 
         let mut builder = SpaceTimestampBuilder::new(2, None);
-        builder.append_spacetimestamp("ICRF", "km", "TAI", "s", "MEASURED", [0.0; 3], [1.0, 0.0, 0.0, 0.0], 0, 500, None, None);
-        builder.append_spacetimestamp("ICRF", "km", "UTC", "s", "MEASURED", [0.0; 3], [1.0, 0.0, 0.0, 0.0], utc_c, utc_n, None, None);
+        builder.append_spacetimestamp(
+            "ICRF",
+            "km",
+            "TAI",
+            "s",
+            "MEASURED",
+            [0.0; 3],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            500,
+            None,
+            None,
+        );
+        builder.append_spacetimestamp(
+            "ICRF",
+            "km",
+            "UTC",
+            "s",
+            "MEASURED",
+            [0.0; 3],
+            [1.0, 0.0, 0.0, 0.0],
+            utc_c,
+            utc_n,
+            None,
+            None,
+        );
         let batch = make_sts_batch(&mut builder, None);
 
         let result = normalize_batch_to_tai(&batch).unwrap();
