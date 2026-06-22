@@ -105,22 +105,50 @@ pub(crate) fn iau_frame_from_name(body_upper: &str) -> Option<Frame> {
     Some(Frame::new(naif_id, naif_id))
 }
 
+/// Maps well-known NAIF frame names to [`Frame`] objects by explicit NAIF body and
+/// orientation IDs, covering names that `Frame::from_name` does not resolve by string.
+///
+/// All IDs are from the NAIF body ID catalog. Orientation ID 1 is the NAIF J2000
+/// inertial frame (effectively ICRF in modern usage; difference is sub-milliarcsecond).
+fn frame_by_naif_id(name: &str) -> Option<Frame> {
+    const J2000_ORIENTATION: i32 = 1;
+    let (ephemeris_id, orientation_id) = match name {
+        // Inertial / quasi-inertial — SSB (0) centered, J2000 oriented.
+        // ICRF and J2000 are both orientation ID 1 in NAIF (differ by < 17 mas).
+        // GCRF and EME2000 are Earth-centered (399) J2000-oriented inertial frames.
+        "ICRF" | "J2000" | "SSB" => (0, J2000_ORIENTATION),
+        "GCRF" | "EME2000"       => (399, J2000_ORIENTATION),
+        // Barycenters
+        "EMB" => (3, J2000_ORIENTATION),
+        // Major moons — J2000-oriented, body-center origin (for IAU body-fixed use IAU_*)
+        "Phobos"    => (401, J2000_ORIENTATION),
+        "Deimos"    => (402, J2000_ORIENTATION),
+        "Io"        => (501, J2000_ORIENTATION),
+        "Europa"    => (502, J2000_ORIENTATION),
+        "Ganymede"  => (503, J2000_ORIENTATION),
+        "Callisto"  => (504, J2000_ORIENTATION),
+        "Titan"     => (606, J2000_ORIENTATION),
+        "Enceladus" => (602, J2000_ORIENTATION),
+        _ => return None,
+    };
+    Some(Frame::new(ephemeris_id, orientation_id))
+}
+
 /// Resolves a bare astronomical frame name to an anise [`Frame`].
 ///
-/// Tries three paths in order:
-/// 1. `Frame::from_name(name, "J2000")` — body centers with inertial orientation
+/// Tries four paths in order:
+/// 1. `Frame::from_name(name, "J2000")` — major body centers (Earth, Moon, Mars, …)
 /// 2. `Frame::from_name("SSB", name)` — SSB-centred orientation frames
 /// 3. `IAU_BODY` prefix — strips `"IAU_"` and looks up the NAIF body-fixed frame
+/// 4. [`frame_by_naif_id`] — explicit NAIF ID table for inertial frames, barycenters,
+///    and minor moons that the string-based paths above do not cover
 ///
-/// Returns `None` if none of the three paths succeeds. Note that some entries in
-/// [`KNOWN_EXTERNAL_FRAMES`] (e.g. `"ICRF"`) are orientation frames that anise does not
-/// resolve as a body-center string — those are accepted statically by
-/// [`is_valid_astronomical_frame`]. Use that function for yes/no checks; use this one
-/// when an actual [`Frame`] object is needed for almanac calls.
+/// Returns `None` if none of the four paths succeeds.
 pub(crate) fn resolve_astronomical_frame(name: &str) -> Option<Frame> {
     Frame::from_name(name, "J2000").ok()
         .or_else(|| Frame::from_name("SSB", name).ok())
         .or_else(|| name.strip_prefix("IAU_").and_then(iau_frame_from_name))
+        .or_else(|| frame_by_naif_id(name))
 }
 
 /// Returns `true` if `name` is a valid astronomical frame identifier.
@@ -447,7 +475,25 @@ pub fn celestial_sts_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::KNOWN_EXTERNAL_FRAMES;
     use hifitime::Duration;
+
+    /// Every entry in KNOWN_EXTERNAL_FRAMES must be resolvable by anise at transform time.
+    /// If this test fails for a given name, that name is a static lie — it passes validation
+    /// but will blow up in transform_batch. Either fix the resolution path or remove the entry.
+    #[test]
+    fn test_known_external_frames_all_resolve() {
+        let failures: Vec<&str> = KNOWN_EXTERNAL_FRAMES
+            .iter()
+            .copied()
+            .filter(|&name| resolve_astronomical_frame(name).is_none())
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "These KNOWN_EXTERNAL_FRAMES entries are not resolvable by anise and must be \
+             removed or given a dedicated resolution path: {failures:?}"
+        );
+    }
 
     #[test]
     fn test_j2000_tai_is_correct() {

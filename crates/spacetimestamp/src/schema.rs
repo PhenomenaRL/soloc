@@ -30,20 +30,27 @@ pub const STS_COLUMN: &str = "spacetimestamp";
 
 /// Astronomical frame names recognized as external roots by `anise`.
 ///
-/// Any name in this list (or matching `*_IAU` or containing `:`) is treated as an
+/// Any name in this list (or matching `IAU_*` or containing `:`) is treated as an
 /// external frame anchor in `add_frame` — it will not be namespace-qualified.
 /// Use `FrameRegistry::add_external_frame` for mission-specific names not listed here.
+///
+/// All entries must be resolvable by [`crate::ephemeris::resolve_astronomical_frame`]
+/// (verified by `test_known_external_frames_all_resolve`). Do not add names here that
+/// anise cannot map to a NAIF frame — they will pass validation but fail at transform time.
+///
+/// Earth-fixed frames: use `IAU_EARTH` (NAIF PCK body-fixed model). `ITRF`, `ECEF`, and
+/// `ECI` are not NAIF frame names and are intentionally absent. `TEME` (True Equator Mean
+/// Equinox, used in TLE/SGP4) requires a custom FK kernel not loaded by default and is
+/// also absent; it will be added when TLE support is implemented.
 pub const KNOWN_EXTERNAL_FRAMES: &[&str] = &[
-    // Inertial / quasi-inertial
-    "ICRF", "J2000", "GCRF", "EME2000", "TEME",
-    // Earth-fixed
-    "ITRF", "ECEF", "ECI",
-    // Barycenters
+    // Inertial / quasi-inertial (NAIF orientation ID 1 = J2000/ICRF)
+    "ICRF", "J2000", "GCRF", "EME2000",
+    // Barycenters (NAIF body IDs: SSB=0, EMB=3)
     "SSB", "EMB",
-    // Solar system body centers (anise resolves these with J2000 orientation)
+    // Solar system body centers with J2000 orientation
     "Sun", "Mercury", "Venus", "Earth", "Moon",
     "Mars", "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto",
-    // Common moon / small-body centers
+    // Major moon body centers with J2000 orientation
     "Phobos", "Deimos", "Io", "Europa", "Ganymede", "Callisto",
     "Titan", "Enceladus",
 ];
