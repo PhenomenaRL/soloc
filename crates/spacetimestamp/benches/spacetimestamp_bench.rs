@@ -1,8 +1,10 @@
+use anise::prelude::Almanac;
 use arrow::datatypes::{DataType, Field, Schema};
 use criterion::{BenchmarkId, black_box, criterion_group, criterion_main, Criterion};
 use hifitime::{Duration, Epoch};
 use spacetimestamp::query::{SpatiotemporalFilter, filter_batch};
 use spacetimestamp::schema::{FrameRegistry, SpaceTimestampBuilder, sts_schema};
+use spacetimestamp::transforms::{normalize_batch_to_tai, transform_batch};
 use spacetimestamp::validation::validate_spacetimestamp_batch;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -140,11 +142,104 @@ fn bench_validation(c: &mut Criterion) {
     });
 }
 
+fn bench_ingestion(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ingestion");
+    for n_rows in [1_000usize, 10_000, 100_000] {
+        group.bench_with_input(BenchmarkId::new("rows", n_rows), &n_rows, |b, &n| {
+            b.iter(|| {
+                let mut builder = SpaceTimestampBuilder::new(n, None);
+                for i in 0..n {
+                    builder.append_spacetimestamp(
+                        "ICRF", "km", "TAI", "sensor_1", "MEASURED",
+                        [i as f64, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0],
+                        0, i as u64, None, None,
+                    );
+                }
+                builder.flush()
+            })
+        });
+    }
+    group.finish();
+}
+
+fn make_transform_bench_batch(
+    n_rows: usize,
+    reg: &FrameRegistry,
+) -> arrow::record_batch::RecordBatch {
+    let mut builder = SpaceTimestampBuilder::new(n_rows, Some(reg.clone()));
+    for i in 0..n_rows {
+        builder.append_spacetimestamp(
+            "arm", "m", "TAI", "s", "MEASURED",
+            [i as f64, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0],
+            0, i as u64, None, None,
+        );
+    }
+    // Must embed the registry in schema metadata so transform_batch can resolve the chain.
+    let struct_array = builder.finish_as_struct();
+    let sts_ref = sts_schema(Some(reg));
+    let schema = Arc::new(
+        Schema::new(vec![Field::new(
+            "spacetimestamp",
+            DataType::Struct(sts_ref.fields().clone()),
+            false,
+        )])
+        .with_metadata(sts_ref.metadata().clone()),
+    );
+    arrow::record_batch::RecordBatch::try_new(schema, vec![Arc::new(struct_array)]).unwrap()
+}
+
+fn bench_transform_batch(c: &mut Criterion) {
+    // Two-hop static chain: arm → base_link → Earth.
+    // Almanac::default() suffices because source and target share the same astronomical root.
+    let mut reg = FrameRegistry::new_with_namespace("bot");
+    reg.add_frame("base_link", "Earth", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
+    reg.add_frame("arm", "base_link", [0.5, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
+    let almanac = Almanac::default();
+
+    let mut group = c.benchmark_group("transform_batch_static");
+    for n_rows in [100usize, 1_000, 10_000] {
+        let batch = make_transform_bench_batch(n_rows, &reg);
+        group.bench_with_input(BenchmarkId::new("rows", n_rows), &n_rows, |b, _| {
+            b.iter(|| {
+                transform_batch(black_box(&batch), "Earth", black_box(&almanac), "m", None)
+                    .unwrap()
+            })
+        });
+    }
+    group.finish();
+}
+
+fn make_normalize_bench_batch(n_rows: usize) -> arrow::record_batch::RecordBatch {
+    let mut builder = SpaceTimestampBuilder::new(n_rows, None);
+    for i in 0..n_rows {
+        let ts = if i % 2 == 0 { "TAI" } else { "UTC" };
+        builder.append_spacetimestamp(
+            "ICRF", "km", ts, "s", "MEASURED",
+            [0.0; 3], [1.0, 0.0, 0.0, 0.0], 0, i as u64, None, None,
+        );
+    }
+    finish_as_wrapped_batch(&mut builder)
+}
+
+fn bench_normalize_to_tai(c: &mut Criterion) {
+    let mut group = c.benchmark_group("normalize_to_tai");
+    for n_rows in [1_000usize, 10_000, 100_000] {
+        let batch = make_normalize_bench_batch(n_rows);
+        group.bench_with_input(BenchmarkId::new("rows", n_rows), &n_rows, |b, _| {
+            b.iter(|| normalize_batch_to_tai(black_box(&batch)).unwrap())
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_ingestion,
     bench_filter_batch_time,
     bench_filter_batch_spatial,
     bench_filter_batch_combined,
     bench_validation,
+    bench_transform_batch,
+    bench_normalize_to_tai,
 );
 criterion_main!(benches);

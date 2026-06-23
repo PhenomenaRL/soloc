@@ -58,6 +58,29 @@ fn spatial_filter_19pct() -> SpatiotemporalFilter {
     SpatiotemporalFilter::new().with_spatial([6800.0, 0.0, 0.0], 4000.0)
 }
 
+fn bench_entity_ingestion(c: &mut Criterion) {
+    let mut group = c.benchmark_group("entity_ingestion");
+    for n_rows in [1_000usize, 10_000, 100_000] {
+        group.bench_with_input(BenchmarkId::new("rows", n_rows), &n_rows, |b, &n| {
+            b.iter(|| {
+                let mut builder = soloc::entity::EntityBuilder::new(n, None);
+                for i in 0..n {
+                    let angle = (i as f64) * 2.0 * std::f64::consts::PI / (n as f64);
+                    builder.append_entity(
+                        "demo:sat", "ICRF", "km", "TAI", "demo:src", "MEASURED",
+                        [6800.0 * angle.cos(), 6800.0 * angle.sin(), 0.0],
+                        [1.0, 0.0, 0.0, 0.0],
+                        0, i as u64,
+                        Some([0.0, 7.8, 0.0]), None, None, Some(500.0), None,
+                    );
+                }
+                builder.flush()
+            })
+        });
+    }
+    group.finish();
+}
+
 fn bench_append(c: &mut Criterion) {
     let batch = make_entity_batch(1_000, 0);
     let mut group = c.benchmark_group("ledger_append");
@@ -182,6 +205,7 @@ fn bench_ipc_roundtrip(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_entity_ingestion,
     bench_append,
     bench_query_time_filter,
     bench_query_spatial_filter,
