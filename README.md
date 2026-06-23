@@ -1,13 +1,10 @@
 # soloc
 
-[![CI](https://github.com/PhenomenaRL/soloc/actions/workflows/ci.yml/badge.svg)](https://github.com/PhenomenaRL/soloc/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
-
 **A federated, physically-grounded ledger for tracking any entity in space-time.**
 
 ## What is soloc?
 
-soloc is a Rust workspace for recording, transforming, and querying spatiotemporal observations — spacecraft, ground stations, underwater vehicles, or any sensor-equipped entity — using [Apache Arrow](https://arrow.apache.org/) as the storage primitive.
+soloc is a Rust workspace for recording, transforming, and querying spatiotemporal observations, spacecraft, ground stations, underwater vehicles, sensor readings or any data-generating entity, using [Apache Arrow](https://arrow.apache.org/) as the storage primitive.
 
 Each observation is stored in its **original reference frame and native units, forever**. Reprojection to any astronomical frame (ICRF, GCRF, body-fixed) happens at query time via a physics engine backed by [NAIF SPICE](https://naif.jpl.nasa.gov/naif/toolkit.html) ephemeris data. This matters: a docking measurement recorded near Neptune in millimetres cannot survive normalization to heliocentric kilometres without catastrophic precision loss.
 
@@ -15,14 +12,14 @@ Each observation is stored in its **original reference frame and native units, f
 
 - **Store raw, reproject on demand.** The ledger is immutable truth. Transforms are a view-layer operation, never re-stored.
 - **Arrow-native throughout.** Every observation is an Arrow `RecordBatch`. Zero-copy interop with Python (`pyarrow`), Julia, and the rest of the Arrow ecosystem comes for free.
-- **Federated by design.** Each operator runs their own `soloc-server` instance. Federation happens by exchanging Arrow Flight streams — no shared cluster, no central authority.
+- **Federated by design.** Each operator runs their own `soloc-server` instance. Federation happens by exchanging Arrow Flight streams, no shared cluster, no central authority.
 
 ## Workspace
 
 | Crate | Description |
 |---|---|
 | [`spacetimestamp`](crates/spacetimestamp/) | Core Arrow schema, `FrameRegistry`, and physics transforms |
-| [`soloc`](crates/soloc/) | Entity schema, append-only ledger, N-body simulation |
+| [`soloc`](crates/soloc/) | custom schemas, append-only ledger |
 | [`soloc-server`](crates/soloc-server/) | Arrow Flight gRPC server |
 
 ## Quick Start
@@ -64,7 +61,7 @@ for _ in client.do_action(fl.Action(
     "register_frame",
     json.dumps({
         "local_name": "radar_boresight",
-        "parent": "EARTH_IAU",
+        "parent": "IAU_EARTH",
         "translation": [0.0, 0.0, 42.0],   # 42 m above ground
         "rotation_quat": [1.0, 0.0, 0.0, 0.0],
     }).encode(),
@@ -88,27 +85,3 @@ writer.write_batch(batch)
 writer.done_writing()
 transformed = next(reader).data
 ```
-
-## Documentation
-
-- [`spacetimestamp` on docs.rs](https://docs.rs/spacetimestamp) *(not yet published)*
-- [`soloc` on docs.rs](https://docs.rs/soloc) *(not yet published)*
-
-Build locally:
-
-```bash
-cargo doc -p spacetimestamp -p soloc -p soloc-server --no-deps --open
-```
-
-## Contributing
-
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and conventions. Use the [issue templates](.github/ISSUE_TEMPLATE/) for bugs and feature requests.
-
-## License
-
-Licensed under either of:
-
-- [MIT License](LICENSE-MIT)
-- [Apache License, Version 2.0](LICENSE-APACHE)
-
-at your option.
