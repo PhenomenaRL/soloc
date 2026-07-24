@@ -19,8 +19,8 @@ use arrow::record_batch::RecordBatch;
 use hifitime::Epoch;
 use spacetimestamp::ephemeris::{epoch_to_parts, query_celestial_state, query_naif_state};
 
-use crate::schemas::entity::EntityBuilder;
 use crate::ledger::Ledger;
+use crate::schemas::entity::EntityBuilder;
 
 // Re-export CelestialBody so existing callers (`soloc::ephemeris::CelestialBody`) are unaffected.
 pub use spacetimestamp::ephemeris::CelestialBody;
@@ -69,9 +69,7 @@ pub fn celestial_snapshot(
     epoch: Epoch,
 ) -> Result<RecordBatch, String> {
     if bodies.is_empty() {
-        return Err(
-            "bodies list is empty — provide at least one CelestialBody".to_string(),
-        );
+        return Err("bodies list is empty — provide at least one CelestialBody".to_string());
     }
 
     let (centuries, ns) = epoch_to_parts(epoch);
@@ -277,7 +275,10 @@ mod tests {
         let before = j2000 - Duration::from_parts(0, 1_000_000_000u64);
         let (c, n) = epoch_to_parts(before);
         let recovered = j2000 + Duration::from_parts(c, n);
-        assert_eq!(recovered, before, "pre-J2000 epoch should round-trip correctly");
+        assert_eq!(
+            recovered, before,
+            "pre-J2000 epoch should round-trip correctly"
+        );
     }
 
     // --- celestial_snapshot with empty almanac ---
@@ -303,16 +304,17 @@ mod tests {
 
     #[test]
     fn test_append_celestial_does_not_mutate_ledger_on_error() {
-        let mut ledger = crate::ledger::Ledger::new(
-            &crate::schemas::entity::entity_schema(None),
-            "entity_id",
-        )
-        .unwrap();
+        let mut ledger =
+            crate::ledger::Ledger::new(&crate::schemas::entity::entity_schema(None), "entity_id")
+                .unwrap();
         let almanac = Almanac::default();
         let epoch = j2000_tai();
         let result = append_celestial(&mut ledger, &almanac, &[CelestialBody::Earth], epoch);
         assert!(result.is_err());
-        assert!(ledger.is_empty(), "ledger should be unchanged after a failed append");
+        assert!(
+            ledger.is_empty(),
+            "ledger should be unchanged after a failed append"
+        );
     }
 
     // --- integration test (requires DE440s download) ---
@@ -320,8 +322,8 @@ mod tests {
     #[test]
     #[ignore = "requires DE440s ephemeris (~150 MB download on first run, then cached)"]
     fn test_celestial_snapshot_real_almanac() {
-        let almanac = anise::prelude::MetaAlmanac::latest()
-            .expect("MetaAlmanac::latest() should succeed");
+        let almanac =
+            anise::prelude::MetaAlmanac::latest().expect("MetaAlmanac::latest() should succeed");
 
         let epoch = j2000_tai();
         let batch = celestial_snapshot(&almanac, CelestialBody::ALL, epoch)
@@ -341,7 +343,11 @@ mod tests {
         assert_eq!(mass.null_count(), 0, "all bodies should have mass");
 
         let ang_vel = batch.column_by_name("angular_velocity").unwrap();
-        assert_eq!(ang_vel.null_count(), 0, "all bodies should have angular velocity from PCK");
+        assert_eq!(
+            ang_vel.null_count(),
+            0,
+            "all bodies should have angular velocity from PCK"
+        );
 
         use arrow::array::{FixedSizeListArray, Float64Array, StructArray};
         let sts = batch

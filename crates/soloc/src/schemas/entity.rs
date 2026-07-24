@@ -176,26 +176,38 @@ impl EntityBuilder {
         self.entity_id.append_value(entity_id);
 
         if let Some(v) = velocity {
-            for val in v { self.velocity.values().append_value(val); }
+            for val in v {
+                self.velocity.values().append_value(val);
+            }
             self.velocity.append(true);
         } else {
-            for _ in 0..3 { self.velocity.values().append_null(); }
+            for _ in 0..3 {
+                self.velocity.values().append_null();
+            }
             self.velocity.append(false);
         }
 
         if let Some(w) = angular_velocity {
-            for val in w { self.angular_velocity.values().append_value(val); }
+            for val in w {
+                self.angular_velocity.values().append_value(val);
+            }
             self.angular_velocity.append(true);
         } else {
-            for _ in 0..3 { self.angular_velocity.values().append_null(); }
+            for _ in 0..3 {
+                self.angular_velocity.values().append_null();
+            }
             self.angular_velocity.append(false);
         }
 
         if let Some(a) = acceleration {
-            for val in a { self.acceleration.values().append_value(val); }
+            for val in a {
+                self.acceleration.values().append_value(val);
+            }
             self.acceleration.append(true);
         } else {
-            for _ in 0..3 { self.acceleration.values().append_null(); }
+            for _ in 0..3 {
+                self.acceleration.values().append_null();
+            }
             self.acceleration.append(false);
         }
 
@@ -203,19 +215,31 @@ impl EntityBuilder {
 
         match state_covariance {
             Some(cov) => {
-                for val in cov { self.state_covariance.values().append_value(val); }
+                for val in cov {
+                    self.state_covariance.values().append_value(val);
+                }
                 self.state_covariance.append(true);
             }
             None => {
-                for _ in 0..21 { self.state_covariance.values().append_null(); }
+                for _ in 0..21 {
+                    self.state_covariance.values().append_null();
+                }
                 self.state_covariance.append(false);
             }
         }
 
         self.sts_builder.append_spacetimestamp(
-            frame_id, units_pos, timescale_id, source_id, estimate_type,
-            position, quaternion, duration_centuries, duration_ns,
-            None, None,
+            frame_id,
+            units_pos,
+            timescale_id,
+            source_id,
+            estimate_type,
+            position,
+            quaternion,
+            duration_centuries,
+            duration_ns,
+            None,
+            None,
         );
     }
 
@@ -279,14 +303,38 @@ mod tests {
         let mut builder = EntityBuilder::new(10, None);
 
         builder.append_entity(
-            "naif:399", "ICRF", "km", "TDB", "naif:de440s", "PREDICTED",
-            [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0,
-            Some([0.0, 29.8, 0.0]), None, None, Some(5.972e24), None,
+            "naif:399",
+            "ICRF",
+            "km",
+            "TDB",
+            "naif:de440s",
+            "PREDICTED",
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            0,
+            Some([0.0, 29.8, 0.0]),
+            None,
+            None,
+            Some(5.972e24),
+            None,
         );
         builder.append_entity(
-            "demo:sensor_1", "IAU_MARS", "m", "TAI", "demo:sensor_1", "MEASURED",
-            [1.2, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 1000,
-            None, None, None, None, None,
+            "demo:sensor_1",
+            "IAU_MARS",
+            "m",
+            "TAI",
+            "demo:sensor_1",
+            "MEASURED",
+            [1.2, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            1000,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
 
         let batch = builder.flush();
@@ -299,9 +347,21 @@ mod tests {
     fn test_entity_batch_validation() {
         let mut builder = EntityBuilder::new(10, None);
         builder.append_entity(
-            "naif:399", "ICRF", "km", "TDB", "naif:de440s", "PREDICTED",
-            [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], 0, 0,
-            Some([0.0, 29.8, 0.0]), None, None, Some(5.972e24), None,
+            "naif:399",
+            "ICRF",
+            "km",
+            "TDB",
+            "naif:de440s",
+            "PREDICTED",
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            0,
+            Some([0.0, 29.8, 0.0]),
+            None,
+            None,
+            Some(5.972e24),
+            None,
         );
         let batch = builder.flush();
 

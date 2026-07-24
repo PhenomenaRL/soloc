@@ -67,11 +67,21 @@ fn bench_entity_ingestion(c: &mut Criterion) {
                 for i in 0..n {
                     let angle = (i as f64) * 2.0 * std::f64::consts::PI / (n as f64);
                     builder.append_entity(
-                        "demo:sat", "ICRF", "km", "TAI", "demo:src", "MEASURED",
+                        "demo:sat",
+                        "ICRF",
+                        "km",
+                        "TAI",
+                        "demo:src",
+                        "MEASURED",
                         [6800.0 * angle.cos(), 6800.0 * angle.sin(), 0.0],
                         [1.0, 0.0, 0.0, 0.0],
-                        0, i as u64,
-                        Some([0.0, 7.8, 0.0]), None, None, Some(500.0), None,
+                        0,
+                        i as u64,
+                        Some([0.0, 7.8, 0.0]),
+                        None,
+                        None,
+                        Some(500.0),
+                        None,
                     );
                 }
                 builder.flush()
