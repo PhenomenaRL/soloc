@@ -1,0 +1,7 @@
+# Pins the toolchain for contributors and CI.
+# Keep in sync with the MSRV documented in README/CONTRIBUTING (≥ 1.88 for
+# edition-2024 let-chains). Pinning a specific version also guarantees rustfmt
+# output matches between contributors' machines and CI.
+[toolchain]
+channel = "1.96"
+components = ["rustfmt", "clippy"]
