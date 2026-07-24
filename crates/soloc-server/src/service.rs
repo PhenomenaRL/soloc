@@ -2,15 +2,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::ipc::writer::IpcWriteOptions;
-use arrow_flight::error::FlightError;
 use arrow::record_batch::RecordBatch;
+use arrow_flight::error::FlightError;
 use arrow_flight::{
-    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
-    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaAsIpc, SchemaResult,
-    Ticket,
-    decode::FlightRecordBatchStream,
-    encode::FlightDataEncoderBuilder,
-    flight_service_server::FlightService,
+    decode::FlightRecordBatchStream, encode::FlightDataEncoderBuilder,
+    flight_service_server::FlightService, Action, ActionType, Criteria, Empty, FlightData,
+    FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse, PollInfo, PutResult,
+    SchemaAsIpc, SchemaResult, Ticket,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
@@ -177,13 +175,16 @@ fn transform_with_server_registry(
     .map_err(|e| Status::internal(format!("transform failed: {e}")))
 }
 
+/// Map from entity-URI frame id to (parent frame, rigid transform) at a batch's epoch.
+type DynamicFrameMap = HashMap<String, (String, Isometry3<f64>)>;
+
 /// Scans the `frame_id` dictionary in the spacetimestamp column for entity URIs ("urn:…").
 /// If any are found, builds a dynamic frame map by reading the ledger at the batch's epoch.
 /// Returns `None` when no entity-URI frames are present (fast path for the common case).
 fn build_dynamic_frames_for_batch(
     batch: &RecordBatch,
     state: &ServerState,
-) -> Result<Option<HashMap<String, (String, Isometry3<f64>)>>, Status> {
+) -> Result<Option<DynamicFrameMap>, Status> {
     let sts_col = match batch
         .column_by_name(STS_COLUMN)
         .and_then(|c| c.as_any().downcast_ref::<StructArray>())
@@ -300,7 +301,7 @@ impl FlightService for SolocFlightService {
             .clone();
         let ipc_options = IpcWriteOptions::default();
         let schema_as_ipc = SchemaAsIpc::new(&schema, &ipc_options);
-        let flight_data: FlightData = schema_as_ipc.try_into().unwrap();
+        let flight_data: FlightData = schema_as_ipc.into();
         Ok(Response::new(SchemaResult {
             schema: flight_data.data_header,
         }))
@@ -351,8 +352,9 @@ impl FlightService for SolocFlightService {
                         .as_ref()
                         .map(|v| v.iter().map(|s| s.as_str()).collect());
                     let entity_ids: Option<&[&str]> = entity_ids_refs.as_deref();
-                    let not_before =
-                        ticket.not_before_tai_s.map(hifitime::Epoch::from_tai_seconds);
+                    let not_before = ticket
+                        .not_before_tai_s
+                        .map(hifitime::Epoch::from_tai_seconds);
                     let result = ledger
                         .current_state(entity_ids, not_before)
                         .map_err(|e| Status::internal(format!("current_state failed: {e}")))?;
@@ -442,19 +444,15 @@ impl FlightService for SolocFlightService {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::invalid_argument("exchange stream is empty"))?;
 
-        let descriptor = first
-            .flight_descriptor
-            .clone()
-            .ok_or_else(|| {
-                Status::invalid_argument("first message must contain a flight_descriptor")
-            })?;
+        let descriptor = first.flight_descriptor.clone().ok_or_else(|| {
+            Status::invalid_argument("first message must contain a flight_descriptor")
+        })?;
         let desc: ExchangeDescriptor = serde_json::from_slice(&descriptor.cmd)
             .map_err(|e| Status::invalid_argument(format!("invalid descriptor JSON: {e}")))?;
 
         // Prepend first message back so FlightRecordBatchStream sees the schema message.
-        let first_stream = futures::stream::once(futures::future::ready(
-            Ok::<FlightData, FlightError>(first),
-        ));
+        let first_stream =
+            futures::stream::once(futures::future::ready(Ok::<FlightData, FlightError>(first)));
         let rest = in_stream.map_err(|e| FlightError::Tonic(Box::new(e)));
         let mut batch_stream =
             FlightRecordBatchStream::new_from_flight_data(first_stream.chain(rest));
@@ -523,8 +521,8 @@ impl FlightService for SolocFlightService {
 
         match action.r#type.as_str() {
             "register_frame" => {
-                let body: RegisterFrameBody = serde_json::from_slice(&action.body)
-                    .map_err(|e| {
+                let body: RegisterFrameBody =
+                    serde_json::from_slice(&action.body).map_err(|e| {
                         Status::invalid_argument(format!("invalid register_frame body: {e}"))
                     })?;
                 let mut registry = self
@@ -557,10 +555,9 @@ impl FlightService for SolocFlightService {
             }
 
             "remove_frame" => {
-                let body: RemoveFrameBody = serde_json::from_slice(&action.body)
-                    .map_err(|e| {
-                        Status::invalid_argument(format!("invalid remove_frame body: {e}"))
-                    })?;
+                let body: RemoveFrameBody = serde_json::from_slice(&action.body).map_err(|e| {
+                    Status::invalid_argument(format!("invalid remove_frame body: {e}"))
+                })?;
                 let mut registry = self
                     .state
                     .registry
@@ -584,8 +581,8 @@ impl FlightService for SolocFlightService {
                     .read()
                     .map_err(|_| Status::internal("registry lock poisoned"))?;
                 let frames: Vec<&str> = registry.list_frames();
-                let json = serde_json::to_string(&frames)
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                let json =
+                    serde_json::to_string(&frames).map_err(|e| Status::internal(e.to_string()))?;
                 let result = arrow_flight::Result {
                     body: json.into_bytes().into(),
                 };
@@ -595,8 +592,9 @@ impl FlightService for SolocFlightService {
             }
 
             "save_ledger" => {
-                let body: SaveLedgerBody = serde_json::from_slice(&action.body)
-                    .map_err(|e| Status::invalid_argument(format!("invalid save_ledger body: {e}")))?;
+                let body: SaveLedgerBody = serde_json::from_slice(&action.body).map_err(|e| {
+                    Status::invalid_argument(format!("invalid save_ledger body: {e}"))
+                })?;
                 let ledger = self
                     .state
                     .ledger
@@ -607,7 +605,9 @@ impl FlightService for SolocFlightService {
                     .save_ipc(std::path::Path::new(&body.path))
                     .map_err(|e| Status::internal(format!("save_ledger failed: {e}")))?;
                 let result = arrow_flight::Result {
-                    body: format!("saved {n} batches to {}", body.path).into_bytes().into(),
+                    body: format!("saved {n} batches to {}", body.path)
+                        .into_bytes()
+                        .into(),
                 };
                 Ok(Response::new(Box::pin(futures::stream::once(
                     futures::future::ready(Ok(result)),
@@ -615,8 +615,9 @@ impl FlightService for SolocFlightService {
             }
 
             "load_ledger" => {
-                let body: SaveLedgerBody = serde_json::from_slice(&action.body)
-                    .map_err(|e| Status::invalid_argument(format!("invalid load_ledger body: {e}")))?;
+                let body: SaveLedgerBody = serde_json::from_slice(&action.body).map_err(|e| {
+                    Status::invalid_argument(format!("invalid load_ledger body: {e}"))
+                })?;
                 let new_ledger = soloc::ledger::Ledger::load_ipc(
                     std::path::Path::new(&body.path),
                     &self.state.id_column,
@@ -629,7 +630,9 @@ impl FlightService for SolocFlightService {
                     .write()
                     .map_err(|_| Status::internal("ledger lock poisoned"))? = new_ledger;
                 let result = arrow_flight::Result {
-                    body: format!("loaded {n} batches from {}", body.path).into_bytes().into(),
+                    body: format!("loaded {n} batches from {}", body.path)
+                        .into_bytes()
+                        .into(),
                 };
                 Ok(Response::new(Box::pin(futures::stream::once(
                     futures::future::ready(Ok(result)),
@@ -637,15 +640,19 @@ impl FlightService for SolocFlightService {
             }
 
             "load_kernel" => {
-                let body: LoadKernelBody = serde_json::from_slice(&action.body)
-                    .map_err(|e| Status::invalid_argument(format!("invalid load_kernel body: {e}")))?;
+                let body: LoadKernelBody = serde_json::from_slice(&action.body).map_err(|e| {
+                    Status::invalid_argument(format!("invalid load_kernel body: {e}"))
+                })?;
 
                 // MetaFile::process() downloads the file if it's a URL and updates the
                 // uri field to the local cache path, or leaves it as-is for local paths.
                 // It is blocking (network I/O), so we run it on the blocking thread pool.
                 let source = body.source.clone();
                 let local_path = tokio::task::spawn_blocking(move || {
-                    let mut meta = MetaFile { uri: source, crc32: None };
+                    let mut meta = MetaFile {
+                        uri: source,
+                        crc32: None,
+                    };
                     meta.process(false).map(|_| meta.uri)
                 })
                 .await
@@ -658,23 +665,26 @@ impl FlightService for SolocFlightService {
                     .almanac
                     .write()
                     .map_err(|_| Status::internal("almanac lock poisoned"))?;
-                let updated = almanac_guard
-                    .clone()
-                    .load(&local_path)
-                    .map_err(|e| Status::internal(format!("failed to load kernel '{local_path}': {e}")))?;
+                let updated = almanac_guard.clone().load(&local_path).map_err(|e| {
+                    Status::internal(format!("failed to load kernel '{local_path}': {e}"))
+                })?;
                 *almanac_guard = updated;
                 drop(almanac_guard);
 
                 let msg = format!("kernel loaded: {}", body.source);
-                let result = arrow_flight::Result { body: msg.into_bytes().into() };
+                let result = arrow_flight::Result {
+                    body: msg.into_bytes().into(),
+                };
                 Ok(Response::new(Box::pin(futures::stream::once(
                     futures::future::ready(Ok(result)),
                 ))))
             }
 
             "append_snapshot" => {
-                let body: AppendSnapshotBody = serde_json::from_slice(&action.body)
-                    .map_err(|e| Status::invalid_argument(format!("invalid append_snapshot body: {e}")))?;
+                let body: AppendSnapshotBody =
+                    serde_json::from_slice(&action.body).map_err(|e| {
+                        Status::invalid_argument(format!("invalid append_snapshot body: {e}"))
+                    })?;
 
                 if body.bodies.is_empty() {
                     return Err(Status::invalid_argument("bodies list is empty"));
@@ -694,10 +704,8 @@ impl FlightService for SolocFlightService {
                     .map_err(|_| Status::internal("almanac lock poisoned"))?;
 
                 // Build the &str slice from the owned Strings.
-                let ref_pairs: Vec<(i32, &str)> = pairs
-                    .iter()
-                    .map(|(id, eid)| (*id, eid.as_str()))
-                    .collect();
+                let ref_pairs: Vec<(i32, &str)> =
+                    pairs.iter().map(|(id, eid)| (*id, eid.as_str())).collect();
 
                 let batch = naif_snapshot(&almanac, &ref_pairs, epoch)
                     .map_err(|e| Status::internal(format!("naif_snapshot failed: {e}")))?;

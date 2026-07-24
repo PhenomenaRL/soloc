@@ -1,10 +1,10 @@
+use crate::ephemeris::is_valid_astronomical_frame;
+use crate::schema::{FrameRegistry, STS_COLUMN, STS_REGISTRY_METADATA_KEY};
 use arrow::array::{Array, AsArray, DictionaryArray, StructArray};
 use arrow::datatypes::UInt32Type;
 use arrow::record_batch::RecordBatch;
 use hifitime::TimeScale;
 use std::str::FromStr;
-use crate::ephemeris::is_valid_astronomical_frame;
-use crate::schema::{FrameRegistry, STS_COLUMN, STS_REGISTRY_METADATA_KEY};
 
 /// Validates `timescale_id` and `frame_id` values in a batch against hifitime and anise standards.
 ///
@@ -30,7 +30,10 @@ pub fn validate_spacetimestamp_batch(batch: &RecordBatch) -> Result<(), String> 
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| format!("'{}' column is not a StructArray", STS_COLUMN))?;
-            (s.column_by_name("timescale_id"), s.column_by_name("frame_id"))
+            (
+                s.column_by_name("timescale_id"),
+                s.column_by_name("frame_id"),
+            )
         }
         None => (
             batch.column_by_name("timescale_id"),
@@ -46,10 +49,15 @@ pub fn validate_spacetimestamp_batch(batch: &RecordBatch) -> Result<(), String> 
             .ok_or_else(|| "timescale_id is not a UInt32 Dictionary".to_string())?;
         let values = dict.values().as_string::<i32>();
         for i in 0..values.len() {
-            if values.is_null(i) { continue; }
+            if values.is_null(i) {
+                continue;
+            }
             let ts_str = values.value(i);
             if TimeScale::from_str(ts_str).is_err() {
-                return Err(format!("Invalid timescale: '{}' is not recognized by hifitime", ts_str));
+                return Err(format!(
+                    "Invalid timescale: '{}' is not recognized by hifitime",
+                    ts_str
+                ));
             }
         }
     }
@@ -62,16 +70,25 @@ pub fn validate_spacetimestamp_batch(batch: &RecordBatch) -> Result<(), String> 
             .ok_or_else(|| "frame_id is not a UInt32 Dictionary".to_string())?;
         let values = dict.values().as_string::<i32>();
         for i in 0..values.len() {
-            if values.is_null(i) { continue; }
+            if values.is_null(i) {
+                continue;
+            }
             let frame_str = values.value(i);
 
             if let Some(reg) = &registry
-                && reg.frames.contains_key(frame_str) {
+                && reg.frames.contains_key(frame_str)
+            {
                 continue;
             }
-            if frame_str.parse::<i32>().is_ok() { continue; }
-            if crate::schema::is_entity_uri(frame_str) { continue; }
-            if is_valid_astronomical_frame(frame_str) { continue; }
+            if frame_str.parse::<i32>().is_ok() {
+                continue;
+            }
+            if crate::schema::is_entity_uri(frame_str) {
+                continue;
+            }
+            if is_valid_astronomical_frame(frame_str) {
+                continue;
+            }
 
             return Err(format!(
                 "Invalid frame_id: '{}' is not recognized by anise or the FrameRegistry",
@@ -94,8 +111,17 @@ mod tests {
     fn make_flat_batch(frame: &str, timescale: &str) -> RecordBatch {
         let mut builder = SpaceTimestampBuilder::new(1, None);
         builder.append_spacetimestamp(
-            frame, "km", timescale, "sensor_1", "MEASURED",
-            [0.0; 3], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None,
+            frame,
+            "km",
+            timescale,
+            "sensor_1",
+            "MEASURED",
+            [0.0; 3],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            0,
+            None,
+            None,
         );
         builder.flush()
     }
@@ -103,13 +129,24 @@ mod tests {
     fn make_nested_batch(frame: &str, timescale: &str) -> RecordBatch {
         let mut builder = SpaceTimestampBuilder::new(1, None);
         builder.append_spacetimestamp(
-            frame, "km", timescale, "sensor_1", "MEASURED",
-            [0.0; 3], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None,
+            frame,
+            "km",
+            timescale,
+            "sensor_1",
+            "MEASURED",
+            [0.0; 3],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            0,
+            None,
+            None,
         );
         let struct_array = builder.finish_as_struct();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(STS_COLUMN, DataType::Struct(sts_schema(None).fields().clone()), false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            STS_COLUMN,
+            DataType::Struct(sts_schema(None).fields().clone()),
+            false,
+        )]));
         RecordBatch::try_new(schema, vec![Arc::new(struct_array)]).unwrap()
     }
 
@@ -161,8 +198,17 @@ mod tests {
 
         let mut builder = SpaceTimestampBuilder::new(1, Some(reg));
         builder.append_spacetimestamp(
-            "cam", "km", "UTC", "sensor_1", "MEASURED",
-            [0.0; 3], [1.0, 0.0, 0.0, 0.0], 0, 0, None, None,
+            "cam",
+            "km",
+            "UTC",
+            "sensor_1",
+            "MEASURED",
+            [0.0; 3],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            0,
+            None,
+            None,
         );
         let batch = builder.flush();
         // The builder qualifies "cam" → "robot:cam" automatically.

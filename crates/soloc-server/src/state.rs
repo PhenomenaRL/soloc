@@ -1,6 +1,6 @@
 use anise::almanac::Almanac;
-use soloc::schemas::entity::entity_schema;
 use soloc::ledger::Ledger;
+use soloc::schemas::entity::entity_schema;
 use spacetimestamp::schema::FrameRegistry;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -37,7 +37,10 @@ impl ServerState {
         let ledger = if let Some(ref url) = ledger_url {
             match object_store_download(url, &id_column).await {
                 Ok(l) => {
-                    eprintln!("soloc-server: ledger loaded from {url} ({} batches)", l.len());
+                    eprintln!(
+                        "soloc-server: ledger loaded from {url} ({} batches)",
+                        l.len()
+                    );
                     l
                 }
                 Err(e) => {
@@ -93,20 +96,30 @@ impl ServerState {
     /// Persists the ledger to the configured object-store URL (if set) or the local path.
     pub async fn persist_ledger(&self) {
         if let Some(ref url) = self.ledger_url {
-            match self.ledger.read() {
-                Ok(ledger) => {
-                    match object_store_upload(&ledger, url).await {
-                        Ok(()) => eprintln!(
-                            "soloc-server: ledger saved to {url} ({} batches)",
-                            ledger.len()
-                        ),
-                        Err(e) => {
-                            eprintln!("soloc-server: WARNING — object-store upload failed: {e}")
-                        }
+            // Serialize while holding the lock, then release it BEFORE awaiting the
+            // network upload. Holding a std lock across an await blocks executor
+            // threads and can deadlock (clippy: await_holding_lock).
+            let serialized = match self.ledger.read() {
+                Ok(ledger) => match ledger.save_ipc_to_bytes() {
+                    Ok(bytes) => Some((bytes, ledger.len())),
+                    Err(e) => {
+                        eprintln!("soloc-server: WARNING — ledger serialization failed: {e}");
+                        None
                     }
-                }
+                },
                 Err(_) => {
-                    eprintln!("soloc-server: WARNING — ledger lock poisoned, skipping save")
+                    eprintln!("soloc-server: WARNING — ledger lock poisoned, skipping save");
+                    None
+                }
+            };
+            if let Some((bytes, n_batches)) = serialized {
+                match object_store_upload(bytes, url).await {
+                    Ok(()) => {
+                        eprintln!("soloc-server: ledger saved to {url} ({n_batches} batches)")
+                    }
+                    Err(e) => {
+                        eprintln!("soloc-server: WARNING — object-store upload failed: {e}")
+                    }
                 }
             }
             return;
@@ -140,18 +153,16 @@ impl ServerState {
 fn new_empty_ledger(schema_path: &Option<PathBuf>, id_column: &str) -> Ledger {
     if let Some(ref path) = schema_path {
         match read_schema_from_ipc(path) {
-            Ok(schema) => {
-                match Ledger::new(&schema, id_column) {
-                    Ok(l) => {
-                        eprintln!("soloc-server: empty ledger created from schema {:?}", path);
-                        return l;
-                    }
-                    Err(e) => eprintln!(
-                        "soloc-server: WARNING — schema_path schema is invalid: {e}. \
-                         Falling back to entity schema."
-                    ),
+            Ok(schema) => match Ledger::new(&schema, id_column) {
+                Ok(l) => {
+                    eprintln!("soloc-server: empty ledger created from schema {:?}", path);
+                    return l;
                 }
-            }
+                Err(e) => eprintln!(
+                    "soloc-server: WARNING — schema_path schema is invalid: {e}. \
+                         Falling back to entity schema."
+                ),
+            },
             Err(e) => eprintln!(
                 "soloc-server: WARNING — failed to read schema_path {:?}: {e}. \
                  Falling back to entity schema.",
@@ -168,8 +179,7 @@ fn new_empty_ledger(schema_path: &Option<PathBuf>, id_column: &str) -> Ledger {
 fn read_schema_from_ipc(path: &PathBuf) -> Result<arrow::datatypes::SchemaRef, String> {
     use arrow::ipc::reader::FileReader;
     use std::fs::File;
-    let file = File::open(path)
-        .map_err(|e| format!("Failed to open {:?}: {e}", path))?;
+    let file = File::open(path).map_err(|e| format!("Failed to open {:?}: {e}", path))?;
     let reader = FileReader::try_new(file, None)
         .map_err(|e| format!("Failed to read IPC schema from {:?}: {e}", path))?;
     Ok(reader.schema())
@@ -179,10 +189,9 @@ fn read_schema_from_ipc(path: &PathBuf) -> Result<arrow::datatypes::SchemaRef, S
 async fn object_store_download(url_str: &str, id_column: &str) -> Result<Ledger, String> {
     use object_store::ObjectStore;
 
-    let url =
-        url::Url::parse(url_str).map_err(|e| format!("invalid object-store URL: {e}"))?;
-    let (store, path) = object_store::parse_url(&url)
-        .map_err(|e| format!("object-store URL parse failed: {e}"))?;
+    let url = url::Url::parse(url_str).map_err(|e| format!("invalid object-store URL: {e}"))?;
+    let (store, path) =
+        object_store::parse_url(&url).map_err(|e| format!("object-store URL parse failed: {e}"))?;
 
     let bytes = store
         .get(&path)
@@ -195,16 +204,13 @@ async fn object_store_download(url_str: &str, id_column: &str) -> Result<Ledger,
     Ledger::load_ipc_from_bytes(&bytes, id_column)
 }
 
-/// Serialises and uploads the ledger to any object-store URL.
-async fn object_store_upload(ledger: &Ledger, url_str: &str) -> Result<(), String> {
+/// Uploads pre-serialised ledger bytes to any object-store URL.
+async fn object_store_upload(raw: Vec<u8>, url_str: &str) -> Result<(), String> {
     use object_store::ObjectStore;
 
-    let raw = ledger.save_ipc_to_bytes()?;
-
-    let url =
-        url::Url::parse(url_str).map_err(|e| format!("invalid object-store URL: {e}"))?;
-    let (store, path) = object_store::parse_url(&url)
-        .map_err(|e| format!("object-store URL parse failed: {e}"))?;
+    let url = url::Url::parse(url_str).map_err(|e| format!("invalid object-store URL: {e}"))?;
+    let (store, path) =
+        object_store::parse_url(&url).map_err(|e| format!("object-store URL parse failed: {e}"))?;
 
     store
         .put(&path, raw.into())

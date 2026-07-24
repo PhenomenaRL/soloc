@@ -8,13 +8,13 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use anise::{almanac::Almanac, prelude::Frame};
 use arrow::array::{
     Array, ArrayBuilder, FixedSizeListBuilder, Float64Builder, Int16Builder,
     StringDictionaryBuilder, StructArray, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt16Type, UInt32Type};
 use arrow::record_batch::RecordBatch;
-use anise::{almanac::Almanac, prelude::Frame};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -44,15 +44,34 @@ pub const STS_COLUMN: &str = "spacetimestamp";
 /// also absent; it will be added when TLE support is implemented.
 pub const KNOWN_EXTERNAL_FRAMES: &[&str] = &[
     // Inertial / quasi-inertial (NAIF orientation ID 1 = J2000/ICRF)
-    "ICRF", "J2000", "GCRF", "EME2000",
+    "ICRF",
+    "J2000",
+    "GCRF",
+    "EME2000",
     // Barycenters (NAIF body IDs: SSB=0, EMB=3)
-    "SSB", "EMB",
+    "SSB",
+    "EMB",
     // Solar system body centers with J2000 orientation
-    "Sun", "Mercury", "Venus", "Earth", "Moon",
-    "Mars", "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto",
+    "Sun",
+    "Mercury",
+    "Venus",
+    "Earth",
+    "Moon",
+    "Mars",
+    "Jupiter",
+    "Saturn",
+    "Uranus",
+    "Neptune",
+    "Pluto",
     // Major moon body centers with J2000 orientation
-    "Phobos", "Deimos", "Io", "Europa", "Ganymede", "Callisto",
-    "Titan", "Enceladus",
+    "Phobos",
+    "Deimos",
+    "Io",
+    "Europa",
+    "Ganymede",
+    "Callisto",
+    "Titan",
+    "Enceladus",
 ];
 
 /// Represents a static spatial transformation between a child frame and its parent.
@@ -204,14 +223,44 @@ impl FrameRegistry {
                 // Covers body-center names, SSB-relative orientation frames, and IAU_ bodies.
                 let ok = Frame::from_name(parent_name, "J2000").is_ok()
                     || Frame::from_name("SSB", parent_name).is_ok()
-                    || parent_name.strip_prefix("IAU_")
-                        .map(|body| matches!(body,
-                            "SUN"|"MERCURY"|"VENUS"|"EARTH"|"MOON"|"MARS"|"JUPITER"|"SATURN"
-                            |"URANUS"|"NEPTUNE"|"PLUTO"|"CHARON"|"PHOBOS"|"DEIMOS"
-                            |"IO"|"EUROPA"|"GANYMEDE"|"CALLISTO"|"MIMAS"|"ENCELADUS"
-                            |"TETHYS"|"DIONE"|"RHEA"|"TITAN"|"IAPETUS"
-                            |"MIRANDA"|"ARIEL"|"UMBRIEL"|"TITANIA"|"OBERON"|"TRITON"
-                        ))
+                    || parent_name
+                        .strip_prefix("IAU_")
+                        .map(|body| {
+                            matches!(
+                                body,
+                                "SUN"
+                                    | "MERCURY"
+                                    | "VENUS"
+                                    | "EARTH"
+                                    | "MOON"
+                                    | "MARS"
+                                    | "JUPITER"
+                                    | "SATURN"
+                                    | "URANUS"
+                                    | "NEPTUNE"
+                                    | "PLUTO"
+                                    | "CHARON"
+                                    | "PHOBOS"
+                                    | "DEIMOS"
+                                    | "IO"
+                                    | "EUROPA"
+                                    | "GANYMEDE"
+                                    | "CALLISTO"
+                                    | "MIMAS"
+                                    | "ENCELADUS"
+                                    | "TETHYS"
+                                    | "DIONE"
+                                    | "RHEA"
+                                    | "TITAN"
+                                    | "IAPETUS"
+                                    | "MIRANDA"
+                                    | "ARIEL"
+                                    | "UMBRIEL"
+                                    | "TITANIA"
+                                    | "OBERON"
+                                    | "TRITON"
+                            )
+                        })
                         .unwrap_or(false);
                 if !ok {
                     return Err(format!(
@@ -308,7 +357,8 @@ impl FrameRegistry {
         let mut merged = FrameRegistry {
             namespace: self.namespace.clone(),
             frames: HashMap::new(),
-            extra_external_frames: self.extra_external_frames
+            extra_external_frames: self
+                .extra_external_frames
                 .union(&other.extra_external_frames)
                 .cloned()
                 .collect(),
@@ -332,14 +382,21 @@ pub fn is_entity_uri(id: &str) -> bool {
 }
 
 /// Appends one nullable 6-element covariance entry to a `FixedSizeListBuilder`.
-fn append_optional_cov6(builder: &mut FixedSizeListBuilder<Float64Builder>, value: Option<[f64; 6]>) {
+fn append_optional_cov6(
+    builder: &mut FixedSizeListBuilder<Float64Builder>,
+    value: Option<[f64; 6]>,
+) {
     match value {
         Some(v) => {
-            for x in v { builder.values().append_value(x); }
+            for x in v {
+                builder.values().append_value(x);
+            }
             builder.append(true);
         }
         None => {
-            for _ in 0..6 { builder.values().append_null(); }
+            for _ in 0..6 {
+                builder.values().append_null();
+            }
             builder.append(false);
         }
     }
@@ -369,9 +426,10 @@ fn append_optional_cov6(builder: &mut FixedSizeListBuilder<Float64Builder>, valu
 pub fn sts_schema(registry: Option<&FrameRegistry>) -> SchemaRef {
     let mut metadata = HashMap::new();
     if let Some(reg) = registry
-        && let Ok(json) = reg.to_json() {
-            metadata.insert(STS_REGISTRY_METADATA_KEY.to_string(), json);
-        }
+        && let Ok(json) = reg.to_json()
+    {
+        metadata.insert(STS_REGISTRY_METADATA_KEY.to_string(), json);
+    }
 
     Arc::new(
         Schema::new(vec![
@@ -464,8 +522,14 @@ impl SpaceTimestampBuilder {
             quaternion: FixedSizeListBuilder::new(Float64Builder::with_capacity(capacity * 4), 4),
             duration_centuries: Int16Builder::with_capacity(capacity),
             duration_ns: UInt64Builder::with_capacity(capacity),
-            position_covariance: FixedSizeListBuilder::new(Float64Builder::with_capacity(capacity * 6), 6),
-            orientation_covariance: FixedSizeListBuilder::new(Float64Builder::with_capacity(capacity * 6), 6),
+            position_covariance: FixedSizeListBuilder::new(
+                Float64Builder::with_capacity(capacity * 6),
+                6,
+            ),
+            orientation_covariance: FixedSizeListBuilder::new(
+                Float64Builder::with_capacity(capacity * 6),
+                6,
+            ),
         }
     }
 
@@ -637,7 +701,8 @@ mod tests {
                 [1.0, 0.0, 0.0, 0.0],
                 0,
                 i as u64,
-                None, None,
+                None,
+                None,
             );
         }
 
@@ -713,7 +778,8 @@ mod tests {
                 [1.0, 0.0, 0.0, 0.0],
                 0,
                 i as u64,
-                None, None,
+                None,
+                None,
             );
         }
 
@@ -778,7 +844,8 @@ mod tests {
                 [0.0, 0.0, 0.0, 1.0],
                 0,
                 i as u64,
-                None, None,
+                None,
+                None,
             );
         }
 
@@ -938,11 +1005,29 @@ mod tests {
         let mut reg = FrameRegistry::new_with_namespace("ns");
         let almanac = anise::almanac::Almanac::default();
         // KNOWN_EXTERNAL_FRAMES entries — trusted without anise runtime call
-        assert!(reg.add_frame_validated("cam",    "Earth", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
-        assert!(reg.add_frame_validated("ant",    "ICRF",  [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
-        assert!(reg.add_frame_validated("sensor", "GCRF",  [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
+        assert!(
+            reg.add_frame_validated("cam", "Earth", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac)
+                .is_ok()
+        );
+        assert!(
+            reg.add_frame_validated(
+                "ant",
+                "ICRF",
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                &almanac
+            )
+            .is_ok()
+        );
+        assert!(
+            reg.add_frame_validated("sensor", "GCRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac)
+                .is_ok()
+        );
         // IAU convention — trusted without anise runtime call
-        assert!(reg.add_frame_validated("imu", "IAU_MARS", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
+        assert!(
+            reg.add_frame_validated("imu", "IAU_MARS", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac)
+                .is_ok()
+        );
         assert_eq!(reg.frames["ns:cam"].parent_id, "Earth");
         assert_eq!(reg.frames["ns:ant"].parent_id, "ICRF");
     }
@@ -954,15 +1039,30 @@ mod tests {
 
         // A valid name in anise's catalog, registered as extra_external — should pass
         reg.add_external_frame("Earth");
-        assert!(reg.add_frame_validated("cam", "Earth", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
+        assert!(
+            reg.add_frame_validated("cam", "Earth", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac)
+                .is_ok()
+        );
 
         // An invalid name registered as extra_external — anise rejects it at validation time
         reg.add_external_frame("NOT_A_REAL_FRAME");
         let err = reg
-            .add_frame_validated("bad", "NOT_A_REAL_FRAME", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac)
+            .add_frame_validated(
+                "bad",
+                "NOT_A_REAL_FRAME",
+                [0.0; 3],
+                [1.0, 0.0, 0.0, 0.0],
+                &almanac,
+            )
             .unwrap_err();
-        assert!(err.contains("NOT_A_REAL_FRAME"), "error should name the frame: {err}");
-        assert!(!reg.frames.contains_key("ns:bad"), "frame must not be inserted on failure");
+        assert!(
+            err.contains("NOT_A_REAL_FRAME"),
+            "error should name the frame: {err}"
+        );
+        assert!(
+            !reg.frames.contains_key("ns:bad"),
+            "frame must not be inserted on failure"
+        );
     }
 
     #[test]
@@ -971,7 +1071,16 @@ mod tests {
         let almanac = anise::almanac::Almanac::default();
         reg.add_frame("base_link", "ICRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
         // cam's parent "base_link" exists → should succeed
-        assert!(reg.add_frame_validated("cam", "base_link", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], &almanac).is_ok());
+        assert!(
+            reg.add_frame_validated(
+                "cam",
+                "base_link",
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                &almanac
+            )
+            .is_ok()
+        );
         assert_eq!(reg.frames["ns:cam"].parent_id, "ns:base_link");
     }
 
@@ -983,7 +1092,10 @@ mod tests {
         let err = reg
             .add_frame_validated("cam", "base_link", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac)
             .unwrap_err();
-        assert!(err.contains("base_link"), "error should name the missing parent: {err}");
+        assert!(
+            err.contains("base_link"),
+            "error should name the missing parent: {err}"
+        );
         assert!(!reg.frames.contains_key("ns:cam"));
     }
 
@@ -1019,7 +1131,8 @@ mod tests {
             [1.0, 0.0, 0.0, 0.0],
             0,
             0,
-            None, None,
+            None,
+            None,
         );
 
         // Append using global/external name (should remain "ICRF")
@@ -1033,7 +1146,8 @@ mod tests {
             [1.0, 0.0, 0.0, 0.0],
             0,
             0,
-            None, None,
+            None,
+            None,
         );
 
         let batch = builder.flush();

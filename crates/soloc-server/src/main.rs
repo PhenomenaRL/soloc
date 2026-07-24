@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anise::almanac::Almanac;
 use anise::almanac::metaload::MetaAlmanac;
+use anise::almanac::Almanac;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use serde::Deserialize;
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{signal, SignalKind};
 use tonic::transport::Server;
 
 mod service;
@@ -41,7 +41,9 @@ struct ServerConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { bind: default_bind() }
+        Self {
+            bind: default_bind(),
+        }
     }
 }
 
@@ -79,7 +81,9 @@ struct StorageConfig {
     id_column: String,
 }
 
-fn default_id_column() -> String { "entity_id".to_string() }
+fn default_id_column() -> String {
+    "entity_id".to_string()
+}
 
 /// Ephemeris kernel configuration.
 ///
@@ -183,20 +187,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let almanac = load_almanac(&cfg.ephemeris);
 
     let registry_path = cfg.storage.registry_path.map(PathBuf::from);
-    let ledger_path   = cfg.storage.ledger_path.map(PathBuf::from);
-    let ledger_url    = cfg.storage.ledger_url;
-    let schema_path   = cfg.storage.schema_path.map(PathBuf::from);
-    let id_column     = cfg.storage.id_column;
+    let ledger_path = cfg.storage.ledger_path.map(PathBuf::from);
+    let ledger_url = cfg.storage.ledger_url;
+    let schema_path = cfg.storage.schema_path.map(PathBuf::from);
+    let id_column = cfg.storage.id_column;
 
     let state = Arc::new(
-        ServerState::new(almanac, registry_path, ledger_path, ledger_url, schema_path, id_column).await,
+        ServerState::new(
+            almanac,
+            registry_path,
+            ledger_path,
+            ledger_url,
+            schema_path,
+            id_column,
+        )
+        .await,
     );
     let service = SolocFlightService::new(state.clone());
 
     // SIGTERM handler: drain in-flight requests then save the ledger.
     // This is the safety-net path; the nominal path is DoAction("save_ledger").
     let mut sigterm = signal(SignalKind::terminate())?;
-    let shutdown = async move { sigterm.recv().await; };
+    let shutdown = async move {
+        sigterm.recv().await;
+    };
 
     eprintln!("soloc-server listening on {addr}");
     Server::builder()

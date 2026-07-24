@@ -8,8 +8,8 @@
 //! Callers that need Arrow output (e.g. entity batches) should use `soloc::ephemeris`.
 
 use anise::constants::celestial_objects::{
-    EARTH, JUPITER, JUPITER_BARYCENTER, MARS, MERCURY, MOON, NEPTUNE, NEPTUNE_BARYCENTER,
-    SATURN, SATURN_BARYCENTER, SUN, URANUS, URANUS_BARYCENTER, VENUS,
+    EARTH, JUPITER, JUPITER_BARYCENTER, MARS, MERCURY, MOON, NEPTUNE, NEPTUNE_BARYCENTER, SATURN,
+    SATURN_BARYCENTER, SUN, URANUS, URANUS_BARYCENTER, VENUS,
 };
 use anise::constants::frames::SSB_J2000;
 use anise::prelude::{Almanac, Frame};
@@ -69,38 +69,38 @@ pub fn epoch_to_parts(epoch: Epoch) -> (i16, u64) {
 /// body name (e.g. `"EARTH"`, `"TITAN"`). Returns `None` for unrecognised bodies.
 pub(crate) fn iau_frame_from_name(body_upper: &str) -> Option<Frame> {
     let naif_id: i32 = match body_upper {
-        "SUN"      => 10,
-        "MERCURY"  => 199,
-        "VENUS"    => 299,
-        "EARTH"    => 399,
-        "MOON"     => 301,
-        "MARS"     => 499,
-        "JUPITER"  => 599,
-        "SATURN"   => 699,
-        "URANUS"   => 799,
-        "NEPTUNE"  => 899,
-        "PLUTO"    => 999,
-        "CHARON"   => 901,
-        "PHOBOS"   => 401,
-        "DEIMOS"   => 402,
-        "IO"       => 501,
-        "EUROPA"   => 502,
+        "SUN" => 10,
+        "MERCURY" => 199,
+        "VENUS" => 299,
+        "EARTH" => 399,
+        "MOON" => 301,
+        "MARS" => 499,
+        "JUPITER" => 599,
+        "SATURN" => 699,
+        "URANUS" => 799,
+        "NEPTUNE" => 899,
+        "PLUTO" => 999,
+        "CHARON" => 901,
+        "PHOBOS" => 401,
+        "DEIMOS" => 402,
+        "IO" => 501,
+        "EUROPA" => 502,
         "GANYMEDE" => 503,
         "CALLISTO" => 504,
-        "MIMAS"    => 601,
-        "ENCELADUS"=> 602,
-        "TETHYS"   => 603,
-        "DIONE"    => 604,
-        "RHEA"     => 605,
-        "TITAN"    => 606,
-        "IAPETUS"  => 608,
-        "MIRANDA"  => 705,
-        "ARIEL"    => 701,
-        "UMBRIEL"  => 702,
-        "TITANIA"  => 703,
-        "OBERON"   => 704,
-        "TRITON"   => 801,
-        _          => return None,
+        "MIMAS" => 601,
+        "ENCELADUS" => 602,
+        "TETHYS" => 603,
+        "DIONE" => 604,
+        "RHEA" => 605,
+        "TITAN" => 606,
+        "IAPETUS" => 608,
+        "MIRANDA" => 705,
+        "ARIEL" => 701,
+        "UMBRIEL" => 702,
+        "TITANIA" => 703,
+        "OBERON" => 704,
+        "TRITON" => 801,
+        _ => return None,
     };
     Some(Frame::new(naif_id, naif_id))
 }
@@ -117,17 +117,17 @@ fn frame_by_naif_id(name: &str) -> Option<Frame> {
         // ICRF and J2000 are both orientation ID 1 in NAIF (differ by < 17 mas).
         // GCRF and EME2000 are Earth-centered (399) J2000-oriented inertial frames.
         "ICRF" | "J2000" | "SSB" => (0, J2000_ORIENTATION),
-        "GCRF" | "EME2000"       => (399, J2000_ORIENTATION),
+        "GCRF" | "EME2000" => (399, J2000_ORIENTATION),
         // Barycenters
         "EMB" => (3, J2000_ORIENTATION),
         // Major moons — J2000-oriented, body-center origin (for IAU body-fixed use IAU_*)
-        "Phobos"    => (401, J2000_ORIENTATION),
-        "Deimos"    => (402, J2000_ORIENTATION),
-        "Io"        => (501, J2000_ORIENTATION),
-        "Europa"    => (502, J2000_ORIENTATION),
-        "Ganymede"  => (503, J2000_ORIENTATION),
-        "Callisto"  => (504, J2000_ORIENTATION),
-        "Titan"     => (606, J2000_ORIENTATION),
+        "Phobos" => (401, J2000_ORIENTATION),
+        "Deimos" => (402, J2000_ORIENTATION),
+        "Io" => (501, J2000_ORIENTATION),
+        "Europa" => (502, J2000_ORIENTATION),
+        "Ganymede" => (503, J2000_ORIENTATION),
+        "Callisto" => (504, J2000_ORIENTATION),
+        "Titan" => (606, J2000_ORIENTATION),
         "Enceladus" => (602, J2000_ORIENTATION),
         _ => return None,
     };
@@ -145,7 +145,8 @@ fn frame_by_naif_id(name: &str) -> Option<Frame> {
 ///
 /// Returns `None` if none of the four paths succeeds.
 pub(crate) fn resolve_astronomical_frame(name: &str) -> Option<Frame> {
-    Frame::from_name(name, "J2000").ok()
+    Frame::from_name(name, "J2000")
+        .ok()
         .or_else(|| Frame::from_name("SSB", name).ok())
         .or_else(|| name.strip_prefix("IAU_").and_then(iau_frame_from_name))
         .or_else(|| frame_by_naif_id(name))
@@ -205,16 +206,16 @@ impl CelestialBody {
     /// orientation (see [`iau_frame`](Self::iau_frame)).
     pub fn naif_id(self) -> i32 {
         match self {
-            CelestialBody::Sun     => SUN,      // 10
-            CelestialBody::Mercury => MERCURY,  // 199
-            CelestialBody::Venus   => VENUS,    // 299
-            CelestialBody::Earth   => EARTH,    // 399
-            CelestialBody::Moon    => MOON,     // 301
-            CelestialBody::Mars    => MARS,     // 499
-            CelestialBody::Jupiter => JUPITER,  // 599
-            CelestialBody::Saturn  => SATURN,   // 699
-            CelestialBody::Uranus  => URANUS,   // 799
-            CelestialBody::Neptune => NEPTUNE,  // 899
+            CelestialBody::Sun => SUN,         // 10
+            CelestialBody::Mercury => MERCURY, // 199
+            CelestialBody::Venus => VENUS,     // 299
+            CelestialBody::Earth => EARTH,     // 399
+            CelestialBody::Moon => MOON,       // 301
+            CelestialBody::Mars => MARS,       // 499
+            CelestialBody::Jupiter => JUPITER, // 599
+            CelestialBody::Saturn => SATURN,   // 699
+            CelestialBody::Uranus => URANUS,   // 799
+            CelestialBody::Neptune => NEPTUNE, // 899
         }
     }
 
@@ -241,10 +242,10 @@ impl CelestialBody {
         let orientation = 1; // J2000 orientation NaifId
         match self {
             CelestialBody::Jupiter => Frame::new(JUPITER_BARYCENTER, orientation),
-            CelestialBody::Saturn  => Frame::new(SATURN_BARYCENTER, orientation),
-            CelestialBody::Uranus  => Frame::new(URANUS_BARYCENTER, orientation),
+            CelestialBody::Saturn => Frame::new(SATURN_BARYCENTER, orientation),
+            CelestialBody::Uranus => Frame::new(URANUS_BARYCENTER, orientation),
             CelestialBody::Neptune => Frame::new(NEPTUNE_BARYCENTER, orientation),
-            _                      => Frame::new(self.naif_id(), orientation),
+            _ => Frame::new(self.naif_id(), orientation),
         }
     }
 
@@ -253,15 +254,15 @@ impl CelestialBody {
     /// Uses NAIF body-center IDs (`naif:<id>`) as the globally unique identifier.
     pub fn entity_id(self) -> &'static str {
         match self {
-            CelestialBody::Sun     => "naif:10",
+            CelestialBody::Sun => "naif:10",
             CelestialBody::Mercury => "naif:199",
-            CelestialBody::Venus   => "naif:299",
-            CelestialBody::Earth   => "naif:399",
-            CelestialBody::Moon    => "naif:301",
-            CelestialBody::Mars    => "naif:499",
+            CelestialBody::Venus => "naif:299",
+            CelestialBody::Earth => "naif:399",
+            CelestialBody::Moon => "naif:301",
+            CelestialBody::Mars => "naif:499",
             CelestialBody::Jupiter => "naif:599",
-            CelestialBody::Saturn  => "naif:699",
-            CelestialBody::Uranus  => "naif:799",
+            CelestialBody::Saturn => "naif:699",
+            CelestialBody::Uranus => "naif:799",
             CelestialBody::Neptune => "naif:899",
         }
     }
@@ -269,15 +270,15 @@ impl CelestialBody {
     /// Standard gravitational parameter GM in km³/s² (DE440 / IAU 2012).
     pub fn gm_km3_s2(self) -> f64 {
         match self {
-            CelestialBody::Sun     => 1.327_124_400_419_393e11,
+            CelestialBody::Sun => 1.327_124_400_419_393e11,
             CelestialBody::Mercury => 2.203_186_855_140_000_3e4,
-            CelestialBody::Venus   => 3.248_585_920_000_000_6e5,
-            CelestialBody::Earth   => 3.986_004_418e5,
-            CelestialBody::Moon    => 4.904_869_5e3,
-            CelestialBody::Mars    => 4.282_837_362_069_909e4,
+            CelestialBody::Venus => 3.248_585_920_000_000_6e5,
+            CelestialBody::Earth => 3.986_004_418e5,
+            CelestialBody::Moon => 4.904_869_5e3,
+            CelestialBody::Mars => 4.282_837_362_069_909e4,
             CelestialBody::Jupiter => 1.266_865_34e8,
-            CelestialBody::Saturn  => 3.793_120_8e7,
-            CelestialBody::Uranus  => 5.793_951_322_279_009e6,
+            CelestialBody::Saturn => 3.793_120_8e7,
+            CelestialBody::Uranus => 5.793_951_322_279_009e6,
             CelestialBody::Neptune => 6.835_099_502_439_672e6,
         }
     }
@@ -338,26 +339,26 @@ pub fn query_celestial_state(
 
     let state = almanac
         .translate(iau, SSB_J2000, epoch, None)
-        .map_err(|e| format!(
-            "Failed to get body-center position for {:?} at {epoch}: {e}. \
+        .map_err(|e| {
+            format!(
+                "Failed to get body-center position for {:?} at {epoch}: {e}. \
              Inner planets require DE440; outer planets (Jupiter+) additionally \
              need a satellite SPK (e.g. jup365.bsp for Jupiter). Load via \
              MetaAlmanac or supply the file directly.",
-            body,
-        ))?;
+                body,
+            )
+        })?;
 
-    let dcm = almanac
-        .rotate(iau, SSB_J2000, epoch)
-        .map_err(|e| format!(
+    let dcm = almanac.rotate(iau, SSB_J2000, epoch).map_err(|e| {
+        format!(
             "Failed to get IAU orientation for {:?} at {epoch}: {e}. \
              Ensure a PCK (e.g. pck11.pca) is loaded, available via \
              MetaAlmanac::latest().",
             body,
-        ))?;
+        )
+    })?;
 
-    let q = UnitQuaternion::from_rotation_matrix(
-        &Rotation3::from_matrix_unchecked(dcm.rot_mat),
-    );
+    let q = UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(dcm.rot_mat));
     let angular_velocity = dcm.rot_mat_dt.map(|r_dt| {
         let omega = r_dt * dcm.rot_mat.transpose();
         [omega[(2, 1)], omega[(0, 2)], omega[(1, 0)]]
@@ -367,7 +368,11 @@ pub fn query_celestial_state(
 
     Ok(CelestialState {
         position_km: [state.radius_km.x, state.radius_km.y, state.radius_km.z],
-        velocity_km_s: [state.velocity_km_s.x, state.velocity_km_s.y, state.velocity_km_s.z],
+        velocity_km_s: [
+            state.velocity_km_s.x,
+            state.velocity_km_s.y,
+            state.velocity_km_s.z,
+        ],
         orientation: [q.w, q.i, q.j, q.k],
         angular_velocity,
         mass_kg: Some(body.mass_kg()),
@@ -395,15 +400,13 @@ pub fn query_naif_state(
 
     let state = almanac
         .translate(iau, SSB_J2000, epoch, None)
-        .map_err(|e| format!(
-            "Failed to get position for NAIF ID {naif_id} at {epoch}: {e}.",
-        ))?;
+        .map_err(|e| format!("Failed to get position for NAIF ID {naif_id} at {epoch}: {e}.",))?;
 
     let (orientation, angular_velocity) = match almanac.rotate(iau, SSB_J2000, epoch) {
         Ok(dcm) => {
-            let q = UnitQuaternion::from_rotation_matrix(
-                &Rotation3::from_matrix_unchecked(dcm.rot_mat),
-            );
+            let q = UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(
+                dcm.rot_mat,
+            ));
             let ang_vel = dcm.rot_mat_dt.map(|r_dt| {
                 let omega = r_dt * dcm.rot_mat.transpose();
                 [omega[(2, 1)], omega[(0, 2)], omega[(1, 0)]]
@@ -417,7 +420,11 @@ pub fn query_naif_state(
 
     Ok(CelestialState {
         position_km: [state.radius_km.x, state.radius_km.y, state.radius_km.z],
-        velocity_km_s: [state.velocity_km_s.x, state.velocity_km_s.y, state.velocity_km_s.z],
+        velocity_km_s: [
+            state.velocity_km_s.x,
+            state.velocity_km_s.y,
+            state.velocity_km_s.z,
+        ],
         orientation,
         angular_velocity,
         mass_kg: None,
@@ -536,7 +543,10 @@ mod tests {
         let utc = j2000_in_timescale(TimeScale::UTC);
         let diff_s = (tai - utc).to_seconds();
         // tai < utc in physical time, so (tai − utc) ≈ −32 s.
-        assert!((diff_s + 32.0).abs() < 1.0, "J2000 UTC should be ~32s after J2000 TAI, got diff = {diff_s}s");
+        assert!(
+            (diff_s + 32.0).abs() < 1.0,
+            "J2000 UTC should be ~32s after J2000 TAI, got diff = {diff_s}s"
+        );
     }
 
     #[test]
@@ -572,7 +582,10 @@ mod tests {
         let utc_ns_total = utc_c as i64 * 36_525i64 * 86_400 * 1_000_000_000 + utc_n as i64;
         // utc_parts < tai_parts because the UTC reference is later: utc_ns - tai_ns ≈ -32 s.
         let diff_s = (utc_ns_total - tai_ns_total) as f64 / 1e9;
-        assert!((diff_s + 32.0).abs() < 1.0, "UTC parts should be ~32s less than TAI parts, got {diff_s}s");
+        assert!(
+            (diff_s + 32.0).abs() < 1.0,
+            "UTC parts should be ~32s less than TAI parts, got {diff_s}s"
+        );
     }
 
     #[test]

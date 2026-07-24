@@ -56,7 +56,6 @@ const SEGMENT_THRESHOLD: usize = 50;
 /// Rows older than (latest stored timestamp − this window) are excluded.
 const CURRENT_STATE_WINDOW_NS: u64 = 3_600 * 1_000_000_000; // 1 hour
 
-
 /// An append-only store of [`RecordBatch`]es forming the soloc Universal Ledger.
 ///
 /// Schema-agnostic: works with any Arrow schema that embeds a spacetimestamp struct column.
@@ -130,23 +129,55 @@ impl Ledger {
         // Check that each required STS field is present with the correct Arrow type.
         // Type correctness is critical: transform_batch and filter_batch call
         // downcast_ref().unwrap() on these arrays and panic at runtime on type mismatch.
-        let checks: &[(&str, &str, fn(&DataType) -> bool)] = &[
-            ("frame_id",           "Dictionary(UInt32, Utf8)",  |dt| matches!(dt, DataType::Dictionary(k, v) if **k == DataType::UInt32 && **v == DataType::Utf8)),
-            ("units_pos",          "Dictionary(UInt16, Utf8)",  |dt| matches!(dt, DataType::Dictionary(k, v) if **k == DataType::UInt16 && **v == DataType::Utf8)),
-            ("timescale_id",       "Dictionary(UInt32, Utf8)",  |dt| matches!(dt, DataType::Dictionary(k, v) if **k == DataType::UInt32 && **v == DataType::Utf8)),
-            ("source_id",          "Dictionary(UInt32, Utf8)",  |dt| matches!(dt, DataType::Dictionary(k, v) if **k == DataType::UInt32 && **v == DataType::Utf8)),
-            ("estimate_type",      "Dictionary(UInt16, Utf8)",  |dt| matches!(dt, DataType::Dictionary(k, v) if **k == DataType::UInt16 && **v == DataType::Utf8)),
-            ("position",           "FixedSizeList(3, Float64)", |dt| matches!(dt, DataType::FixedSizeList(f, 3) if f.data_type() == &DataType::Float64)),
-            ("quaternion",         "FixedSizeList(4, Float64)", |dt| matches!(dt, DataType::FixedSizeList(f, 4) if f.data_type() == &DataType::Float64)),
-            ("duration_centuries", "Int16",                     |dt| *dt == DataType::Int16),
-            ("duration_ns",        "UInt64",                    |dt| *dt == DataType::UInt64),
+        // (field name, expected type description, type predicate)
+        type FieldCheck = (&'static str, &'static str, fn(&DataType) -> bool);
+        let checks: &[FieldCheck] = &[
+            (
+                "frame_id",
+                "Dictionary(UInt32, Utf8)",
+                |dt| matches!(dt, DataType::Dictionary(k, v) if **k == DataType::UInt32 && **v == DataType::Utf8),
+            ),
+            (
+                "units_pos",
+                "Dictionary(UInt16, Utf8)",
+                |dt| matches!(dt, DataType::Dictionary(k, v) if **k == DataType::UInt16 && **v == DataType::Utf8),
+            ),
+            (
+                "timescale_id",
+                "Dictionary(UInt32, Utf8)",
+                |dt| matches!(dt, DataType::Dictionary(k, v) if **k == DataType::UInt32 && **v == DataType::Utf8),
+            ),
+            (
+                "source_id",
+                "Dictionary(UInt32, Utf8)",
+                |dt| matches!(dt, DataType::Dictionary(k, v) if **k == DataType::UInt32 && **v == DataType::Utf8),
+            ),
+            (
+                "estimate_type",
+                "Dictionary(UInt16, Utf8)",
+                |dt| matches!(dt, DataType::Dictionary(k, v) if **k == DataType::UInt16 && **v == DataType::Utf8),
+            ),
+            (
+                "position",
+                "FixedSizeList(3, Float64)",
+                |dt| matches!(dt, DataType::FixedSizeList(f, 3) if f.data_type() == &DataType::Float64),
+            ),
+            (
+                "quaternion",
+                "FixedSizeList(4, Float64)",
+                |dt| matches!(dt, DataType::FixedSizeList(f, 4) if f.data_type() == &DataType::Float64),
+            ),
+            ("duration_centuries", "Int16", |dt| *dt == DataType::Int16),
+            ("duration_ns", "UInt64", |dt| *dt == DataType::UInt64),
         ];
 
         for (name, expected, type_ok) in checks {
             match sts_fields.find(name) {
-                None => return Err(format!(
-                    "'{STS_COLUMN}' struct is missing required STS field '{name}'"
-                )),
+                None => {
+                    return Err(format!(
+                        "'{STS_COLUMN}' struct is missing required STS field '{name}'"
+                    ));
+                }
                 Some((_, field)) => {
                     if !type_ok(field.data_type()) {
                         return Err(format!(
@@ -459,7 +490,7 @@ impl Ledger {
                 if row_dur > target_dur {
                     continue;
                 }
-                if best_dur.map_or(false, |b| row_dur <= b) {
+                if best_dur.is_some_and(|b| row_dur <= b) {
                     continue;
                 }
 
@@ -772,18 +803,18 @@ impl Ledger {
                     row.to_string()
                 };
 
-                if let Some(ref filter) = id_filter_set {
-                    if !filter.contains(row_key.as_str()) {
-                        continue;
-                    }
+                if let Some(ref filter) = id_filter_set
+                    && !filter.contains(row_key.as_str())
+                {
+                    continue;
                 }
 
                 let dur = Duration::from_parts(cent_arr.value(row), ns_arr.value(row));
 
-                if let Some(c) = cutoff {
-                    if dur < c {
-                        continue;
-                    }
+                if let Some(c) = cutoff
+                    && dur < c
+                {
+                    continue;
                 }
 
                 let et = et_dict.value(et_col.keys().value(row) as usize);
@@ -1302,13 +1333,26 @@ mod tests {
         use spacetimestamp::schema::sts_schema;
         let sts_ref = sts_schema(None);
         let mut fields: Vec<Field> = sts_ref.fields().iter().map(|f| (**f).clone()).collect();
-        let ns_idx = fields.iter().position(|f| f.name() == "duration_ns").unwrap();
+        let ns_idx = fields
+            .iter()
+            .position(|f| f.name() == "duration_ns")
+            .unwrap();
         fields[ns_idx] = Field::new("duration_ns", DataType::Int32, false);
         let broken_sts = DataType::Struct(Fields::from(fields));
-        let schema = Arc::new(Schema::new(vec![Field::new("spacetimestamp", broken_sts, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "spacetimestamp",
+            broken_sts,
+            false,
+        )]));
         let err = Ledger::new(&schema, "").unwrap_err();
-        assert!(err.contains("duration_ns"), "error should name the bad field: {err}");
-        assert!(err.contains("UInt64"), "error should name the expected type: {err}");
+        assert!(
+            err.contains("duration_ns"),
+            "error should name the bad field: {err}"
+        );
+        assert!(
+            err.contains("UInt64"),
+            "error should name the expected type: {err}"
+        );
     }
 
     #[test]
@@ -1323,9 +1367,16 @@ mod tests {
             .map(|f| (**f).clone())
             .collect();
         let broken_sts = DataType::Struct(Fields::from(fields));
-        let schema = Arc::new(Schema::new(vec![Field::new("spacetimestamp", broken_sts, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "spacetimestamp",
+            broken_sts,
+            false,
+        )]));
         let err = Ledger::new(&schema, "").unwrap_err();
-        assert!(err.contains("position"), "error should name the missing field: {err}");
+        assert!(
+            err.contains("position"),
+            "error should name the missing field: {err}"
+        );
     }
 
     // -----------------------------------------------------------------------
