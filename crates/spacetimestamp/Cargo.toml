@@ -2,6 +2,7 @@
 name = "spacetimestamp"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 anise = "0.9.4"
@@ -20,4 +21,3 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "spacetimestamp_bench"
 harness = false
-
