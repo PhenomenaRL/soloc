@@ -1,0 +1,48 @@
+name: Bug report
+description: Something behaves incorrectly
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Also tell us what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal code or commands that trigger the bug. For frame/transform issues, include the frames, units, and epoch involved.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: rust-version
+    attributes:
+      label: Rust version
+      description: Output of `rustc --version`
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+    validations:
+      required: true
+  - type: dropdown
+    id: kernels
+    attributes:
+      label: SPICE kernel setup
+      options:
+        - Kernels mounted via SOLOC_KERNEL_PATHS
+        - Auto-downloaded via MetaAlmanac::latest()
+        - No kernels loaded
+        - Not applicable / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      render: shell
