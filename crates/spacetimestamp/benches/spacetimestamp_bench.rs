@@ -1,11 +1,12 @@
 use anise::prelude::Almanac;
 use arrow::datatypes::{DataType, Field, Schema};
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hifitime::{Duration, Epoch};
 use spacetimestamp::query::{SpatiotemporalFilter, filter_batch};
 use spacetimestamp::schema::{FrameRegistry, SpaceTimestampBuilder, sts_schema};
 use spacetimestamp::transforms::{normalize_batch_to_tai, transform_batch};
 use spacetimestamp::validation::validate_spacetimestamp_batch;
+use std::hint::black_box;
 use std::str::FromStr;
 use std::sync::Arc;
 

@@ -5,6 +5,8 @@ updates:
     schedule:
       interval: weekly
     groups:
+      arrow:
+        patterns: ["arrow*"]
       minor-and-patch:
         update-types: ["minor", "patch"]
   - package-ecosystem: github-actions
