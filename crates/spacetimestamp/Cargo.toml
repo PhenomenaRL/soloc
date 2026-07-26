@@ -16,7 +16,7 @@ uuid = { version = "1.21.0", features = ["serde", "v4"] }
 
 [dev-dependencies]
 test-log = "0.2.19"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "spacetimestamp_bench"
