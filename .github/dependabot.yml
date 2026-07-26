@@ -5,8 +5,6 @@ updates:
     schedule:
       interval: weekly
     groups:
-      # arrow and arrow-flight must move in lockstep — bumping one alone
-      # leaves two incompatible arrow versions in the dependency tree.
       arrow:
         patterns: ["arrow*"]
       minor-and-patch:
