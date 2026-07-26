@@ -1,9 +1,10 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hifitime::{Duration, Epoch};
 use soloc::entity::{EntityBuilder, entity_schema};
 use soloc::ledger::Ledger;
 use spacetimestamp::ephemeris::j2000_tai;
 use spacetimestamp::query::SpatiotemporalFilter;
+use std::hint::black_box;
 
 fn j2000_epoch() -> Epoch {
     j2000_tai()
