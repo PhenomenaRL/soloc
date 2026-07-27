@@ -1,5 +1,5 @@
 use crate::ephemeris::is_valid_astronomical_frame;
-use crate::schema::{FrameRegistry, STS_COLUMN, STS_REGISTRY_METADATA_KEY};
+use crate::schema::STS_COLUMN;
 use arrow::array::{Array, AsArray, DictionaryArray, StructArray};
 use arrow::datatypes::UInt32Type;
 use arrow::record_batch::RecordBatch;
@@ -16,13 +16,12 @@ use std::str::FromStr;
 ///
 /// Detection is automatic: if a `"spacetimestamp"` struct column is present, the nested
 /// path is taken; otherwise the top-level columns are checked.
+///
+/// A `frame_id` is accepted if it is a raw NAIF integer ID, an entity URI (resolved against
+/// the ledger's derived topology, not here), or a name anise recognizes. Frame *reachability*
+/// is checked at ledger append time by [`crate::topology::TransformTree`]; this function only
+/// checks that the identifier is well-formed.
 pub fn validate_spacetimestamp_batch(batch: &RecordBatch) -> Result<(), String> {
-    let schema = batch.schema();
-    let registry = schema
-        .metadata()
-        .get(STS_REGISTRY_METADATA_KEY)
-        .and_then(|json| FrameRegistry::from_json(json).ok());
-
     // Locate the STS fields — either nested inside STS_COLUMN or at the top level.
     let (timescale_col, frame_col) = match batch.column_by_name(STS_COLUMN) {
         Some(col) => {
@@ -75,11 +74,6 @@ pub fn validate_spacetimestamp_batch(batch: &RecordBatch) -> Result<(), String> 
             }
             let frame_str = values.value(i);
 
-            if let Some(reg) = &registry
-                && reg.frames.contains_key(frame_str)
-            {
-                continue;
-            }
             if frame_str.parse::<i32>().is_ok() {
                 continue;
             }
@@ -91,7 +85,8 @@ pub fn validate_spacetimestamp_batch(batch: &RecordBatch) -> Result<(), String> 
             }
 
             return Err(format!(
-                "Invalid frame_id: '{}' is not recognized by anise or the FrameRegistry",
+                "Invalid frame_id: '{}' is not a NAIF ID, an entity URI, or a frame name \
+                 recognized by anise",
                 frame_str
             ));
         }
@@ -103,13 +98,13 @@ pub fn validate_spacetimestamp_batch(batch: &RecordBatch) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{FrameRegistry, SpaceTimestampBuilder, sts_schema};
+    use crate::schema::{SpaceTimestampBuilder, sts_schema};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
     fn make_flat_batch(frame: &str, timescale: &str) -> RecordBatch {
-        let mut builder = SpaceTimestampBuilder::new(1, None);
+        let mut builder = SpaceTimestampBuilder::new(1);
         builder.append_spacetimestamp(
             frame,
             "km",
@@ -127,7 +122,7 @@ mod tests {
     }
 
     fn make_nested_batch(frame: &str, timescale: &str) -> RecordBatch {
-        let mut builder = SpaceTimestampBuilder::new(1, None);
+        let mut builder = SpaceTimestampBuilder::new(1);
         builder.append_spacetimestamp(
             frame,
             "km",
@@ -144,7 +139,7 @@ mod tests {
         let struct_array = builder.finish_as_struct();
         let schema = Arc::new(Schema::new(vec![Field::new(
             STS_COLUMN,
-            DataType::Struct(sts_schema(None).fields().clone()),
+            DataType::Struct(sts_schema().fields().clone()),
             false,
         )]));
         RecordBatch::try_new(schema, vec![Arc::new(struct_array)]).unwrap()
@@ -190,29 +185,18 @@ mod tests {
         assert!(validate_spacetimestamp_batch(&make_nested_batch("demo:truck_A", "TAI")).is_ok());
     }
 
+    /// A raw NAIF integer ID is a valid frame identifier and must not be rejected.
     #[test]
-    fn test_valid_custom_frame() {
-        let mut reg = FrameRegistry::new_with_namespace("robot");
-        reg.add_frame("cam", "ICRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
-        let qualified = reg.qualify("cam");
+    fn test_naif_id_frame_is_valid() {
+        assert!(validate_spacetimestamp_batch(&make_flat_batch("499", "TAI")).is_ok());
+        assert!(validate_spacetimestamp_batch(&make_nested_batch("499", "TAI")).is_ok());
+    }
 
-        let mut builder = SpaceTimestampBuilder::new(1, Some(reg));
-        builder.append_spacetimestamp(
-            "cam",
-            "km",
-            "UTC",
-            "sensor_1",
-            "MEASURED",
-            [0.0; 3],
-            [1.0, 0.0, 0.0, 0.0],
-            0,
-            0,
-            None,
-            None,
-        );
-        let batch = builder.flush();
-        // The builder qualifies "cam" → "robot:cam" automatically.
-        let _ = qualified;
-        assert!(validate_spacetimestamp_batch(&batch).is_ok());
+    /// An unqualified local name is no longer legal: without the registry there is no
+    /// namespacing step that could turn "cam" into a resolvable identifier.
+    #[test]
+    fn test_unqualified_local_frame_is_rejected() {
+        let result = validate_spacetimestamp_batch(&make_flat_batch("cam", "TAI"));
+        assert!(result.unwrap_err().contains("Invalid frame_id"));
     }
 }

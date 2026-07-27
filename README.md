@@ -18,7 +18,7 @@ Each observation is stored in its **original reference frame and native units, f
 
 | Crate | Description |
 |---|---|
-| [`spacetimestamp`](crates/spacetimestamp/) | Core Arrow schema, `FrameRegistry`, and physics transforms |
+| [`spacetimestamp`](crates/spacetimestamp/) | Core Arrow schema, row-derived transform tree, and physics transforms |
 | [`soloc`](crates/soloc/) | custom schemas, append-only ledger |
 | [`soloc-server`](crates/soloc-server/) | Arrow Flight gRPC server |
 
@@ -36,17 +36,39 @@ cargo test -p spacetimestamp -p soloc -p soloc-server
 
 ### Running the server
 
+The server takes no positional arguments. It reads a TOML config from `$SOLOC_CONFIG`, falling back to `./config.toml`; with neither present it starts fully in memory with sensible defaults.
+
 ```bash
+# Zero-config: in-memory ledger, entity schema, bound to 0.0.0.0:50051
+cargo run --release -p soloc-server
+
 # With NAIF ephemeris kernels mounted (no network required at runtime)
 SOLOC_KERNEL_PATHS=/path/to/de440s.bsp:/path/to/pck11.pca \
-  cargo run --release -p soloc-server -- /path/to/registry.json /path/to/ledger.arrow
+  cargo run --release -p soloc-server
 ```
 
-If `SOLOC_KERNEL_PATHS` is not set, the server falls back to downloading kernels via `MetaAlmanac::latest()` and caching them locally (~150 MB on first run). Custom frame registration and static transforms work without any kernels loaded.
+```toml
+# config.toml
+[server]
+bind = "0.0.0.0:50051"
 
-Arguments:
-- `argv[1]` — path for the persisted frame registry JSON (reloaded on restart)
-- `argv[2]` — path for the Arrow IPC ledger file (reloaded on restart, saved on SIGTERM)
+[storage]
+# ledger_url takes priority over ledger_path when both are set.
+# s3://, gs://, az:// and file:// are all supported.
+ledger_path = "/var/data/ledger.arrows"
+# Optional zero-row Arrow IPC file defining the schema for a fresh ledger.
+# Defaults to the standard entity schema.
+# schema_path = "/var/data/schema.arrow"
+id_column = "entity_id"
+
+[ephemeris]
+# Pre-mounted kernels; takes priority over SOLOC_KERNEL_PATHS.
+kernels = ["/path/to/de440s.bsp", "/path/to/pck11.pca"]
+```
+
+Kernels resolve in order: the `kernels` list, then `SOLOC_KERNEL_PATHS` (colon-separated), then `MetaAlmanac::latest()`, which downloads DE440s + PCK files and caches them locally (~150 MB on first run). With no kernels at all the server still starts, but astronomical transforms will fail.
+
+**Federation actions:** `export_topology` emits the transform-tree event log as Arrow IPC; `import_topology` merges a peer's back in, rejecting anything that would form a cycle. Both are advertised via `list_actions`, alongside `save_ledger`, `load_ledger`, `load_kernel`, and `append_snapshot`.
 
 ### Python client
 
@@ -56,24 +78,17 @@ import json
 
 client = fl.FlightClient("grpc://localhost:50051")
 
-# Register a custom sensor frame (persisted server-side)
-for _ in client.do_action(fl.Action(
-    "register_frame",
-    json.dumps({
-        "local_name": "radar_boresight",
-        "parent": "IAU_EARTH",
-        "translation": [0.0, 0.0, 42.0],   # 42 m above ground
-        "rotation_quat": [1.0, 0.0, 0.0, 0.0],
-    }).encode(),
-)):
-    pass
+# There is no separate frame-registration step. A custom frame exists as soon as a row
+# declares it: append a row with entity_id "acme.com:radar_boresight" and frame_id
+# "IAU_EARTH", and the server derives the parent edge from the data itself. Re-parenting
+# is just another append. Cycles and unreachable parent frames are rejected at append time.
 
-# Push observations (batch schema embeds your local FrameRegistry)
+# Push observations
 writer, _ = client.do_put(fl.FlightDescriptor.for_path(["obs"]), batch.schema)
 writer.write_batch(batch)
 writer.close()
 
-# Query with a time filter — returned batches carry the canonical frame map
+# Query with a time filter
 ticket = fl.Ticket(json.dumps({"time_range_tai_s": [1_000_000.0, 2_000_000.0]}).encode())
 table = client.do_get(ticket).read_all()
 

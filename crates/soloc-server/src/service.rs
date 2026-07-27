@@ -147,8 +147,14 @@ fn transform_with_ledger_frames(
 
     // Fast path: no entity-URI frames means no ledger lookups, so don't take the lock.
     if !batch_has_uri_frames(batch) {
-        return transform_batch(batch, &desc.target_frame, &almanac, &desc.target_units, None)
-            .map_err(|e| Status::internal(format!("transform failed: {e}")));
+        return transform_batch(
+            batch,
+            &desc.target_frame,
+            &almanac,
+            &desc.target_units,
+            None,
+        )
+        .map_err(|e| Status::internal(format!("transform failed: {e}")));
     }
 
     let ledger = state
@@ -404,19 +410,22 @@ impl FlightService for SolocFlightService {
             }),
             Ok(ActionType {
                 r#type: "load_ledger".to_string(),
-                description: "Replace the in-memory ledger from an Arrow IPC file. Body: {path}".to_string(),
+                description: "Replace the in-memory ledger from an Arrow IPC file. Body: {path}"
+                    .to_string(),
             }),
             Ok(ActionType {
                 r#type: "load_kernel".to_string(),
                 description: "Load a SPICE kernel (BSP/PCK/BPC) into the server almanac. \
                               Body: {source} where source is an http/https URL or local path. \
-                              URLs are downloaded and cached in the anise data directory.".to_string(),
+                              URLs are downloaded and cached in the anise data directory."
+                    .to_string(),
             }),
             Ok(ActionType {
                 r#type: "append_snapshot".to_string(),
                 description: "Query the almanac for arbitrary NAIF bodies at a given epoch and \
                               append the result to the ledger. \
-                              Body: {bodies: [{naif_id, entity_id}], epoch_tai_s}".to_string(),
+                              Body: {bodies: [{naif_id, entity_id}], epoch_tai_s}"
+                    .to_string(),
             }),
         ];
         Ok(Response::new(Box::pin(futures::stream::iter(actions))))
@@ -438,9 +447,7 @@ impl FlightService for SolocFlightService {
                     .export_topology()
                     .map_err(|e| Status::internal(format!("export_topology failed: {e}")))?;
                 let bytes = batch_to_ipc_bytes(&batch)?;
-                let result = arrow_flight::Result {
-                    body: bytes.into(),
-                };
+                let result = arrow_flight::Result { body: bytes.into() };
                 Ok(Response::new(Box::pin(futures::stream::once(
                     futures::future::ready(Ok(result)),
                 ))))
@@ -607,5 +614,157 @@ impl FlightService for SolocFlightService {
                 "unknown action type: '{other}'"
             ))),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anise::almanac::Almanac;
+    use soloc::schemas::entity::EntityBuilder;
+
+    /// A one-row entity batch placing `entity_id` relative to `frame_id`.
+    fn entity_batch(entity_id: &str, frame_id: &str, x: f64) -> RecordBatch {
+        let mut b = EntityBuilder::new(1);
+        b.append_entity(
+            entity_id,
+            frame_id,
+            "km",
+            "TAI",
+            "test:src",
+            "MEASURED",
+            [x, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        b.flush()
+    }
+
+    /// A service backed by an empty in-memory entity ledger — no paths, so no disk I/O.
+    async fn make_service() -> SolocFlightService {
+        let state = ServerState::new(
+            Almanac::default(),
+            None,
+            None,
+            None,
+            "entity_id".to_string(),
+        )
+        .await;
+        SolocFlightService::new(Arc::new(state))
+    }
+
+    /// Drains a DoAction response stream into the single result body it carries.
+    async fn action_body(
+        response: Response<<SolocFlightService as FlightService>::DoActionStream>,
+    ) -> Vec<u8> {
+        let results: Vec<_> = response.into_inner().collect().await;
+        assert_eq!(results.len(), 1, "expected exactly one action result");
+        results
+            .into_iter()
+            .next()
+            .unwrap()
+            .expect("action result should not be an error")
+            .body
+            .to_vec()
+    }
+
+    /// The full federation wire path: one server exports its derived topology, a second
+    /// server imports the bytes and ends up holding the same edges. This is the only
+    /// coverage of `batch_to_ipc_bytes`/`batch_from_ipc_bytes`, which sit between them.
+    #[tokio::test]
+    async fn test_export_import_topology_round_trip() {
+        let exporter = make_service().await;
+        {
+            let mut ledger = exporter.state.ledger.write().unwrap();
+            ledger
+                .append(entity_batch("demo:facility", "IAU_EARTH", 50.0))
+                .unwrap();
+            ledger
+                .append(entity_batch("demo:robot", "demo:facility", 5.0))
+                .unwrap();
+        }
+
+        let exported = exporter
+            .do_action(Request::new(Action {
+                r#type: "export_topology".to_string(),
+                body: Default::default(),
+            }))
+            .await
+            .expect("export_topology should succeed");
+        let bytes = action_body(exported).await;
+        assert!(!bytes.is_empty(), "export must produce an IPC payload");
+
+        let importer = make_service().await;
+        let imported = importer
+            .do_action(Request::new(Action {
+                r#type: "import_topology".to_string(),
+                body: bytes.into(),
+            }))
+            .await
+            .expect("import_topology should succeed");
+        let msg = String::from_utf8(action_body(imported).await).unwrap();
+        assert_eq!(msg, "applied 2 topology events");
+
+        // The importer now holds the same two edges, so re-exporting reproduces them.
+        let reexported = importer
+            .state
+            .ledger
+            .read()
+            .unwrap()
+            .export_topology()
+            .unwrap();
+        assert_eq!(reexported.num_rows(), 2);
+    }
+
+    /// A malformed body must be rejected as a client error, not surface as an internal panic.
+    #[tokio::test]
+    async fn test_import_topology_rejects_garbage_body() {
+        let service = make_service().await;
+        // The Ok variant is a boxed stream and so is not Debug — match rather than expect_err.
+        let result = service
+            .do_action(Request::new(Action {
+                r#type: "import_topology".to_string(),
+                body: vec![0xde, 0xad, 0xbe, 0xef].into(),
+            }))
+            .await;
+        match result {
+            Ok(_) => panic!("garbage body must be rejected"),
+            Err(status) => assert_eq!(status.code(), tonic::Code::InvalidArgument),
+        }
+    }
+
+    /// Both federation actions must be discoverable, or a peer cannot find them.
+    #[tokio::test]
+    async fn test_list_actions_advertises_topology_actions() {
+        let service = make_service().await;
+        let listed: Vec<String> = service
+            .list_actions(Request::new(Empty {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|a| a.unwrap().r#type)
+            .collect();
+
+        assert!(
+            listed.contains(&"export_topology".to_string()),
+            "{listed:?}"
+        );
+        assert!(
+            listed.contains(&"import_topology".to_string()),
+            "{listed:?}"
+        );
     }
 }

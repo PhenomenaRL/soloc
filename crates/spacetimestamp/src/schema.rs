@@ -8,18 +8,12 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use anise::{almanac::Almanac, prelude::Frame};
 use arrow::array::{
     Array, ArrayBuilder, FixedSizeListBuilder, Float64Builder, Int16Builder,
     StringDictionaryBuilder, StructArray, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt16Type, UInt32Type};
 use arrow::record_batch::RecordBatch;
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-
-/// The metadata key used to store the serialized `FrameRegistry` in the Arrow schema.
-pub const STS_REGISTRY_METADATA_KEY: &str = "soloc.frame_registry";
 
 /// The fixed name of the spacetimestamp struct column in any soloc schema.
 ///
@@ -27,348 +21,6 @@ pub const STS_REGISTRY_METADATA_KEY: &str = "soloc.frame_registry";
 /// The name is fixed (not configurable) so that validation, querying, and transforms
 /// can locate the column without caller-supplied parameters.
 pub const STS_COLUMN: &str = "spacetimestamp";
-
-/// Astronomical frame names recognized as external roots by `anise`.
-///
-/// Any name in this list (or matching `IAU_*` or containing `:`) is treated as an
-/// external frame anchor in `add_frame` — it will not be namespace-qualified.
-/// Use `FrameRegistry::add_external_frame` for mission-specific names not listed here.
-///
-/// All entries must be resolvable by [`crate::ephemeris::resolve_astronomical_frame`]
-/// (verified by `test_known_external_frames_all_resolve`). Do not add names here that
-/// anise cannot map to a NAIF frame — they will pass validation but fail at transform time.
-///
-/// Earth-fixed frames: use `IAU_EARTH` (NAIF PCK body-fixed model). `ITRF`, `ECEF`, and
-/// `ECI` are not NAIF frame names and are intentionally absent. `TEME` (True Equator Mean
-/// Equinox, used in TLE/SGP4) requires a custom FK kernel not loaded by default and is
-/// also absent; it will be added when TLE support is implemented.
-pub const KNOWN_EXTERNAL_FRAMES: &[&str] = &[
-    // Inertial / quasi-inertial (NAIF orientation ID 1 = J2000/ICRF)
-    "ICRF",
-    "J2000",
-    "GCRF",
-    "EME2000",
-    // Barycenters (NAIF body IDs: SSB=0, EMB=3)
-    "SSB",
-    "EMB",
-    // Solar system body centers with J2000 orientation
-    "Sun",
-    "Mercury",
-    "Venus",
-    "Earth",
-    "Moon",
-    "Mars",
-    "Jupiter",
-    "Saturn",
-    "Uranus",
-    "Neptune",
-    "Pluto",
-    // Major moon body centers with J2000 orientation
-    "Phobos",
-    "Deimos",
-    "Io",
-    "Europa",
-    "Ganymede",
-    "Callisto",
-    "Titan",
-    "Enceladus",
-];
-
-/// Represents a static spatial transformation between a child frame and its parent.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct FrameTransform {
-    /// The ID of the parent frame this transform connects to.
-    pub parent_id: String,
-    /// The translation vector `[x, y, z]` relative to the parent frame.
-    pub translation: [f64; 3],
-    /// The rotation quaternion `[w, x, y, z]` relative to the parent frame.
-    pub rotation_quat: [f64; 4],
-}
-
-/// A registry defining the static relationships between custom frames and root astronomical frames.
-///
-/// This registry is embedded as JSON into the Arrow schema metadata. It ensures that custom
-/// frames (like "arm" or "base_link") are namespaced to avoid global collisions and that
-/// the transformation tree is acyclic and anchors to a known astronomical root.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FrameRegistry {
-    /// The unique namespace prefix for this registry (usually a UUID).
-    pub namespace: String,
-    /// Maps a fully qualified frame ID (`namespace:local_name`) to its transform definition.
-    pub frames: HashMap<String, FrameTransform>,
-    /// Mission-specific external frame names not in `KNOWN_EXTERNAL_FRAMES`.
-    /// These are treated as external roots and never namespace-qualified.
-    /// Serialized into JSON alongside `frames` so they survive persistence.
-    #[serde(default)]
-    pub extra_external_frames: HashSet<String>,
-}
-
-impl Default for FrameRegistry {
-    fn default() -> Self {
-        Self::new_with_uuid()
-    }
-}
-
-impl FrameRegistry {
-    /// Creates a new registry with a randomly generated UUID v4 namespace.
-    pub fn new_with_uuid() -> Self {
-        let namespace = uuid::Uuid::new_v4().to_string();
-        Self {
-            namespace,
-            frames: HashMap::new(),
-            extra_external_frames: HashSet::new(),
-        }
-    }
-
-    /// Creates a new registry with a specific namespace.
-    pub fn new_with_namespace(namespace: impl Into<String>) -> Self {
-        Self {
-            namespace: namespace.into(),
-            frames: HashMap::new(),
-            extra_external_frames: HashSet::new(),
-        }
-    }
-
-    /// Returns the fully qualified, namespaced frame ID for a given local name.
-    pub fn qualify(&self, local_name: &str) -> String {
-        format!("{}:{}", self.namespace, local_name)
-    }
-
-    /// Returns `true` if `name` should be treated as an external astronomical frame root —
-    /// i.e., it will not be namespace-qualified when used as a parent in `add_frame`.
-    ///
-    /// A name is external if it:
-    /// - Is already fully qualified (contains `:`),
-    /// - Matches the `IAU_*` body-fixed naming convention (e.g. `"IAU_MARS"`, `"IAU_EARTH"`),
-    /// - Appears in [`KNOWN_EXTERNAL_FRAMES`], or
-    /// - Was registered via [`add_external_frame`](Self::add_external_frame).
-    pub fn is_external_frame(&self, name: &str) -> bool {
-        name.contains(':')
-            || name.starts_with("IAU_")
-            || KNOWN_EXTERNAL_FRAMES.contains(&name)
-            || self.extra_external_frames.contains(name)
-    }
-
-    /// Registers a mission-specific frame name as an external root.
-    ///
-    /// Use this for names that `anise` recognizes but are not in [`KNOWN_EXTERNAL_FRAMES`]
-    /// (e.g., raw NAIF ID strings, mission-specific orientation frames). Registered names
-    /// survive JSON serialization alongside `frames`.
-    pub fn add_external_frame(&mut self, name: impl Into<String>) {
-        self.extra_external_frames.insert(name.into());
-    }
-
-    /// Adds a custom frame to the registry.
-    ///
-    /// The `local_name` is the name of the new frame.
-    /// The `parent_name` can be either:
-    /// 1. Another local name within this registry (e.g., "base_link").
-    /// 2. An external astronomical frame (e.g., "IAU_MARS", "GCRF", "Neptune").
-    ///
-    /// External parents are detected via [`is_external_frame`](Self::is_external_frame)
-    /// and passed through unchanged. Local siblings are namespace-qualified automatically.
-    /// For runtime validation that the parent is resolvable by the loaded `Almanac`,
-    /// use `add_frame_validated` (Step 2).
-    pub fn add_frame(
-        &mut self,
-        local_name: &str,
-        parent_name: &str,
-        translation: [f64; 3],
-        rotation_quat: [f64; 4],
-    ) {
-        let child_id = self.qualify(local_name);
-        let parent_id = if self.is_external_frame(parent_name) {
-            parent_name.to_string()
-        } else {
-            self.qualify(parent_name)
-        };
-        self.frames.insert(
-            child_id,
-            FrameTransform {
-                parent_id,
-                translation,
-                rotation_quat,
-            },
-        );
-    }
-
-    /// Adds a custom frame to the registry, validating the parent before committing.
-    ///
-    /// If `parent_name` is external (per [`is_external_frame`](Self::is_external_frame)):
-    /// validates that `anise` can resolve it as a named frame. This catches typos and
-    /// unsupported frame names at registration time rather than silently producing an
-    /// unresolvable root anchor that only fails at `transform_batch` time.
-    ///
-    /// If `parent_name` is a local sibling: validates that the sibling already exists
-    /// in this registry, catching ordering mistakes early.
-    ///
-    /// On success, delegates to [`add_frame`](Self::add_frame). Use the infallible
-    /// `add_frame` in tests or offline contexts where no `Almanac` is available.
-    pub fn add_frame_validated(
-        &mut self,
-        local_name: &str,
-        parent_name: &str,
-        translation: [f64; 3],
-        rotation_quat: [f64; 4],
-        almanac: &Almanac,
-    ) -> Result<(), String> {
-        if self.is_external_frame(parent_name) {
-            // KNOWN_EXTERNAL_FRAMES, *_IAU, and fully-qualified names are compile-time
-            // trusted — we don't call Frame::from_name for them because anise doesn't
-            // resolve all of them as body centers (e.g. "ICRF" is an orientation, not
-            // a center). Only user-registered extra frames get runtime validation, since
-            // those are arbitrary strings we cannot trust statically.
-            if self.extra_external_frames.contains(parent_name) {
-                // Direct anise check — schema.rs cannot call ephemeris (circular dep).
-                // Covers body-center names, SSB-relative orientation frames, and IAU_ bodies.
-                let ok = Frame::from_name(parent_name, "J2000").is_ok()
-                    || Frame::from_name("SSB", parent_name).is_ok()
-                    || parent_name
-                        .strip_prefix("IAU_")
-                        .map(|body| {
-                            matches!(
-                                body,
-                                "SUN"
-                                    | "MERCURY"
-                                    | "VENUS"
-                                    | "EARTH"
-                                    | "MOON"
-                                    | "MARS"
-                                    | "JUPITER"
-                                    | "SATURN"
-                                    | "URANUS"
-                                    | "NEPTUNE"
-                                    | "PLUTO"
-                                    | "CHARON"
-                                    | "PHOBOS"
-                                    | "DEIMOS"
-                                    | "IO"
-                                    | "EUROPA"
-                                    | "GANYMEDE"
-                                    | "CALLISTO"
-                                    | "MIMAS"
-                                    | "ENCELADUS"
-                                    | "TETHYS"
-                                    | "DIONE"
-                                    | "RHEA"
-                                    | "TITAN"
-                                    | "IAPETUS"
-                                    | "MIRANDA"
-                                    | "ARIEL"
-                                    | "UMBRIEL"
-                                    | "TITANIA"
-                                    | "OBERON"
-                                    | "TRITON"
-                            )
-                        })
-                        .unwrap_or(false);
-                if !ok {
-                    return Err(format!(
-                        "parent frame '{}' was registered via add_external_frame() but is \
-                         not recognized by anise. Verify the frame name or NAIF ID.",
-                        parent_name
-                    ));
-                }
-            }
-            // almanac is reserved for future per-frame SPK availability checks
-            // (e.g. a translate() probe to verify SPK data is loaded for this body).
-            let _ = almanac;
-        } else {
-            let qualified_parent = self.qualify(parent_name);
-            if !self.frames.contains_key(&qualified_parent) {
-                return Err(format!(
-                    "parent frame '{}' (qualified: '{}') does not exist in this registry; \
-                     add it before referencing it as a parent.",
-                    parent_name, qualified_parent
-                ));
-            }
-        }
-        self.add_frame(local_name, parent_name, translation, rotation_quat);
-        Ok(())
-    }
-
-    /// Validates the transform tree to ensure there are no cycles.
-    /// Returns `Ok(())` if valid, or an `Err(String)` with the validation failure reason.
-    pub fn validate(&self) -> Result<(), String> {
-        for start_node in self.frames.keys() {
-            let mut visited = HashSet::new();
-            let mut current = start_node.clone();
-
-            loop {
-                if !visited.insert(current.clone()) {
-                    return Err(format!("Cycle detected involving frame: {}", current));
-                }
-
-                match self.frames.get(&current) {
-                    Some(transform) => {
-                        current = transform.parent_id.clone();
-                    }
-                    None => {
-                        // We reached a node not in our registry. This is our Root Anchor.
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Serializes the registry to a JSON string.
-    pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(self)
-    }
-
-    /// Deserializes the registry from a JSON string.
-    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
-    }
-
-    /// Returns the namespace prefix used to qualify local frame names.
-    pub fn namespace(&self) -> &str {
-        &self.namespace
-    }
-
-    /// Returns `true` if the given fully-qualified frame name exists in this registry.
-    pub fn contains_frame(&self, qualified_name: &str) -> bool {
-        self.frames.contains_key(qualified_name)
-    }
-
-    /// Returns all fully-qualified frame names in this registry.
-    pub fn list_frames(&self) -> Vec<&str> {
-        self.frames.keys().map(|s| s.as_str()).collect()
-    }
-
-    /// Removes a frame by its local (unqualified) name.
-    ///
-    /// Returns `true` if the frame existed and was removed. Does not check whether
-    /// other frames reference this one as a parent — the caller is responsible for
-    /// maintaining a valid tree.
-    pub fn remove_frame(&mut self, local_name: &str) -> bool {
-        let qualified = self.qualify(local_name);
-        self.frames.remove(&qualified).is_some()
-    }
-
-    /// Combines this registry with `other`, returning a new registry containing all frames
-    /// from both. The result uses this registry's namespace.
-    ///
-    /// Runs [`FrameRegistry::validate`] on the merged result. Returns `Err` if the combined
-    /// frame graph contains a cycle (e.g. cross-registry references that form a loop).
-    pub fn merge(&self, other: &FrameRegistry) -> Result<FrameRegistry, String> {
-        let mut merged = FrameRegistry {
-            namespace: self.namespace.clone(),
-            frames: HashMap::new(),
-            extra_external_frames: self
-                .extra_external_frames
-                .union(&other.extra_external_frames)
-                .cloned()
-                .collect(),
-        };
-        merged.frames.extend(self.frames.clone());
-        merged.frames.extend(other.frames.clone());
-        merged.validate()?;
-        Ok(merged)
-    }
-}
 
 /// Returns `true` if `id` is a federated entity URI rather than an astronomical frame name.
 ///
@@ -404,8 +56,8 @@ fn append_optional_cov6(
 
 /// Returns the canonical Arrow schema for SpaceTimestamp data.
 ///
-/// If a `FrameRegistry` is provided, it is serialized and embedded into the
-/// schema metadata under the `"soloc.frame_registry"` key.
+/// The schema carries no metadata: frame topology is derived from the rows themselves
+/// (see [`crate::topology::TransformTree`]), not declared alongside the schema.
 ///
 /// The schema consists of:
 /// * `frame_id`: Dictionary-encoded reference frame (e.g., "ICRF").
@@ -423,74 +75,64 @@ fn append_optional_cov6(
 /// * `orientation_covariance`: Nullable `FixedSizeList(6, Float64)` — upper triangle of the
 ///   3×3 orientation covariance in the tangent space of SO(3) (axis-angle perturbation),
 ///   row-major: `[σ_11, σ_12, σ_13, σ_22, σ_23, σ_33]`. Null when unknown.
-pub fn sts_schema(registry: Option<&FrameRegistry>) -> SchemaRef {
-    let mut metadata = HashMap::new();
-    if let Some(reg) = registry
-        && let Ok(json) = reg.to_json()
-    {
-        metadata.insert(STS_REGISTRY_METADATA_KEY.to_string(), json);
-    }
-
-    Arc::new(
-        Schema::new(vec![
-            Field::new(
-                "frame_id",
-                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
-                false,
-            ),
-            Field::new(
-                "units_pos",
-                DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
-                false,
-            ),
-            Field::new(
-                "timescale_id",
-                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
-                false,
-            ),
-            Field::new(
-                "source_id",
-                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
-                false,
-            ),
-            Field::new(
-                "estimate_type",
-                DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
-                false,
-            ),
-            Field::new(
-                "position",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 3),
-                false,
-            ),
-            Field::new(
-                "quaternion",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 4),
-                false,
-            ),
-            Field::new("duration_centuries", DataType::Int16, false),
-            Field::new("duration_ns", DataType::UInt64, false),
-            Field::new(
-                "position_covariance",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 6),
-                true,
-            ),
-            Field::new(
-                "orientation_covariance",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 6),
-                true,
-            ),
-        ])
-        .with_metadata(metadata),
-    )
+pub fn sts_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(
+            "frame_id",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            false,
+        ),
+        Field::new(
+            "units_pos",
+            DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
+            false,
+        ),
+        Field::new(
+            "timescale_id",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            false,
+        ),
+        Field::new(
+            "source_id",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            false,
+        ),
+        Field::new(
+            "estimate_type",
+            DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
+            false,
+        ),
+        Field::new(
+            "position",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 3),
+            false,
+        ),
+        Field::new(
+            "quaternion",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 4),
+            false,
+        ),
+        Field::new("duration_centuries", DataType::Int16, false),
+        Field::new("duration_ns", DataType::UInt64, false),
+        Field::new(
+            "position_covariance",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 6),
+            true,
+        ),
+        Field::new(
+            "orientation_covariance",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 6),
+            true,
+        ),
+    ]))
 }
 
 /// An efficient builder for creating [`RecordBatch`]es following the SpaceTimestamp schema.
 ///
-/// This builder supports injecting a `FrameRegistry`. Any appended frames that
-/// match a local name in the registry will be automatically namespace-qualified.
+/// `frame_id` and `source_id` are written exactly as supplied — the builder performs no
+/// namespacing. Callers are responsible for passing fully-qualified identifiers, the same
+/// convention `entity_id` already follows.
 pub struct SpaceTimestampBuilder {
-    registry: Option<FrameRegistry>,
     frame_id: StringDictionaryBuilder<UInt32Type>,
     units_pos: StringDictionaryBuilder<UInt16Type>,
     timescale_id: StringDictionaryBuilder<UInt32Type>,
@@ -505,14 +147,12 @@ pub struct SpaceTimestampBuilder {
 }
 
 impl SpaceTimestampBuilder {
-    /// Creates a new builder pre-allocated for the given capacity, with an optional registry.
+    /// Creates a new builder pre-allocated for the given capacity.
     ///
     /// # Arguments
     /// * `capacity` - The expected number of rows to be ingested before a flush.
-    /// * `registry` - An optional `FrameRegistry` to embed into the generated schema.
-    pub fn new(capacity: usize, registry: Option<FrameRegistry>) -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self {
-            registry,
             frame_id: StringDictionaryBuilder::<UInt32Type>::with_capacity(capacity, 10, 100),
             units_pos: StringDictionaryBuilder::<UInt16Type>::with_capacity(capacity, 10, 100),
             timescale_id: StringDictionaryBuilder::<UInt32Type>::with_capacity(capacity, 10, 100),
@@ -545,8 +185,8 @@ impl SpaceTimestampBuilder {
 
     /// Appends a single row of space-time data to the internal builders.
     ///
-    /// If the provided `frame_id` matches a local name in the builder's `FrameRegistry`,
-    /// it will automatically be qualified with the registry's namespace prefix.
+    /// `frame_id` and `source_id` are stored verbatim; supply fully-qualified identifiers.
+    ///
     /// # Covariance convention
     ///
     /// Both covariance fields store the **upper triangle, row-major** of the corresponding
@@ -567,32 +207,10 @@ impl SpaceTimestampBuilder {
         position_covariance: Option<[f64; 6]>,
         orientation_covariance: Option<[f64; 6]>,
     ) {
-        let final_frame_id = if let Some(ref reg) = self.registry {
-            let qualified = reg.qualify(frame_id);
-            if reg.frames.contains_key(&qualified) {
-                qualified
-            } else {
-                frame_id.to_string()
-            }
-        } else {
-            frame_id.to_string()
-        };
-
-        let final_source_id = if let Some(ref reg) = self.registry {
-            // Check if it already looks like a UUID or a qualified string
-            if source_id.contains(':') || source_id.len() >= 32 {
-                source_id.to_string()
-            } else {
-                reg.qualify(source_id)
-            }
-        } else {
-            source_id.to_string()
-        };
-
-        self.frame_id.append_value(&final_frame_id);
+        self.frame_id.append_value(frame_id);
         self.units_pos.append_value(units_pos);
         self.timescale_id.append_value(timescale_id);
-        self.source_id.append_value(&final_source_id);
+        self.source_id.append_value(source_id);
         self.estimate_type.append_value(estimate_type);
 
         for p in position {
@@ -614,10 +232,9 @@ impl SpaceTimestampBuilder {
 
     /// Consumes the buffered data and returns an Arrow [`RecordBatch`].
     ///
-    /// This automatically builds the canonical schema (including the serialized
-    /// `FrameRegistry` metadata) and packages the arrays.
+    /// This automatically builds the canonical schema and packages the arrays.
     pub fn flush(&mut self) -> RecordBatch {
-        let schema = sts_schema(self.registry.as_ref());
+        let schema = sts_schema();
         RecordBatch::try_new(
             schema,
             vec![
@@ -642,7 +259,7 @@ impl SpaceTimestampBuilder {
     /// This is useful for embedding the SpaceTimestamp data as a single nested
     /// column within a larger Arrow schema.
     pub fn finish_as_struct(&mut self) -> StructArray {
-        let schema = sts_schema(self.registry.as_ref());
+        let schema = sts_schema();
         let fields = schema.fields().clone();
         let arrays: Vec<Arc<dyn Array>> = vec![
             Arc::new(self.frame_id.finish()),
@@ -668,7 +285,7 @@ impl SpaceTimestampBuilder {
 pub fn export_sts_schema_to_file<P: AsRef<std::path::Path>>(
     path: P,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let schema = sts_schema(None);
+    let schema = sts_schema();
     let file = std::fs::File::create(path)?;
     let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &schema)?;
     writer.finish()?;
@@ -688,7 +305,7 @@ mod tests {
 
         let start = Instant::now();
         let num_records = 100_000;
-        let mut builder = SpaceTimestampBuilder::new(num_records, None);
+        let mut builder = SpaceTimestampBuilder::new(num_records);
 
         for i in 0..num_records {
             builder.append_spacetimestamp(
@@ -721,7 +338,7 @@ mod tests {
 
     #[test]
     fn test_schema_definition() {
-        let s = sts_schema(None);
+        let s = sts_schema();
         assert_eq!(s.fields().len(), 11);
 
         let frame_field = s.field_with_name("frame_id").unwrap();
@@ -764,7 +381,7 @@ mod tests {
     fn test_recordbatch_generation_and_sampling() {
         use arrow::array::{FixedSizeListArray, Float64Array};
 
-        let mut builder = SpaceTimestampBuilder::new(10, None);
+        let mut builder = SpaceTimestampBuilder::new(10);
 
         // Generate 10 rows
         for i in 0..10 {
@@ -832,7 +449,7 @@ mod tests {
         assert!(loaded_schema.field_with_name("frame_id").is_ok());
 
         // 3. Generate data using the loaded schema
-        let mut builder = SpaceTimestampBuilder::new(5, None);
+        let mut builder = SpaceTimestampBuilder::new(5);
         for i in 0..5 {
             builder.append_spacetimestamp(
                 "ICRF",
@@ -860,309 +477,5 @@ mod tests {
         let _ = std::fs::remove_file(file_path);
 
         Ok(())
-    }
-
-    #[test]
-    fn test_frame_registry_validation() {
-        let mut reg = FrameRegistry::new_with_namespace("test_ns");
-
-        // Valid Tree: arm -> base_link -> IAU_MARS
-        reg.add_frame(
-            "base_link",
-            "IAU_MARS",
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0, 0.0],
-        );
-        reg.add_frame("arm", "base_link", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
-        assert!(reg.validate().is_ok());
-
-        // Introduce a cycle: base_link parent becomes arm
-        reg.add_frame("base_link", "arm", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
-        assert!(reg.validate().is_err());
-    }
-
-    #[test]
-    fn test_schema_metadata_injection() {
-        let mut reg = FrameRegistry::new_with_namespace("robot_1");
-        reg.add_frame("cam", "ICRF", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
-
-        let schema = sts_schema(Some(&reg));
-        let metadata = schema.metadata();
-
-        assert!(metadata.contains_key(STS_REGISTRY_METADATA_KEY));
-        let json = metadata.get(STS_REGISTRY_METADATA_KEY).unwrap();
-
-        // Ensure we can deserialize it back
-        let recovered_reg = FrameRegistry::from_json(json).unwrap();
-        assert_eq!(recovered_reg.namespace, "robot_1");
-        assert!(recovered_reg.frames.contains_key("robot_1:cam"));
-    }
-
-    #[test]
-    fn test_list_and_contains() {
-        let mut reg = FrameRegistry::new_with_namespace("ns");
-        reg.add_frame("cam", "ICRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
-        reg.add_frame("lidar", "ICRF", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
-
-        let frames = reg.list_frames();
-        assert_eq!(frames.len(), 2);
-        assert!(reg.contains_frame("ns:cam"));
-        assert!(reg.contains_frame("ns:lidar"));
-        assert!(!reg.contains_frame("ns:unknown"));
-        assert_eq!(reg.namespace(), "ns");
-    }
-
-    #[test]
-    fn test_remove_frame() {
-        let mut reg = FrameRegistry::new_with_namespace("ns");
-        reg.add_frame("cam", "ICRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
-
-        assert!(reg.remove_frame("cam"));
-        assert!(!reg.contains_frame("ns:cam"));
-        assert!(reg.list_frames().is_empty());
-        // Removing again returns false
-        assert!(!reg.remove_frame("cam"));
-    }
-
-    #[test]
-    fn test_merge() {
-        let mut reg_a = FrameRegistry::new_with_namespace("ns_a");
-        let mut reg_b = FrameRegistry::new_with_namespace("ns_b");
-        reg_a.add_frame("cam", "ICRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
-        reg_b.add_frame("lidar", "ICRF", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
-
-        let merged = reg_a.merge(&reg_b).unwrap();
-        assert_eq!(merged.namespace(), "ns_a");
-        assert!(merged.contains_frame("ns_a:cam"));
-        assert!(merged.contains_frame("ns_b:lidar"));
-        assert_eq!(merged.list_frames().len(), 2);
-    }
-
-    #[test]
-    fn test_is_external_frame() {
-        let mut reg = FrameRegistry::new_with_namespace("ns");
-
-        // Static catalog entries
-        assert!(reg.is_external_frame("ICRF"));
-        assert!(reg.is_external_frame("GCRF"));
-        assert!(reg.is_external_frame("EME2000"));
-        assert!(reg.is_external_frame("Neptune"));
-        assert!(reg.is_external_frame("SSB"));
-
-        // IAU convention
-        assert!(reg.is_external_frame("IAU_EARTH"));
-        assert!(reg.is_external_frame("IAU_MARS"));
-
-        // Already fully qualified
-        assert!(reg.is_external_frame("ns:cam"));
-
-        // Local name — not external
-        assert!(!reg.is_external_frame("base_link"));
-        assert!(!reg.is_external_frame("cam"));
-
-        // User-registered custom external
-        reg.add_external_frame("NEPTUNE_IAU_CUSTOM");
-        assert!(reg.is_external_frame("NEPTUNE_IAU_CUSTOM"));
-    }
-
-    #[test]
-    fn test_add_frame_with_catalog_parents() {
-        let mut reg = FrameRegistry::new_with_namespace("ns");
-
-        // These should all be recognized as external and NOT be namespace-qualified
-        reg.add_frame("cam", "GCRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
-        reg.add_frame("antenna", "Neptune", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
-        reg.add_frame("sensor", "EME2000", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
-
-        assert_eq!(reg.frames["ns:cam"].parent_id, "GCRF");
-        assert_eq!(reg.frames["ns:antenna"].parent_id, "Neptune");
-        assert_eq!(reg.frames["ns:sensor"].parent_id, "EME2000");
-    }
-
-    #[test]
-    fn test_add_frame_with_custom_external() {
-        let mut reg = FrameRegistry::new_with_namespace("ns");
-        reg.add_external_frame("MISSION_FRAME_42");
-        reg.add_frame("cam", "MISSION_FRAME_42", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
-
-        assert_eq!(reg.frames["ns:cam"].parent_id, "MISSION_FRAME_42");
-    }
-
-    #[test]
-    fn test_merge_unions_extra_external_frames() {
-        let mut reg_a = FrameRegistry::new_with_namespace("ns_a");
-        let mut reg_b = FrameRegistry::new_with_namespace("ns_b");
-        reg_a.add_external_frame("FRAME_A");
-        reg_b.add_external_frame("FRAME_B");
-
-        let merged = reg_a.merge(&reg_b).unwrap();
-        assert!(merged.is_external_frame("FRAME_A"));
-        assert!(merged.is_external_frame("FRAME_B"));
-    }
-
-    #[test]
-    fn test_add_frame_validated_external_ok() {
-        let mut reg = FrameRegistry::new_with_namespace("ns");
-        let almanac = anise::almanac::Almanac::default();
-        // KNOWN_EXTERNAL_FRAMES entries — trusted without anise runtime call
-        assert!(
-            reg.add_frame_validated("cam", "Earth", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac)
-                .is_ok()
-        );
-        assert!(
-            reg.add_frame_validated(
-                "ant",
-                "ICRF",
-                [1.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0, 0.0],
-                &almanac
-            )
-            .is_ok()
-        );
-        assert!(
-            reg.add_frame_validated("sensor", "GCRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac)
-                .is_ok()
-        );
-        // IAU convention — trusted without anise runtime call
-        assert!(
-            reg.add_frame_validated("imu", "IAU_MARS", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac)
-                .is_ok()
-        );
-        assert_eq!(reg.frames["ns:cam"].parent_id, "Earth");
-        assert_eq!(reg.frames["ns:ant"].parent_id, "ICRF");
-    }
-
-    #[test]
-    fn test_add_frame_validated_extra_external_anise_check() {
-        let mut reg = FrameRegistry::new_with_namespace("ns");
-        let almanac = anise::almanac::Almanac::default();
-
-        // A valid name in anise's catalog, registered as extra_external — should pass
-        reg.add_external_frame("Earth");
-        assert!(
-            reg.add_frame_validated("cam", "Earth", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac)
-                .is_ok()
-        );
-
-        // An invalid name registered as extra_external — anise rejects it at validation time
-        reg.add_external_frame("NOT_A_REAL_FRAME");
-        let err = reg
-            .add_frame_validated(
-                "bad",
-                "NOT_A_REAL_FRAME",
-                [0.0; 3],
-                [1.0, 0.0, 0.0, 0.0],
-                &almanac,
-            )
-            .unwrap_err();
-        assert!(
-            err.contains("NOT_A_REAL_FRAME"),
-            "error should name the frame: {err}"
-        );
-        assert!(
-            !reg.frames.contains_key("ns:bad"),
-            "frame must not be inserted on failure"
-        );
-    }
-
-    #[test]
-    fn test_add_frame_validated_local_sibling_ok() {
-        let mut reg = FrameRegistry::new_with_namespace("ns");
-        let almanac = anise::almanac::Almanac::default();
-        reg.add_frame("base_link", "ICRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
-        // cam's parent "base_link" exists → should succeed
-        assert!(
-            reg.add_frame_validated(
-                "cam",
-                "base_link",
-                [1.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0, 0.0],
-                &almanac
-            )
-            .is_ok()
-        );
-        assert_eq!(reg.frames["ns:cam"].parent_id, "ns:base_link");
-    }
-
-    #[test]
-    fn test_add_frame_validated_local_sibling_missing() {
-        let mut reg = FrameRegistry::new_with_namespace("ns");
-        let almanac = anise::almanac::Almanac::default();
-        // "base_link" hasn't been added yet
-        let err = reg
-            .add_frame_validated("cam", "base_link", [0.0; 3], [1.0, 0.0, 0.0, 0.0], &almanac)
-            .unwrap_err();
-        assert!(
-            err.contains("base_link"),
-            "error should name the missing parent: {err}"
-        );
-        assert!(!reg.frames.contains_key("ns:cam"));
-    }
-
-    #[test]
-    fn test_merge_cycle_detected() {
-        let mut reg_a = FrameRegistry::new_with_namespace("ns_a");
-        let mut reg_b = FrameRegistry::new_with_namespace("ns_b");
-        // ns_a:frame_a → ns_b:frame_b (cross-registry reference; valid in isolation)
-        reg_a.add_frame("frame_a", "ns_b:frame_b", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
-        // ns_b:frame_b → ns_a:frame_a (creates a cycle when merged)
-        reg_b.add_frame("frame_b", "ns_a:frame_a", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
-
-        assert!(reg_a.validate().is_ok());
-        assert!(reg_b.validate().is_ok());
-        assert!(reg_a.merge(&reg_b).is_err());
-    }
-
-    #[test]
-    fn test_builder_auto_namespacing() {
-        let mut reg = FrameRegistry::new_with_namespace("robot_1");
-        reg.add_frame("cam", "ICRF", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
-
-        let mut builder = SpaceTimestampBuilder::new(10, Some(reg));
-
-        // Append using local name (should auto-namespace to "robot_1:cam")
-        builder.append_spacetimestamp(
-            "cam",
-            "m",
-            "TAI",
-            "cam_sensor_1",
-            "MEASURED",
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0, 0.0],
-            0,
-            0,
-            None,
-            None,
-        );
-
-        // Append using global/external name (should remain "ICRF")
-        builder.append_spacetimestamp(
-            "ICRF",
-            "m",
-            "TAI",
-            "cam_sensor_1",
-            "ESTIMATED",
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0, 0.0],
-            0,
-            0,
-            None,
-            None,
-        );
-
-        let batch = builder.flush();
-        let frame_col = batch.column_by_name("frame_id").unwrap();
-        let dict_array = frame_col
-            .as_any()
-            .downcast_ref::<arrow::array::DictionaryArray<UInt32Type>>()
-            .unwrap();
-        let values = dict_array
-            .values()
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
-
-        assert_eq!(values.value(dict_array.key(0).unwrap()), "robot_1:cam");
-        assert_eq!(values.value(dict_array.key(1).unwrap()), "ICRF");
     }
 }

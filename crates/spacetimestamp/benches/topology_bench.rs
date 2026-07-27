@@ -29,7 +29,7 @@ fn bench_schema() -> SchemaRef {
         ),
         Field::new(
             STS_COLUMN,
-            DataType::Struct(sts_schema(None).fields().clone()),
+            DataType::Struct(sts_schema().fields().clone()),
             false,
         ),
     ]))
@@ -37,7 +37,7 @@ fn bench_schema() -> SchemaRef {
 
 fn build_batch(rows: &[(String, &str, u64)]) -> RecordBatch {
     let mut ids = StringDictionaryBuilder::<UInt32Type>::new();
-    let mut sts = SpaceTimestampBuilder::new(rows.len(), None);
+    let mut sts = SpaceTimestampBuilder::new(rows.len());
     for (id, frame, ns) in rows {
         ids.append_value(id);
         sts.append_spacetimestamp(

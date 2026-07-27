@@ -73,7 +73,7 @@ pub fn celestial_snapshot(
     }
 
     let (centuries, ns) = epoch_to_parts(epoch);
-    let mut builder = EntityBuilder::new(bodies.len(), None);
+    let mut builder = EntityBuilder::new(bodies.len());
 
     for &body in bodies {
         let cs = query_celestial_state(almanac, body, epoch)?;
@@ -129,7 +129,7 @@ pub fn naif_snapshot(
     }
 
     let (centuries, ns) = epoch_to_parts(epoch);
-    let mut builder = EntityBuilder::new(bodies.len(), None);
+    let mut builder = EntityBuilder::new(bodies.len());
 
     for &(naif_id, entity_id) in bodies {
         let cs = query_naif_state(almanac, naif_id, epoch)
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn test_append_celestial_does_not_mutate_ledger_on_error() {
         let mut ledger =
-            crate::ledger::Ledger::new(&crate::schemas::entity::entity_schema(None), "entity_id")
+            crate::ledger::Ledger::new(&crate::schemas::entity::entity_schema(), "entity_id")
                 .unwrap();
         let almanac = Almanac::default();
         let epoch = j2000_tai();

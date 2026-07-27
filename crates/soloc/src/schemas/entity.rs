@@ -21,7 +21,7 @@ use alloc::sync::Arc;
 use arrow::array::{FixedSizeListBuilder, Float64Builder, StringDictionaryBuilder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt32Type};
 use arrow::record_batch::RecordBatch;
-use spacetimestamp::schema::{FrameRegistry, SpaceTimestampBuilder, sts_schema};
+use spacetimestamp::schema::{SpaceTimestampBuilder, sts_schema};
 
 use super::SolocSchema;
 
@@ -37,13 +37,13 @@ use super::SolocSchema;
 /// use soloc::schemas::entity::EntitySchema;
 /// use soloc::ledger::Ledger;
 ///
-/// let ledger = Ledger::for_schema::<EntitySchema>(None)?;
+/// let ledger = Ledger::for_schema::<EntitySchema>()?;
 /// ```
 pub struct EntitySchema;
 
 impl SolocSchema for EntitySchema {
-    fn schema(registry: Option<&FrameRegistry>) -> SchemaRef {
-        entity_schema(registry)
+    fn schema() -> SchemaRef {
+        entity_schema()
     }
     fn id_column() -> &'static str {
         "entity_id"
@@ -60,8 +60,8 @@ impl SolocSchema for EntitySchema {
 /// 1. Static IoT Sensors (only `spacetimestamp` populated).
 /// 2. Planets/Spacecraft (populate `velocity` and `mass_kg`).
 /// 3. Drones/Robots (populate `velocity`, `angular_velocity`, and `acceleration`).
-pub fn entity_schema(registry: Option<&FrameRegistry>) -> SchemaRef {
-    let sts = sts_schema(registry);
+pub fn entity_schema() -> SchemaRef {
+    let sts = sts_schema();
 
     Arc::new(Schema::new(vec![
         // Federated entity ID (e.g., "nasa.gov:perseverance" or "naif:499" for Mars)
@@ -112,7 +112,6 @@ pub fn entity_schema(registry: Option<&FrameRegistry>) -> SchemaRef {
 
 /// An efficient builder for creating [`RecordBatch`]es following the Entity schema.
 pub struct EntityBuilder {
-    registry: Option<FrameRegistry>,
     entity_id: StringDictionaryBuilder<UInt32Type>,
     sts_builder: SpaceTimestampBuilder,
     velocity: FixedSizeListBuilder<Float64Builder>,
@@ -124,11 +123,10 @@ pub struct EntityBuilder {
 
 impl EntityBuilder {
     /// Creates a new EntityBuilder pre-allocated for the given capacity.
-    pub fn new(capacity: usize, registry: Option<FrameRegistry>) -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self {
-            registry: registry.clone(),
             entity_id: StringDictionaryBuilder::<UInt32Type>::with_capacity(capacity, 10, 100),
-            sts_builder: SpaceTimestampBuilder::new(capacity, registry),
+            sts_builder: SpaceTimestampBuilder::new(capacity),
             velocity: FixedSizeListBuilder::new(Float64Builder::with_capacity(capacity * 3), 3),
             angular_velocity: FixedSizeListBuilder::new(
                 Float64Builder::with_capacity(capacity * 3),
@@ -245,7 +243,7 @@ impl EntityBuilder {
 
     /// Consumes the buffered data and returns an Arrow [`RecordBatch`].
     pub fn flush(&mut self) -> RecordBatch {
-        let schema = entity_schema(self.registry.as_ref());
+        let schema = entity_schema();
         let sts_struct_array = self.sts_builder.finish_as_struct();
 
         RecordBatch::try_new(
@@ -272,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_entity_schema_definition() {
-        let schema = entity_schema(None);
+        let schema = entity_schema();
         assert_eq!(schema.fields().len(), 7);
 
         let entity_id = schema.field_with_name("entity_id").unwrap();
@@ -293,14 +291,14 @@ mod tests {
 
     #[test]
     fn test_entity_schema_impl() {
-        let schema = EntitySchema::schema(None);
+        let schema = EntitySchema::schema();
         assert_eq!(EntitySchema::id_column(), "entity_id");
         assert!(schema.field_with_name("spacetimestamp").is_ok());
     }
 
     #[test]
     fn test_entity_builder_flush() {
-        let mut builder = EntityBuilder::new(10, None);
+        let mut builder = EntityBuilder::new(10);
 
         builder.append_entity(
             "naif:399",
@@ -345,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_entity_batch_validation() {
-        let mut builder = EntityBuilder::new(10, None);
+        let mut builder = EntityBuilder::new(10);
         builder.append_entity(
             "naif:399",
             "ICRF",
@@ -368,7 +366,7 @@ mod tests {
         let sts_col = batch.column_by_name("spacetimestamp").unwrap();
         let struct_array = sts_col.as_any().downcast_ref::<StructArray>().unwrap();
         let temp_batch =
-            RecordBatch::try_new(sts_schema(None), struct_array.columns().to_vec()).unwrap();
+            RecordBatch::try_new(sts_schema(), struct_array.columns().to_vec()).unwrap();
 
         assert!(validate_spacetimestamp_batch(&temp_batch).is_ok());
     }

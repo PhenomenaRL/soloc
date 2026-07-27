@@ -188,16 +188,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let schema_path = cfg.storage.schema_path.map(PathBuf::from);
     let id_column = cfg.storage.id_column;
 
-    let state = Arc::new(
-        ServerState::new(
-            almanac,
-            ledger_path,
-            ledger_url,
-            schema_path,
-            id_column,
-        )
-        .await,
-    );
+    let state =
+        Arc::new(ServerState::new(almanac, ledger_path, ledger_url, schema_path, id_column).await);
     let service = SolocFlightService::new(state.clone());
 
     // SIGTERM handler: drain in-flight requests then save the ledger.

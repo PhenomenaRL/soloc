@@ -150,7 +150,7 @@ fn new_empty_ledger(schema_path: &Option<PathBuf>, id_column: &str) -> Ledger {
         }
     }
 
-    Ledger::new(&entity_schema(None), id_column)
+    Ledger::new(&entity_schema(), id_column)
         .expect("entity_schema is always valid for 'spacetimestamp'/'entity_id'")
 }
 

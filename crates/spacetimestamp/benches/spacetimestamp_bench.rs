@@ -2,8 +2,9 @@ use anise::prelude::Almanac;
 use arrow::datatypes::{DataType, Field, Schema};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hifitime::{Duration, Epoch};
+use nalgebra::{Isometry3, Translation3, UnitQuaternion};
 use spacetimestamp::query::{SpatiotemporalFilter, filter_batch};
-use spacetimestamp::schema::{FrameRegistry, SpaceTimestampBuilder, sts_schema};
+use spacetimestamp::schema::{SpaceTimestampBuilder, sts_schema};
 use spacetimestamp::transforms::{normalize_batch_to_tai, transform_batch};
 use spacetimestamp::validation::validate_spacetimestamp_batch;
 use std::hint::black_box;
@@ -20,7 +21,7 @@ fn finish_as_wrapped_batch(
     builder: &mut SpaceTimestampBuilder,
 ) -> arrow::record_batch::RecordBatch {
     let struct_array = builder.finish_as_struct();
-    let sts_ref = sts_schema(None);
+    let sts_ref = sts_schema();
     let schema = Arc::new(
         Schema::new(vec![Field::new(
             "spacetimestamp",
@@ -35,7 +36,7 @@ fn finish_as_wrapped_batch(
 /// Build a batch of n_rows on a full LEO orbit, each row 1ms apart.
 /// All rows are in ICRF to satisfy the frame-uniformity requirement for spatial filters.
 fn make_filter_bench_batch(n_rows: usize) -> arrow::record_batch::RecordBatch {
-    let mut builder = SpaceTimestampBuilder::new(n_rows, None);
+    let mut builder = SpaceTimestampBuilder::new(n_rows);
     for i in 0..n_rows {
         let angle = (i as f64) * 2.0 * std::f64::consts::PI / (n_rows as f64);
         builder.append_spacetimestamp(
@@ -109,21 +110,17 @@ fn bench_filter_batch_combined(c: &mut Criterion) {
 fn bench_validation(c: &mut Criterion) {
     let num_records = 100_000;
 
-    // Set up a FrameRegistry with a couple of custom frames
-    let mut reg = FrameRegistry::new_with_namespace("bench_robot");
-    reg.add_frame("cam", "ICRF", [0.0; 3], [1.0, 0.0, 0.0, 0.0]);
-    reg.add_frame("arm", "cam", [1.0; 3], [1.0, 0.0, 0.0, 0.0]);
+    let mut builder = SpaceTimestampBuilder::new(num_records);
 
-    let mut builder = SpaceTimestampBuilder::new(num_records, Some(reg));
-
-    // Create a batch of 100,000 records containing a mix of standard and local frames
+    // Create a batch of 100,000 records mixing an astronomical root with entity-URI frames,
+    // so the validator exercises both the anise path and the entity-URI path.
     for i in 0..num_records {
         let frame = if i % 3 == 0 {
             "ICRF"
         } else if i % 3 == 1 {
-            "cam"
+            "bench_robot:cam"
         } else {
-            "arm"
+            "bench_robot:arm"
         };
         let timescale = if i % 2 == 0 { "TAI" } else { "UTC" };
 
@@ -157,7 +154,7 @@ fn bench_ingestion(c: &mut Criterion) {
     for n_rows in [1_000usize, 10_000, 100_000] {
         group.bench_with_input(BenchmarkId::new("rows", n_rows), &n_rows, |b, &n| {
             b.iter(|| {
-                let mut builder = SpaceTimestampBuilder::new(n, None);
+                let mut builder = SpaceTimestampBuilder::new(n);
                 for i in 0..n {
                     builder.append_spacetimestamp(
                         "ICRF",
@@ -180,15 +177,12 @@ fn bench_ingestion(c: &mut Criterion) {
     group.finish();
 }
 
-fn make_transform_bench_batch(
-    n_rows: usize,
-    reg: &FrameRegistry,
-) -> arrow::record_batch::RecordBatch {
-    let mut builder = SpaceTimestampBuilder::new(n_rows, Some(reg.clone()));
+fn make_transform_bench_batch(n_rows: usize) -> arrow::record_batch::RecordBatch {
+    let mut builder = SpaceTimestampBuilder::new(n_rows);
     for i in 0..n_rows {
         builder.append_spacetimestamp(
-            "arm",
-            "m",
+            "bot:arm",
+            "km",
             "TAI",
             "s",
             "MEASURED",
@@ -200,34 +194,41 @@ fn make_transform_bench_batch(
             None,
         );
     }
-    // Must embed the registry in schema metadata so transform_batch can resolve the chain.
     let struct_array = builder.finish_as_struct();
-    let sts_ref = sts_schema(Some(reg));
-    let schema = Arc::new(
-        Schema::new(vec![Field::new(
-            "spacetimestamp",
-            DataType::Struct(sts_ref.fields().clone()),
-            false,
-        )])
-        .with_metadata(sts_ref.metadata().clone()),
-    );
+    let sts_ref = sts_schema();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "spacetimestamp",
+        DataType::Struct(sts_ref.fields().clone()),
+        false,
+    )]));
     arrow::record_batch::RecordBatch::try_new(schema, vec![Arc::new(struct_array)]).unwrap()
 }
 
 fn bench_transform_batch(c: &mut Criterion) {
-    // Two-hop static chain: arm → base_link → Earth.
-    // Almanac::default() suffices because source and target share the same astronomical root.
-    let mut reg = FrameRegistry::new_with_namespace("bot");
-    reg.add_frame("base_link", "Earth", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
-    reg.add_frame("arm", "base_link", [0.5, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
+    // A resolved two-hop chain (arm → base_link → Earth) arrives pre-composed, exactly as
+    // Ledger::resolve_to_root supplies it. Almanac::default() suffices because source and
+    // target share the same astronomical root.
+    // Every row shares one frame and one epoch, so the resolver memo in transform_batch is
+    // hit for all but the first row — this measures the per-row transform, not resolution.
     let almanac = Almanac::default();
+    let placed =
+        Isometry3::from_parts(Translation3::new(1.5, 0.0, 0.0), UnitQuaternion::identity());
+    let resolver =
+        |frame: &str, _epoch: Epoch| (frame == "bot:arm").then(|| ("Earth".to_string(), placed));
 
-    let mut group = c.benchmark_group("transform_batch_static");
+    let mut group = c.benchmark_group("transform_batch_resolved");
     for n_rows in [100usize, 1_000, 10_000] {
-        let batch = make_transform_bench_batch(n_rows, &reg);
+        let batch = make_transform_bench_batch(n_rows);
         group.bench_with_input(BenchmarkId::new("rows", n_rows), &n_rows, |b, _| {
             b.iter(|| {
-                transform_batch(black_box(&batch), "Earth", black_box(&almanac), "m", None).unwrap()
+                transform_batch(
+                    black_box(&batch),
+                    "Earth",
+                    black_box(&almanac),
+                    "km",
+                    Some(&resolver),
+                )
+                .unwrap()
             })
         });
     }
@@ -235,7 +236,7 @@ fn bench_transform_batch(c: &mut Criterion) {
 }
 
 fn make_normalize_bench_batch(n_rows: usize) -> arrow::record_batch::RecordBatch {
-    let mut builder = SpaceTimestampBuilder::new(n_rows, None);
+    let mut builder = SpaceTimestampBuilder::new(n_rows);
     for i in 0..n_rows {
         let ts = if i % 2 == 0 { "TAI" } else { "UTC" };
         builder.append_spacetimestamp(
