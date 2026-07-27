@@ -7,6 +7,10 @@ updates:
     groups:
       arrow:
         patterns: ["arrow*"]
+      # anise's nalgebra types cross our API boundary, so the two must be
+      # bumped in lockstep to avoid duplicate nalgebra versions in the tree.
+      anise:
+        patterns: ["anise", "nalgebra"]
       minor-and-patch:
         update-types: ["minor", "patch"]
   - package-ecosystem: github-actions
