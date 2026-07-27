@@ -41,6 +41,7 @@ use anise::prelude::Almanac;
 use spacetimestamp::ephemeris::j2000_tai;
 use spacetimestamp::query::{SpatiotemporalFilter, filter_batch};
 use spacetimestamp::schema::{FrameRegistry, STS_COLUMN, is_entity_uri};
+use spacetimestamp::topology::TransformTree;
 use spacetimestamp::transforms::{normalize_batch_to_tai, transform_batch};
 use spacetimestamp::validation::validate_spacetimestamp_batch;
 
@@ -77,6 +78,28 @@ pub struct Ledger {
     batches: Vec<RecordBatch>,
     /// Name of the entity-identity column (e.g. `"entity_id"`). Empty string = no id column.
     id_column: String,
+    /// Parent graph derived from appended rows. Topology only — never a pose value.
+    transform_tree: TransformTree,
+    /// Highest-epoch pose seen for each entity, so the common "where is X now" lookup
+    /// does not have to scan every batch. See [`LatestPose`].
+    latest_pose: HashMap<String, LatestPose>,
+}
+
+/// The most recent pose ingested for one entity — the pose cache backing
+/// [`Ledger::resolve_frame_at`]'s fast path.
+///
+/// Populated in [`Ledger::append`] from the winning row indices `ingest_batch` already
+/// computed, so maintaining it costs k targeted reads per append rather than a second
+/// full scan. `epoch` is the highest epoch *ever ingested* for the entity, which is what
+/// makes the fast path sound: a query at or after `epoch` cannot have a newer row to find.
+#[derive(Debug, Clone)]
+struct LatestPose {
+    /// The `frame_id` the pose is expressed in — another entity URI, or an astronomical frame.
+    parent_frame_id: String,
+    /// The pose itself, normalised to kilometres.
+    isometry_km: Isometry3<f64>,
+    /// Offset from the J2000 TAI epoch.
+    epoch: Duration,
 }
 
 impl Ledger {
@@ -89,6 +112,8 @@ impl Ledger {
             schema: schema.clone(),
             batches: Vec::new(),
             id_column: id_column.to_string(),
+            transform_tree: TransformTree::new(),
+            latest_pose: HashMap::new(),
         })
     }
 
@@ -209,9 +234,89 @@ impl Ledger {
     pub fn append(&mut self, batch: RecordBatch) -> Result<(), String> {
         validate_spacetimestamp_batch(&batch)?;
         let normalized = normalize_batch_to_tai(&batch)?;
+
+        // Topology is derived from the *normalised* rows so every epoch compared is on the
+        // TAI scale. A batch that would introduce a cycle, or that names a frame which
+        // cannot exist, is rejected as a whole; `ingest_batch` stages its edges internally,
+        // so a rejected batch leaves the tree untouched and nothing is pushed below.
+        let outcome = self
+            .transform_tree
+            .ingest_batch(&normalized, &self.id_column)?;
+        self.update_pose_cache(&normalized, outcome.latest_rows);
+
         self.batches.push(normalized);
         self.seal_and_flush_if_needed();
         Ok(())
+    }
+
+    /// Rebuilds `transform_tree` and `latest_pose` from the batches already in `self`.
+    ///
+    /// Both are pure functions of the stored rows, so nothing extra has to be persisted —
+    /// a load simply replays the batches through the same path [`Ledger::append`] uses.
+    /// The batches were normalised to TAI before being stored, so they are ingested as-is.
+    ///
+    /// Errors if the stored data contains a cycle, which a ledger built through `append`
+    /// cannot produce; a file that trips this was written by something that bypassed it.
+    fn rebuild_derived_state(&mut self) -> Result<(), String> {
+        if self.id_column.is_empty() || self.batches.is_empty() {
+            return Ok(());
+        }
+        // Moved out so the ingest below can borrow the batches while mutating self.
+        let batches = std::mem::take(&mut self.batches);
+        let result = (|| {
+            for batch in &batches {
+                let outcome = self.transform_tree.ingest_batch(batch, &self.id_column)?;
+                self.update_pose_cache(batch, outcome.latest_rows);
+            }
+            Ok(())
+        })();
+        self.batches = batches;
+        result
+    }
+
+    /// Drops the pose cache, forcing [`Ledger::resolve_frame_at`] down its scan path.
+    /// Test-only: lets a test compare the fast path against the fallback.
+    #[cfg(test)]
+    fn clear_pose_cache(&mut self) {
+        self.latest_pose.clear();
+    }
+
+    /// Refreshes the pose cache from the winning row indices `ingest_batch` already found.
+    ///
+    /// Costs k targeted reads (k = distinct ids in the batch), not a second pass over the
+    /// rows. `latest_rows` is taken by value so its keys move into the cache rather than
+    /// being reallocated — the per-entity term dominates append cost at high entity counts.
+    fn update_pose_cache(&mut self, batch: &RecordBatch, latest_rows: HashMap<String, usize>) {
+        if latest_rows.is_empty() {
+            return;
+        }
+        let Some(cols) = PoseColumns::try_new(batch, &self.id_column) else {
+            return;
+        };
+
+        for (id, row) in latest_rows {
+            let epoch = cols.epoch_at(row);
+            // Strictly-greater, so an equal epoch keeps the entry already cached. This
+            // matches resolve_frame_at's scan, which walks batches in insertion order and
+            // only replaces its best on a strictly later row — the two must never disagree.
+            // It also means a backfilled older batch cannot clobber a newer cached pose.
+            if self
+                .latest_pose
+                .get(&id)
+                .is_some_and(|cached| epoch <= cached.epoch)
+            {
+                continue;
+            }
+            let (parent_frame_id, isometry_km) = cols.pose_at(row);
+            self.latest_pose.insert(
+                id,
+                LatestPose {
+                    parent_frame_id,
+                    isometry_km,
+                    epoch,
+                },
+            );
+        }
     }
 
     /// Merges all batches into one when the batch count exceeds [`SEGMENT_THRESHOLD`].
@@ -356,23 +461,26 @@ impl Ledger {
         target_units: &str,
         almanac: &Almanac,
     ) -> Result<RecordBatch, String> {
-        let epoch = epoch_from_batch(batch);
-        let uri_frames = collect_uri_frames(batch);
+        // Only pay for a resolver if the batch actually references entity frames.
+        if collect_uri_frames(batch).is_empty() {
+            return transform_batch(batch, target_frame, almanac, target_units, None);
+        }
 
-        let dynamic_frames = if uri_frames.is_empty() {
-            None
-        } else {
-            let ids: Vec<&str> = uri_frames.iter().map(|s| s.as_str()).collect();
-            Some(self.build_dynamic_frame_map(&ids, epoch)?)
-        };
+        // Each row resolves against its own epoch rather than one epoch for the whole
+        // batch, so a batch spanning several timesteps is projected correctly.
+        let resolver = |frame: &str, epoch: Epoch| self.resolve_to_root(frame, epoch);
+        transform_batch(batch, target_frame, almanac, target_units, Some(&resolver))
+    }
 
-        transform_batch(
-            batch,
-            target_frame,
-            almanac,
-            target_units,
-            dynamic_frames.as_ref(),
-        )
+    /// Resolves one entity frame to `(astronomical_root, isometry_km)` at `epoch`.
+    ///
+    /// The single-frame form of [`Ledger::build_dynamic_frame_map`], shaped for use as
+    /// [`spacetimestamp::transforms::transform_batch`]'s resolver. Returns `None` when the
+    /// chain cannot be resolved — `transform_batch` reports that as a frame error.
+    pub fn resolve_to_root(&self, frame: &str, epoch: Epoch) -> Option<(String, Isometry3<f64>)> {
+        let mut resolved = HashMap::new();
+        self.resolve_chain(frame, epoch, &mut resolved).ok()?;
+        resolved.remove(frame)
     }
 
     /// Returns the pose of `entity_id` at the latest timestamp ≤ `epoch` as an
@@ -380,6 +488,9 @@ impl Ledger {
     ///
     /// Returns `None` if this ledger has no `id_column`, or if the entity has no entry
     /// at or before `epoch`.
+    ///
+    /// O(1) for the common case — a query at or after the entity's most recent row — via
+    /// the pose cache. Genuinely historical queries still scan every batch.
     pub fn resolve_frame_at(
         &self,
         entity_id: &str,
@@ -391,102 +502,31 @@ impl Ledger {
 
         let target_dur = epoch - j2000_tai();
 
+        // Fast path. The cached epoch is the highest ever ingested for this entity, so if
+        // it is already at or before the query there cannot be a later row to find, and
+        // the scan below would settle on exactly this pose.
+        if let Some(cached) = self.latest_pose.get(entity_id)
+            && cached.epoch <= target_dur
+        {
+            return Some((cached.parent_frame_id.clone(), cached.isometry_km));
+        }
+
+        // Slow path: the query predates the entity's latest row, or the cache was never
+        // populated (a ledger loaded from IPC).
         let mut best_dur: Option<Duration> = None;
         let mut best: Option<(String, Isometry3<f64>)> = None;
 
         for batch in &self.batches {
-            let Some(eid_raw) = batch.column_by_name(&self.id_column) else {
-                continue;
-            };
-            let Some(eid_col) = eid_raw
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt32Type>>()
-            else {
-                continue;
-            };
-            let Some(eid_dict) = eid_col.values().as_any().downcast_ref::<StringArray>() else {
-                continue;
-            };
-
-            let Some(sts_raw) = batch.column_by_name(STS_COLUMN) else {
-                continue;
-            };
-            let Some(sts) = sts_raw.as_any().downcast_ref::<StructArray>() else {
-                continue;
-            };
-
-            let Some(frame_raw) = sts.column_by_name("frame_id") else {
-                continue;
-            };
-            let Some(frame_col) = frame_raw
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt32Type>>()
-            else {
-                continue;
-            };
-            let Some(frame_dict) = frame_col.values().as_any().downcast_ref::<StringArray>() else {
-                continue;
-            };
-
-            let Some(units_raw) = sts.column_by_name("units_pos") else {
-                continue;
-            };
-            let Some(units_col) = units_raw
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt16Type>>()
-            else {
-                continue;
-            };
-            let Some(units_dict) = units_col.values().as_any().downcast_ref::<StringArray>() else {
-                continue;
-            };
-
-            let Some(pos_raw) = sts.column_by_name("position") else {
-                continue;
-            };
-            let Some(pos_list) = pos_raw.as_any().downcast_ref::<FixedSizeListArray>() else {
-                continue;
-            };
-            let Some(pos_vals) = pos_list.values().as_any().downcast_ref::<Float64Array>() else {
-                continue;
-            };
-            let pos_offset = pos_list.offset();
-
-            let Some(quat_raw) = sts.column_by_name("quaternion") else {
-                continue;
-            };
-            let Some(quat_list) = quat_raw.as_any().downcast_ref::<FixedSizeListArray>() else {
-                continue;
-            };
-            let Some(quat_vals) = quat_list.values().as_any().downcast_ref::<Float64Array>() else {
-                continue;
-            };
-            let quat_offset = quat_list.offset();
-
-            let Some(cent_raw) = sts.column_by_name("duration_centuries") else {
-                continue;
-            };
-            let Some(cent_arr) = cent_raw.as_any().downcast_ref::<Int16Array>() else {
-                continue;
-            };
-
-            let Some(ns_raw) = sts.column_by_name("duration_ns") else {
-                continue;
-            };
-            let Some(ns_arr) = ns_raw.as_any().downcast_ref::<UInt64Array>() else {
+            let Some(cols) = PoseColumns::try_new(batch, &self.id_column) else {
                 continue;
             };
 
             for i in 0..batch.num_rows() {
-                let eid = eid_dict.value(eid_col.keys().value(i) as usize);
-                if eid != entity_id {
+                if cols.id_at(i) != entity_id {
                     continue;
                 }
 
-                let centuries = cent_arr.value(i);
-                let ns = ns_arr.value(i);
-                let row_dur = Duration::from_parts(centuries, ns);
-
+                let row_dur = cols.epoch_at(i);
                 if row_dur > target_dur {
                     continue;
                 }
@@ -494,33 +534,8 @@ impl Ledger {
                     continue;
                 }
 
-                let units = units_dict.value(units_col.keys().value(i) as usize);
-                let to_km: f64 = match units.to_lowercase().as_str() {
-                    "m" | "meters" | "meter" => 0.001,
-                    "au" => 149_597_870.7,
-                    _ => 1.0,
-                };
-
-                let pb = (pos_offset + i) * 3;
-                let translation = Translation3::new(
-                    pos_vals.value(pb) * to_km,
-                    pos_vals.value(pb + 1) * to_km,
-                    pos_vals.value(pb + 2) * to_km,
-                );
-
-                let qb = (quat_offset + i) * 4;
-                let rotation = UnitQuaternion::from_quaternion(Quaternion::new(
-                    quat_vals.value(qb),
-                    quat_vals.value(qb + 1),
-                    quat_vals.value(qb + 2),
-                    quat_vals.value(qb + 3),
-                ));
-
-                let frame_id = frame_dict
-                    .value(frame_col.keys().value(i) as usize)
-                    .to_string();
                 best_dur = Some(row_dur);
-                best = Some((frame_id, Isometry3::from_parts(translation, rotation)));
+                best = Some(cols.pose_at(i));
             }
         }
 
@@ -528,6 +543,9 @@ impl Ledger {
     }
 
     /// Builds a dynamic frame map for use with [`spacetimestamp::transforms::transform_batch`].
+    ///
+    /// Maps each requested entity — and every ancestor resolved along the way — to the
+    /// astronomical frame its chain terminates in, plus the isometry taking it there.
     pub fn build_dynamic_frame_map(
         &self,
         entity_ids: &[&str],
@@ -535,43 +553,63 @@ impl Ledger {
     ) -> Result<HashMap<String, (String, Isometry3<f64>)>, String> {
         let mut result = HashMap::new();
         for &id in entity_ids {
+            // Ancestors get memoised by the walk below, so a later id sharing a chain
+            // with an earlier one costs nothing.
             if !result.contains_key(id) {
-                self.resolve_chain(id, epoch, &mut result, &mut HashSet::new())?;
+                self.resolve_chain(id, epoch, &mut result)?;
             }
         }
         Ok(result)
     }
 
+    /// Resolves one entity's chain to its astronomical root, memoising every hop.
+    ///
+    /// Structure comes from `transform_tree` (which is where cycle detection now lives);
+    /// this only performs the per-hop numeric lookups and composes them.
     fn resolve_chain(
         &self,
         entity_id: &str,
         epoch: Epoch,
         result: &mut HashMap<String, (String, Isometry3<f64>)>,
-        visiting: &mut HashSet<String>,
     ) -> Result<(), String> {
-        if result.contains_key(entity_id) {
-            return Ok(());
-        }
-        if !visiting.insert(entity_id.to_string()) {
-            return Err(format!(
-                "Cycle detected in entity frame chain involving '{entity_id}'"
-            ));
-        }
+        let chain = self
+            .transform_tree
+            .resolve_chain(entity_id, epoch - j2000_tai())?;
 
-        let (parent_frame, iso) = self.resolve_frame_at(entity_id, epoch).ok_or_else(|| {
-            format!("Entity '{entity_id}' not found in ledger at or before {epoch}")
-        })?;
+        // `resolve_chain` always returns at least [entity, terminal]: the last element is
+        // the astronomical root, everything before it is an entity needing a pose lookup.
+        let Some((root, hops)) = chain.split_last() else {
+            return Err(format!("Empty frame chain for '{entity_id}'"));
+        };
 
-        if spacetimestamp::schema::is_entity_uri(&parent_frame) {
-            self.resolve_chain(&parent_frame, epoch, result, visiting)?;
-            let (root_frame, parent_iso) = result[&parent_frame].clone();
-            result.insert(entity_id.to_string(), (root_frame, parent_iso * iso));
-        } else {
-            result.insert(entity_id.to_string(), (parent_frame, iso));
+        // Walk inward from the root so each hop composes onto its parent's accumulated pose.
+        let mut acc = Isometry3::identity();
+        for node in hops.iter().rev() {
+            let (_, iso) = self.resolve_frame_at(node, epoch).ok_or_else(|| {
+                format!("Entity '{node}' not found in ledger at or before {epoch}")
+            })?;
+            acc *= iso;
+            result.insert(node.clone(), (root.clone(), acc));
         }
-
-        visiting.remove(entity_id);
         Ok(())
+    }
+
+    /// Exports this ledger's full topology history as a [`RecordBatch`] for federation.
+    ///
+    /// Follows [`spacetimestamp::topology::topology_schema`]. The whole event log is
+    /// exported, not just the current parenting, so a recipient can replay history.
+    pub fn export_topology(&self) -> Result<RecordBatch, String> {
+        self.transform_tree.to_log_batch()
+    }
+
+    /// Merges a topology log exported by [`Ledger::export_topology`] (possibly by a
+    /// federated peer) into this ledger's tree. Returns the number of events applied.
+    ///
+    /// Rejected as a whole if the merged result would contain a cycle. This affects
+    /// topology only — no poses are added, so an edge merged for an entity this ledger
+    /// holds no rows for will resolve structurally but fail the numeric lookup.
+    pub fn merge_topology(&mut self, batch: &RecordBatch) -> Result<usize, String> {
+        self.transform_tree.merge_log_batch(batch)
     }
 
     /// Merges all batches into a single [`RecordBatch`] for serialisation.
@@ -653,6 +691,8 @@ impl Ledger {
             schema,
             batches: Vec::new(),
             id_column: id_column.to_string(),
+            transform_tree: TransformTree::new(),
+            latest_pose: HashMap::new(),
         })
     }
 
@@ -687,6 +727,8 @@ impl Ledger {
             schema,
             batches: Vec::new(),
             id_column: id_column.to_string(),
+            transform_tree: TransformTree::new(),
+            latest_pose: HashMap::new(),
         })
     }
 
@@ -883,11 +925,15 @@ impl Ledger {
             return Err("IPC file contained no record batches".to_string());
         }
 
-        Ok(Self {
+        let mut ledger = Self {
             schema,
             batches,
             id_column: id_column.to_string(),
-        })
+            transform_tree: TransformTree::new(),
+            latest_pose: HashMap::new(),
+        };
+        ledger.rebuild_derived_state()?;
+        Ok(ledger)
     }
 
     /// Serializes all batches to an in-memory Arrow IPC buffer.
@@ -931,11 +977,146 @@ impl Ledger {
         if batches.is_empty() {
             return Err("IPC bytes contained no record batches".to_string());
         }
-        Ok(Self {
+        let mut ledger = Self {
             schema,
             batches,
             id_column: id_column.to_string(),
+            transform_tree: TransformTree::new(),
+            latest_pose: HashMap::new(),
+        };
+        ledger.rebuild_derived_state()?;
+        Ok(ledger)
+    }
+}
+
+/// The identity and pose columns of one batch, located once instead of once per row.
+///
+/// Shared by [`Ledger::resolve_frame_at`]'s scan and [`Ledger::update_pose_cache`] so the
+/// two can never drift in how they read a row. Every accessor is indexed by row number.
+struct PoseColumns<'a> {
+    id_keys: &'a DictionaryArray<UInt32Type>,
+    id_values: &'a StringArray,
+    frame_keys: &'a DictionaryArray<UInt32Type>,
+    frame_values: &'a StringArray,
+    units_keys: &'a DictionaryArray<UInt16Type>,
+    units_values: &'a StringArray,
+    position: &'a Float64Array,
+    position_offset: usize,
+    quaternion: &'a Float64Array,
+    quaternion_offset: usize,
+    centuries: &'a Int16Array,
+    nanos: &'a UInt64Array,
+}
+
+impl<'a> PoseColumns<'a> {
+    /// Locates every column needed to read a pose, or `None` if any is absent or has an
+    /// unexpected type — callers skip such a batch rather than failing the whole query.
+    fn try_new(batch: &'a RecordBatch, id_column: &str) -> Option<Self> {
+        let id_keys = batch
+            .column_by_name(id_column)?
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()?;
+        let id_values = id_keys.values().as_any().downcast_ref::<StringArray>()?;
+
+        let sts = batch
+            .column_by_name(STS_COLUMN)?
+            .as_any()
+            .downcast_ref::<StructArray>()?;
+
+        let frame_keys = sts
+            .column_by_name("frame_id")?
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()?;
+        let frame_values = frame_keys.values().as_any().downcast_ref::<StringArray>()?;
+
+        let units_keys = sts
+            .column_by_name("units_pos")?
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt16Type>>()?;
+        let units_values = units_keys.values().as_any().downcast_ref::<StringArray>()?;
+
+        let pos_list = sts
+            .column_by_name("position")?
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()?;
+        let position = pos_list.values().as_any().downcast_ref::<Float64Array>()?;
+        let position_offset = pos_list.offset();
+
+        let quat_list = sts
+            .column_by_name("quaternion")?
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()?;
+        let quaternion = quat_list.values().as_any().downcast_ref::<Float64Array>()?;
+        let quaternion_offset = quat_list.offset();
+
+        let centuries = sts
+            .column_by_name("duration_centuries")?
+            .as_any()
+            .downcast_ref::<Int16Array>()?;
+        let nanos = sts
+            .column_by_name("duration_ns")?
+            .as_any()
+            .downcast_ref::<UInt64Array>()?;
+
+        Some(Self {
+            id_keys,
+            id_values,
+            frame_keys,
+            frame_values,
+            units_keys,
+            units_values,
+            position,
+            position_offset,
+            quaternion,
+            quaternion_offset,
+            centuries,
+            nanos,
         })
+    }
+
+    /// The entity id at `row`.
+    fn id_at(&self, row: usize) -> &str {
+        self.id_values
+            .value(self.id_keys.keys().value(row) as usize)
+    }
+
+    /// The timestamp at `row`, as an offset from the J2000 TAI epoch.
+    fn epoch_at(&self, row: usize) -> Duration {
+        Duration::from_parts(self.centuries.value(row), self.nanos.value(row))
+    }
+
+    /// The `(parent_frame_id, isometry)` at `row`, with the translation converted to km.
+    fn pose_at(&self, row: usize) -> (String, Isometry3<f64>) {
+        let units = self
+            .units_values
+            .value(self.units_keys.keys().value(row) as usize);
+        let to_km: f64 = match units.to_lowercase().as_str() {
+            "m" | "meters" | "meter" => 0.001,
+            "au" => 149_597_870.7,
+            _ => 1.0,
+        };
+
+        let pb = (self.position_offset + row) * 3;
+        let translation = Translation3::new(
+            self.position.value(pb) * to_km,
+            self.position.value(pb + 1) * to_km,
+            self.position.value(pb + 2) * to_km,
+        );
+
+        let qb = (self.quaternion_offset + row) * 4;
+        let rotation = UnitQuaternion::from_quaternion(Quaternion::new(
+            self.quaternion.value(qb),
+            self.quaternion.value(qb + 1),
+            self.quaternion.value(qb + 2),
+            self.quaternion.value(qb + 3),
+        ));
+
+        let frame_id = self
+            .frame_values
+            .value(self.frame_keys.keys().value(row) as usize)
+            .to_string();
+
+        (frame_id, Isometry3::from_parts(translation, rotation))
     }
 }
 
@@ -945,32 +1126,6 @@ fn estimate_type_priority(s: &str) -> u8 {
         "PREDICTED" => 1,
         _ => 2,
     }
-}
-
-/// Extracts the epoch from the first row of the spacetimestamp struct column.
-/// Falls back to J2000 TAI if the column or fields are absent.
-fn epoch_from_batch(batch: &RecordBatch) -> Epoch {
-    let j2000 = j2000_tai();
-    if batch.num_rows() == 0 {
-        return j2000;
-    }
-    let Some(sts) = batch
-        .column_by_name(STS_COLUMN)
-        .and_then(|c| c.as_any().downcast_ref::<StructArray>())
-    else {
-        return j2000;
-    };
-    let cent = sts
-        .column_by_name("duration_centuries")
-        .and_then(|c| c.as_any().downcast_ref::<Int16Array>())
-        .map(|a| a.value(0))
-        .unwrap_or(0);
-    let ns = sts
-        .column_by_name("duration_ns")
-        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-        .map(|a| a.value(0))
-        .unwrap_or(0);
-    j2000 + Duration::from_parts(cent, ns)
 }
 
 /// Returns unique entity-URI values in the frame_id dictionary of the spacetimestamp struct.
@@ -1492,8 +1647,10 @@ mod tests {
         );
     }
 
+    /// Cycles are now rejected at append time by the transform tree, rather than being
+    /// stored and only discovered later when someone tried to resolve a chain through them.
     #[test]
-    fn test_build_dynamic_frame_map_cycle_detected() {
+    fn test_append_rejects_cycle() {
         let mut ledger = make_entity_ledger();
         ledger
             .append(make_entity_batch(
@@ -1504,7 +1661,8 @@ mod tests {
                 0,
             ))
             .unwrap();
-        ledger
+
+        let err = ledger
             .append(make_entity_batch(
                 "demo:B",
                 "demo:A",
@@ -1512,16 +1670,378 @@ mod tests {
                 [1.0, 0.0, 0.0, 0.0],
                 0,
             ))
-            .unwrap();
-
-        let epoch = j2000();
-        let err = ledger
-            .build_dynamic_frame_map(&["demo:A"], epoch)
             .unwrap_err();
         assert!(
             err.to_lowercase().contains("cycle"),
             "expected cycle error: {err}"
         );
+
+        // The rejected batch must leave no trace: neither the rows nor the pose cache
+        // entry it would have created.
+        assert_eq!(ledger.len(), 1, "rejected batch must not be stored");
+        assert!(
+            ledger.resolve_frame_at("demo:B", j2000()).is_none(),
+            "rejected batch must not populate the pose cache"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // topology derivation, persistence, and federation tests
+    // -----------------------------------------------------------------------
+
+    /// Builds a ledger holding `demo:robot` → `demo:facility` → `IAU_EARTH`.
+    fn make_two_hop_ledger() -> Ledger {
+        let mut ledger = make_entity_ledger();
+        ledger
+            .append(make_entity_batch(
+                "demo:facility",
+                "IAU_EARTH",
+                [50.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
+        ledger
+            .append(make_entity_batch(
+                "demo:robot",
+                "demo:facility",
+                [5.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
+        ledger
+    }
+
+    /// Topology is derived data, not persisted separately — a reloaded ledger has to
+    /// rebuild it from the rows, or chain resolution silently stops working.
+    #[test]
+    fn test_ipc_round_trip_rebuilds_topology() {
+        let ledger = make_two_hop_ledger();
+        let bytes = ledger.save_ipc_to_bytes().unwrap();
+        let reloaded = Ledger::load_ipc_from_bytes(&bytes, "entity_id").unwrap();
+
+        let map = reloaded
+            .build_dynamic_frame_map(&["demo:robot"], j2000())
+            .unwrap();
+        let (root, iso) = map.get("demo:robot").unwrap();
+        assert_eq!(root, "IAU_EARTH");
+        assert!((iso.translation.vector.x - 55.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_export_topology_shape() {
+        let ledger = make_two_hop_ledger();
+        let exported = ledger.export_topology().unwrap();
+
+        assert_eq!(
+            exported.schema(),
+            spacetimestamp::topology::topology_schema()
+        );
+        // One edge per entity: facility→IAU_EARTH and robot→facility.
+        assert_eq!(exported.num_rows(), 2);
+    }
+
+    /// A federated peer receiving an exported log gets the *structure* only — poses still
+    /// have to arrive as ordinary rows.
+    #[test]
+    fn test_topology_export_merges_into_peer() {
+        let exported = make_two_hop_ledger().export_topology().unwrap();
+
+        let mut peer = make_entity_ledger();
+        assert_eq!(peer.merge_topology(&exported).unwrap(), 2);
+
+        // The chain is now known, so resolution gets far enough to demand a pose the peer
+        // does not hold — rather than failing for lack of a parent.
+        let err = peer
+            .build_dynamic_frame_map(&["demo:robot"], j2000())
+            .unwrap_err();
+        assert!(
+            err.contains("not found in ledger"),
+            "expected a missing-pose error, got: {err}"
+        );
+    }
+
+    /// Re-parenting is an ordinary append, and queries at different epochs must see the
+    /// parent that was in effect at each one.
+    #[test]
+    fn test_resolve_to_root_follows_reparenting_over_time() {
+        let mut ledger = make_entity_ledger();
+        ledger
+            .append(make_entity_batch(
+                "demo:hangar",
+                "IAU_EARTH",
+                [10.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
+        // Starts parented to the hangar...
+        ledger
+            .append(make_entity_batch(
+                "demo:drone",
+                "demo:hangar",
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
+        // ...then is re-parented straight to IAU_EARTH once airborne.
+        ledger
+            .append(make_entity_batch(
+                "demo:drone",
+                "IAU_EARTH",
+                [500.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                1_000,
+            ))
+            .unwrap();
+
+        // Before the re-parenting: through the hangar, so 10 + 1.
+        let (root, iso) = ledger.resolve_to_root("demo:drone", j2000()).unwrap();
+        assert_eq!(root, "IAU_EARTH");
+        assert!((iso.translation.vector.x - 11.0).abs() < 1e-9);
+
+        // After: direct, so just 500.
+        let after = j2000() + Duration::from_parts(0, 1_000);
+        let (root, iso) = ledger.resolve_to_root("demo:drone", after).unwrap();
+        assert_eq!(root, "IAU_EARTH");
+        assert!((iso.translation.vector.x - 500.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_resolve_to_root_unknown_entity_returns_none() {
+        let ledger = make_two_hop_ledger();
+        assert!(ledger.resolve_to_root("demo:ghost", j2000()).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // pose cache tests
+    // -----------------------------------------------------------------------
+
+    /// Checks that `resolve_frame_at`'s cache fast path and its scan fallback give the same
+    /// answer — including on the epoch-tie rule, where both must keep the *first* row seen.
+    ///
+    /// Takes an independent copy through IPC and drops its pose cache, so every lookup on
+    /// that copy is forced down the scan path while the original still uses the cache.
+    fn assert_cache_agrees_with_scan(ledger: &Ledger, entity_id: &str, queries: &[Epoch]) {
+        let bytes = ledger.save_ipc_to_bytes().unwrap();
+        let mut scanned = Ledger::load_ipc_from_bytes(&bytes, "entity_id").unwrap();
+        scanned.clear_pose_cache();
+
+        for &epoch in queries {
+            let cached = ledger.resolve_frame_at(entity_id, epoch);
+            let scanned = scanned.resolve_frame_at(entity_id, epoch);
+            assert_eq!(
+                cached.as_ref().map(|(f, i)| (f, i.translation.vector)),
+                scanned.as_ref().map(|(f, i)| (f, i.translation.vector)),
+                "cache and scan disagree for '{entity_id}' at {epoch}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pose_cache_returns_latest_pose() {
+        let mut ledger = make_entity_ledger();
+        for (x, ns) in [(1.0, 0), (2.0, 1_000), (3.0, 2_000)] {
+            ledger
+                .append(make_entity_batch(
+                    "demo:A",
+                    "ICRF",
+                    [x, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                    ns,
+                ))
+                .unwrap();
+        }
+
+        let at_latest = j2000() + Duration::from_parts(0, 2_000);
+        let (frame, iso) = ledger.resolve_frame_at("demo:A", at_latest).unwrap();
+        assert_eq!(frame, "ICRF");
+        assert_eq!(iso.translation.vector.x, 3.0);
+
+        // Well past the last row — still the last row, served from the cache.
+        let far_future = j2000() + Duration::from_parts(0, 999_999);
+        let (_, iso) = ledger.resolve_frame_at("demo:A", far_future).unwrap();
+        assert_eq!(iso.translation.vector.x, 3.0);
+
+        assert_cache_agrees_with_scan(&ledger, "demo:A", &[at_latest, far_future]);
+    }
+
+    #[test]
+    fn test_resolve_frame_at_historical_query_bypasses_cache() {
+        let mut ledger = make_entity_ledger();
+        for (x, ns) in [(1.0, 0), (2.0, 1_000), (3.0, 2_000)] {
+            ledger
+                .append(make_entity_batch(
+                    "demo:A",
+                    "ICRF",
+                    [x, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                    ns,
+                ))
+                .unwrap();
+        }
+
+        // Between rows: the cached epoch (2000) is after the query, so this must fall back
+        // to the scan and find the row at 1000 rather than returning the cached pose.
+        let midpoint = j2000() + Duration::from_parts(0, 1_500);
+        let (_, iso) = ledger.resolve_frame_at("demo:A", midpoint).unwrap();
+        assert_eq!(iso.translation.vector.x, 2.0);
+
+        // Before every row: no answer exists.
+        assert!(
+            ledger
+                .resolve_frame_at("demo:A", j2000() - Duration::from_parts(0, 1))
+                .is_none()
+        );
+
+        assert_cache_agrees_with_scan(
+            &ledger,
+            "demo:A",
+            &[j2000(), midpoint, j2000() + Duration::from_parts(0, 1_000)],
+        );
+    }
+
+    /// Appending an older batch after a newer one must not move the cache backwards.
+    #[test]
+    fn test_pose_cache_survives_backfilled_batch() {
+        let mut ledger = make_entity_ledger();
+        ledger
+            .append(make_entity_batch(
+                "demo:A",
+                "ICRF",
+                [9.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                5_000,
+            ))
+            .unwrap();
+        ledger
+            .append(make_entity_batch(
+                "demo:A",
+                "ICRF",
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
+
+        let latest = j2000() + Duration::from_parts(0, 5_000);
+        let (_, iso) = ledger.resolve_frame_at("demo:A", latest).unwrap();
+        assert_eq!(
+            iso.translation.vector.x, 9.0,
+            "backfilled older row must not overwrite the cached newer pose"
+        );
+
+        // The backfilled row is still findable at its own epoch, via the scan path.
+        let (_, iso) = ledger.resolve_frame_at("demo:A", j2000()).unwrap();
+        assert_eq!(iso.translation.vector.x, 1.0);
+
+        assert_cache_agrees_with_scan(&ledger, "demo:A", &[j2000(), latest]);
+    }
+
+    /// Two rows at the same epoch: the first one appended wins, in both code paths.
+    #[test]
+    fn test_pose_cache_epoch_tie_keeps_first_seen() {
+        let mut ledger = make_entity_ledger();
+        for x in [1.0, 2.0] {
+            ledger
+                .append(make_entity_batch(
+                    "demo:A",
+                    "ICRF",
+                    [x, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                    0,
+                ))
+                .unwrap();
+        }
+
+        let (_, iso) = ledger.resolve_frame_at("demo:A", j2000()).unwrap();
+        assert_eq!(iso.translation.vector.x, 1.0);
+
+        assert_cache_agrees_with_scan(&ledger, "demo:A", &[j2000()]);
+    }
+
+    /// Poses are cached in km regardless of the units the row was written in, matching
+    /// what the scan path returns.
+    #[test]
+    fn test_pose_cache_normalises_units_to_km() {
+        use crate::schemas::entity::EntityBuilder;
+        let mut ledger = make_entity_ledger();
+        let mut b = EntityBuilder::new(1, None);
+        b.append_entity(
+            "demo:A",
+            "ICRF",
+            "m",
+            "TAI",
+            "test:src",
+            "MEASURED",
+            [2_000.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        ledger.append(b.flush()).unwrap();
+
+        let (_, iso) = ledger.resolve_frame_at("demo:A", j2000()).unwrap();
+        assert_eq!(iso.translation.vector.x, 2.0);
+
+        assert_cache_agrees_with_scan(&ledger, "demo:A", &[j2000()]);
+    }
+
+    /// Independent entities each keep their own cache entry.
+    #[test]
+    fn test_pose_cache_is_per_entity() {
+        let mut ledger = make_entity_ledger();
+        ledger
+            .append(make_entity_batch(
+                "demo:A",
+                "ICRF",
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
+        ledger
+            .append(make_entity_batch(
+                "demo:B",
+                "ICRF",
+                [7.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                1_000,
+            ))
+            .unwrap();
+
+        let at_b = j2000() + Duration::from_parts(0, 1_000);
+        assert_eq!(
+            ledger
+                .resolve_frame_at("demo:A", at_b)
+                .unwrap()
+                .1
+                .translation
+                .vector
+                .x,
+            1.0
+        );
+        assert_eq!(
+            ledger
+                .resolve_frame_at("demo:B", at_b)
+                .unwrap()
+                .1
+                .translation
+                .vector
+                .x,
+            7.0
+        );
+        assert!(ledger.resolve_frame_at("demo:missing", at_b).is_none());
+
+        assert_cache_agrees_with_scan(&ledger, "demo:A", &[j2000(), at_b]);
+        assert_cache_agrees_with_scan(&ledger, "demo:B", &[j2000(), at_b]);
     }
 
     // -----------------------------------------------------------------------

@@ -55,7 +55,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::ephemeris::{epoch_from_parts, epoch_to_parts};
-use crate::schema::{FrameRegistry, STS_COLUMN, STS_REGISTRY_METADATA_KEY, SpaceTimestampBuilder};
+use crate::schema::{
+    FrameRegistry, STS_COLUMN, STS_REGISTRY_METADATA_KEY, SpaceTimestampBuilder, is_entity_uri,
+};
 
 /// Converts a position/velocity unit string to a multiplier yielding kilometers.
 fn unit_to_km_factor(unit: &str) -> f64 {
@@ -92,6 +94,15 @@ fn read_vec4(values: &Float64Array, list_offset: usize, row: usize) -> [f64; 4] 
     ]
 }
 
+/// A resolved dynamic frame: the astronomical root its chain terminates in, plus the
+/// isometry (always in km) taking child-frame coordinates into that root.
+pub type ResolvedFrame = (String, Isometry3<f64>);
+
+/// Resolves an entity-URI frame name at a given epoch — see [`transform_batch`].
+///
+/// `soloc`'s ledger supplies one of these; `spacetimestamp` never looks up poses itself.
+pub type DynamicFrameResolver<'a> = &'a dyn Fn(&str, Epoch) -> Option<ResolvedFrame>;
+
 /// Transforms the `spacetimestamp` struct column of a batch into a new target astronomical frame.
 ///
 /// This function acts as a pure projection: the original `RecordBatch` is unmodified.
@@ -105,11 +116,17 @@ fn read_vec4(values: &Float64Array, list_offset: usize, row: usize) -> [f64; 4] 
 /// * `target_frame_name` - The target `anise` frame (e.g. "ICRF", "Earth").
 /// * `almanac` - The `anise` ephemeris engine holding planetary data.
 /// * `target_unit` - The desired output unit for position (e.g. "km" or "m").
-/// * `dynamic_frames` - Optional map from entity URI frame IDs to `(astronomical_root, isometry_km)`.
-///   Used when a row's `frame_id` is an entity URI (e.g. `"demo:truck_A"`) whose pose
-///   must be looked up in the ledger. The isometry translates child-frame coordinates (in km)
-///   into the astronomical root frame. Build this map with
-///   [`soloc::ledger::Ledger::build_dynamic_frame_map`] before calling.
+/// * `resolve_dynamic_frame` - Optional resolver called when a row's `frame_id` is an
+///   entity URI (e.g. `"demo:truck_A"`) whose pose must be looked up in a ledger. It
+///   receives the frame name and **that row's own epoch**, and returns
+///   `(astronomical_root, isometry_km)` — the isometry translating child-frame
+///   coordinates (in km) into the astronomical root frame.
+///
+///   Taking a resolver rather than a prebuilt map is what lets a batch spanning several
+///   timesteps resolve each row against the pose that was current *at that row's epoch*;
+///   a single map could only ever hold one epoch's answer for the whole batch. Results
+///   are memoised per `(frame, epoch)`, so a snapshot batch where every row shares a
+///   frame and timestep still costs exactly one resolver call.
 ///
 ///   Dynamic frame isometries are always in km, regardless of the batch's `units_pos`.
 ///   Static [`FrameRegistry`] entries are checked first; dynamic frames are the fallback.
@@ -118,7 +135,7 @@ pub fn transform_batch(
     target_frame_name: &str,
     almanac: &Almanac,
     target_unit: &str,
-    dynamic_frames: Option<&HashMap<String, (String, Isometry3<f64>)>>,
+    resolve_dynamic_frame: Option<DynamicFrameResolver<'_>>,
 ) -> Result<RecordBatch, String> {
     // Attempt to resolve the target frame in anise. We default to assuming J2000 orientation
     // if the user simply passed a planetary center like "Mars".  Also handles "IAU_BODY" strings
@@ -300,10 +317,17 @@ pub fn transform_batch(
 
     let to_target_factor = 1.0 / unit_to_km_factor(target_unit);
 
+    // Memoises resolver answers per (frame dictionary key, epoch). Keyed on the dictionary
+    // key rather than the frame string so a hit costs no allocation; the key uniquely
+    // identifies a name within this batch. A per-timestep snapshot batch therefore makes
+    // one resolver call, not one per row.
+    let mut dynamic_cache: HashMap<(u32, (i16, u64)), Option<ResolvedFrame>> = HashMap::new();
+
     // 4. Iterate over the data and apply transformations.
     for i in 0..num_rows {
         // Look up strings via dictionary key → value index
-        let original_frame = frames_dict.value(frames.keys().value(i) as usize);
+        let frame_key = frames.keys().value(i);
+        let original_frame = frames_dict.value(frame_key as usize);
         let current_unit = units_dict.value(units.keys().value(i) as usize);
         let ts_str = timescales_dict.value(timescales.keys().value(i) as usize);
         let source_str = sources_dict.value(sources.keys().value(i) as usize);
@@ -332,18 +356,27 @@ pub fn transform_batch(
         //   c) Passthrough                 — original_frame is already an astronomical root
         let quat_local = UnitQuaternion::from_quaternion(Quaternion::new(qw, qx, qy, qz));
 
+        // Resolved against this row's own epoch, so a batch spanning several timesteps
+        // gets the pose that was current at each one.
+        let dynamic = resolve_dynamic_frame.and_then(|resolve| {
+            dynamic_cache
+                .entry((frame_key, epoch.to_tai_duration().to_parts()))
+                .or_insert_with(|| resolve(original_frame, epoch))
+                .clone()
+        });
+
         let (root_frame_name, pos_root, quat_root) =
             if let Some((root, iso)) = custom_frame_cache.get(original_frame) {
                 // Static: isometry in batch units; convert to km after applying.
                 let pos_root = (iso * Point3::new(px, py, pz)).coords * to_km;
                 let quat_root = iso.rotation * quat_local;
                 (root.clone(), pos_root, quat_root)
-            } else if let Some((root, iso)) = dynamic_frames.and_then(|m| m.get(original_frame)) {
+            } else if let Some((root, iso)) = dynamic {
                 // Dynamic: isometry in km; normalize coordinates to km first.
                 let pos_km = Point3::new(px * to_km, py * to_km, pz * to_km);
                 let pos_root = (iso * pos_km).coords;
                 let quat_root = iso.rotation * quat_local;
-                (root.clone(), pos_root, quat_root)
+                (root, pos_root, quat_root)
             } else {
                 // Passthrough: original_frame is an astronomical root already.
                 let pos_root = Vector3::new(px, py, pz) * to_km;
@@ -357,10 +390,19 @@ pub fn transform_batch(
         // appear here as root_frame_name.
         let root_frame = crate::ephemeris::resolve_astronomical_frame(&root_frame_name)
             .ok_or_else(|| {
-                format!(
-                    "Failed resolving root frame '{}': not recognized by anise",
-                    root_frame_name
-                )
+                // An entity-shaped name reaching this point means the resolver could not
+                // place it — say so, rather than blaming anise for a name it never owned.
+                if is_entity_uri(&root_frame_name) {
+                    format!(
+                        "Failed resolving frame '{root_frame_name}': it looks like an entity \
+                         reference, but no pose for it could be resolved at {epoch}"
+                    )
+                } else {
+                    format!(
+                        "Failed resolving root frame '{}': not recognized by anise",
+                        root_frame_name
+                    )
+                }
             })?;
 
         // almanac.translate(from, to, epoch) → radius_km is the position of `from`'s origin

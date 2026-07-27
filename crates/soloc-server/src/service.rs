@@ -20,12 +20,9 @@ use spacetimestamp::query::SpatiotemporalFilter;
 use spacetimestamp::schema::{FrameRegistry, STS_COLUMN, STS_REGISTRY_METADATA_KEY};
 use spacetimestamp::transforms::transform_batch;
 
-use arrow::array::{Array, DictionaryArray, Int16Array, StringArray, StructArray, UInt64Array};
+use arrow::array::{Array, DictionaryArray, StringArray, StructArray};
 use arrow::datatypes::UInt32Type;
-use hifitime::{Duration, Epoch};
-use nalgebra::Isometry3;
-use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
+use hifitime::Epoch;
 
 use crate::state::ServerState;
 
@@ -158,96 +155,65 @@ fn transform_with_server_registry(
 
     let patched = inject_registry(batch, &merged)?;
 
-    // Scan for entity-URI frame IDs and build a dynamic frame map from the ledger.
-    let dynamic_frames = build_dynamic_frames_for_batch(&patched, state)?;
-
     let almanac = state
         .almanac
         .read()
         .map_err(|_| Status::internal("almanac lock poisoned"))?;
-    transform_batch(
-        &patched,
-        &desc.target_frame,
-        &almanac,
-        &desc.target_units,
-        dynamic_frames.as_ref(),
-    )
-    .map_err(|e| Status::internal(format!("transform failed: {e}")))
-}
 
-/// Map from entity-URI frame id to (parent frame, rigid transform) at a batch's epoch.
-type DynamicFrameMap = HashMap<String, (String, Isometry3<f64>)>;
-
-/// Scans the `frame_id` dictionary in the spacetimestamp column for entity URIs ("urn:…").
-/// If any are found, builds a dynamic frame map by reading the ledger at the batch's epoch.
-/// Returns `None` when no entity-URI frames are present (fast path for the common case).
-fn build_dynamic_frames_for_batch(
-    batch: &RecordBatch,
-    state: &ServerState,
-) -> Result<Option<DynamicFrameMap>, Status> {
-    let sts_col = match batch
-        .column_by_name(STS_COLUMN)
-        .and_then(|c| c.as_any().downcast_ref::<StructArray>())
-    {
-        Some(s) => s,
-        None => return Ok(None),
-    };
-
-    // Collect unique entity URIs from the frame_id dictionary values.
-    let frames = match sts_col
-        .column_by_name("frame_id")
-        .and_then(|c| c.as_any().downcast_ref::<DictionaryArray<UInt32Type>>())
-    {
-        Some(d) => d,
-        None => return Ok(None),
-    };
-    let frames_dict = match frames.values().as_any().downcast_ref::<StringArray>() {
-        Some(s) => s,
-        None => return Ok(None),
-    };
-
-    let uri_frames: HashSet<&str> = (0..frames_dict.len())
-        .filter(|&i| !frames_dict.is_null(i))
-        .map(|i| frames_dict.value(i))
-        .filter(|s| spacetimestamp::schema::is_entity_uri(s))
-        .collect();
-
-    if uri_frames.is_empty() {
-        return Ok(None);
+    // Fast path: no entity-URI frames means no ledger lookups, so don't take the lock.
+    if !batch_has_uri_frames(&patched) {
+        return transform_batch(
+            &patched,
+            &desc.target_frame,
+            &almanac,
+            &desc.target_units,
+            None,
+        )
+        .map_err(|e| Status::internal(format!("transform failed: {e}")));
     }
 
-    // Derive an epoch from the first row's duration fields.
-    let epoch = {
-        let j2000 = Epoch::from_str("2000-01-01T12:00:00 TAI")
-            .map_err(|e| Status::internal(format!("J2000 parse: {e}")))?;
-        let cent = match sts_col
-            .column_by_name("duration_centuries")
-            .and_then(|c| c.as_any().downcast_ref::<Int16Array>())
-        {
-            Some(a) if batch.num_rows() > 0 => a.value(0),
-            _ => 0,
-        };
-        let ns = match sts_col
-            .column_by_name("duration_ns")
-            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-        {
-            Some(a) if batch.num_rows() > 0 => a.value(0),
-            _ => 0,
-        };
-        j2000 + Duration::from_parts(cent, ns)
-    };
-
-    let ids: Vec<&str> = uri_frames.into_iter().collect();
     let ledger = state
         .ledger
         .read()
         .map_err(|_| Status::internal("ledger lock poisoned"))?;
 
-    let map = ledger
-        .build_dynamic_frame_map(&ids, epoch)
-        .map_err(|e| Status::internal(format!("dynamic frame resolution: {e}")))?;
+    // Each row resolves at its own epoch. The previous version derived one epoch from the
+    // batch's first row and applied it to every row, which was wrong for a batch spanning
+    // multiple timesteps.
+    let resolver = |frame: &str, epoch: Epoch| ledger.resolve_to_root(frame, epoch);
 
-    Ok(Some(map))
+    transform_batch(
+        &patched,
+        &desc.target_frame,
+        &almanac,
+        &desc.target_units,
+        Some(&resolver),
+    )
+    .map_err(|e| Status::internal(format!("transform failed: {e}")))
+}
+
+/// Whether the batch's `frame_id` dictionary contains any entity URI (e.g. `"demo:truck_A"`),
+/// meaning the transform will need ledger lookups to resolve them.
+fn batch_has_uri_frames(batch: &RecordBatch) -> bool {
+    let Some(sts_col) = batch
+        .column_by_name(STS_COLUMN)
+        .and_then(|c| c.as_any().downcast_ref::<StructArray>())
+    else {
+        return false;
+    };
+    let Some(frames) = sts_col
+        .column_by_name("frame_id")
+        .and_then(|c| c.as_any().downcast_ref::<DictionaryArray<UInt32Type>>())
+    else {
+        return false;
+    };
+    let Some(frames_dict) = frames.values().as_any().downcast_ref::<StringArray>() else {
+        return false;
+    };
+
+    (0..frames_dict.len())
+        .filter(|&i| !frames_dict.is_null(i))
+        .any(|i| spacetimestamp::schema::is_entity_uri(frames_dict.value(i)))
 }
 
 #[tonic::async_trait]
