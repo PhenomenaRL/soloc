@@ -51,7 +51,7 @@ fn default_bind() -> String {
     "0.0.0.0:50051".to_string()
 }
 
-/// Persistence configuration for the ledger and frame registry.
+/// Persistence configuration for the ledger.
 ///
 /// When omitted the server runs entirely in memory and all data is lost on shutdown.
 ///
@@ -69,9 +69,6 @@ struct StorageConfig {
     /// Local filesystem path for the ledger (`*.arrows`).
     /// Used when `ledger_url` is not set.
     ledger_path: Option<String>,
-    /// Path to a JSON file for the frame registry.
-    /// Loaded on startup if the file exists; saved whenever the registry changes.
-    registry_path: Option<String>,
     /// Path to a zero-row Arrow IPC file that defines the schema for a fresh ledger.
     /// Ignored when an existing ledger is loaded (schema comes from the IPC file).
     /// When absent and no existing ledger is found, defaults to the standard entity schema.
@@ -186,7 +183,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = cfg.server.bind.parse()?;
     let almanac = load_almanac(&cfg.ephemeris);
 
-    let registry_path = cfg.storage.registry_path.map(PathBuf::from);
     let ledger_path = cfg.storage.ledger_path.map(PathBuf::from);
     let ledger_url = cfg.storage.ledger_url;
     let schema_path = cfg.storage.schema_path.map(PathBuf::from);
@@ -195,7 +191,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(
         ServerState::new(
             almanac,
-            registry_path,
             ledger_path,
             ledger_url,
             schema_path,
