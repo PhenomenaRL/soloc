@@ -17,7 +17,7 @@ use tonic::{Request, Response, Status, Streaming};
 use anise::almanac::metaload::MetaFile;
 use soloc::ephemeris::naif_snapshot;
 use spacetimestamp::query::SpatiotemporalFilter;
-use spacetimestamp::schema::{FrameRegistry, STS_COLUMN, STS_REGISTRY_METADATA_KEY};
+use spacetimestamp::schema::STS_COLUMN;
 use spacetimestamp::transforms::transform_batch;
 
 use arrow::array::{Array, DictionaryArray, StringArray, StructArray};
@@ -27,19 +27,6 @@ use hifitime::Epoch;
 use crate::state::ServerState;
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send + 'static>>;
-
-#[derive(Deserialize)]
-struct RegisterFrameBody {
-    local_name: String,
-    parent: String,
-    translation: [f64; 3],
-    rotation_quat: [f64; 4],
-}
-
-#[derive(Deserialize)]
-struct RemoveFrameBody {
-    local_name: String,
-}
 
 #[derive(Deserialize)]
 struct SaveLedgerBody {
@@ -114,62 +101,54 @@ fn unimplemented<T>() -> Result<Response<T>, Status> {
     Err(Status::unimplemented("not implemented"))
 }
 
-/// Replaces the FrameRegistry embedded in a batch's schema metadata.
-fn inject_registry(batch: &RecordBatch, registry: &FrameRegistry) -> Result<RecordBatch, Status> {
-    let mut metadata = batch.schema().metadata().clone();
-    let json = registry
-        .to_json()
-        .map_err(|e| Status::internal(format!("registry serialization failed: {e}")))?;
-    metadata.insert(STS_REGISTRY_METADATA_KEY.to_string(), json);
-    let new_schema = Arc::new(batch.schema().as_ref().clone().with_metadata(metadata));
-    RecordBatch::try_new(new_schema, batch.columns().to_vec())
-        .map_err(|e| Status::internal(format!("failed to patch batch schema: {e}")))
+/// Serialises a single batch as a self-contained Arrow IPC file, for use as a DoAction body.
+fn batch_to_ipc_bytes(batch: &RecordBatch) -> Result<Vec<u8>, Status> {
+    use arrow::ipc::writer::FileWriter;
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut writer = FileWriter::try_new(&mut buf, &batch.schema())
+            .map_err(|e| Status::internal(format!("IPC writer init failed: {e}")))?;
+        writer
+            .write(batch)
+            .map_err(|e| Status::internal(format!("IPC write failed: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| Status::internal(format!("IPC finalise failed: {e}")))?;
+    }
+    Ok(buf)
 }
 
-/// Merges the server registry with any registry embedded in the batch, injects the result,
-/// then calls transform_batch.  Entity-URI frame IDs are resolved via the ledger so that
-/// child entities (e.g. a robot with frame_id = "urn:soloc:truck_A") are correctly placed.
-fn transform_with_server_registry(
+/// Reads back a single batch written by [`batch_to_ipc_bytes`]. Multi-batch payloads are
+/// concatenated so a peer that chunked its export still merges correctly.
+fn batch_from_ipc_bytes(bytes: &[u8]) -> Result<RecordBatch, Status> {
+    use arrow::ipc::reader::FileReader;
+    let reader = FileReader::try_new(std::io::Cursor::new(bytes), None)
+        .map_err(|e| Status::invalid_argument(format!("invalid Arrow IPC body: {e}")))?;
+    let schema = reader.schema();
+    let batches: Vec<RecordBatch> = reader
+        .collect::<Result<_, _>>()
+        .map_err(|e| Status::invalid_argument(format!("failed to read IPC batches: {e}")))?;
+    arrow::compute::concat_batches(&schema, &batches)
+        .map_err(|e| Status::invalid_argument(format!("failed to concat IPC batches: {e}")))
+}
+
+/// Transforms a batch into the descriptor's target frame. Entity-URI frame IDs are resolved
+/// through the ledger's transform tree so that child entities (e.g. a robot with
+/// frame_id = "urn:soloc:truck_A") are correctly placed.
+fn transform_with_ledger_frames(
     state: &ServerState,
     batch: &RecordBatch,
     desc: &ExchangeDescriptor,
 ) -> Result<RecordBatch, Status> {
-    let batch_registry = batch
-        .schema()
-        .metadata()
-        .get(STS_REGISTRY_METADATA_KEY)
-        .and_then(|json| FrameRegistry::from_json(json).ok());
-
-    let server_reg = state
-        .registry
-        .read()
-        .map_err(|_| Status::internal("registry lock poisoned"))?;
-
-    let merged = match batch_registry {
-        Some(ref batch_reg) => server_reg
-            .merge(batch_reg)
-            .map_err(|e| Status::internal(format!("registry merge failed: {e}")))?,
-        None => server_reg.clone(),
-    };
-    drop(server_reg);
-
-    let patched = inject_registry(batch, &merged)?;
-
     let almanac = state
         .almanac
         .read()
         .map_err(|_| Status::internal("almanac lock poisoned"))?;
 
     // Fast path: no entity-URI frames means no ledger lookups, so don't take the lock.
-    if !batch_has_uri_frames(&patched) {
-        return transform_batch(
-            &patched,
-            &desc.target_frame,
-            &almanac,
-            &desc.target_units,
-            None,
-        )
-        .map_err(|e| Status::internal(format!("transform failed: {e}")));
+    if !batch_has_uri_frames(batch) {
+        return transform_batch(batch, &desc.target_frame, &almanac, &desc.target_units, None)
+            .map_err(|e| Status::internal(format!("transform failed: {e}")));
     }
 
     let ledger = state
@@ -183,7 +162,7 @@ fn transform_with_server_registry(
     let resolver = |frame: &str, epoch: Epoch| ledger.resolve_to_root(frame, epoch);
 
     transform_batch(
-        &patched,
+        batch,
         &desc.target_frame,
         &almanac,
         &desc.target_units,
@@ -292,14 +271,6 @@ impl FlightService for SolocFlightService {
             filter = filter.with_spatial(origin, radius);
         }
 
-        // Snapshot the registry before acquiring the ledger lock to avoid
-        // holding both locks simultaneously.
-        let registry = state
-            .registry
-            .read()
-            .map_err(|_| Status::internal("registry lock poisoned"))?
-            .clone();
-
         let batches: Vec<RecordBatch> = {
             let ledger = state
                 .ledger
@@ -310,8 +281,7 @@ impl FlightService for SolocFlightService {
                     .stream_query(&filter)
                     .filter_map(|r| r.ok())
                     .filter(|b| b.num_rows() > 0)
-                    .map(|b| inject_registry(&b, &registry))
-                    .collect::<Result<Vec<_>, _>>()?,
+                    .collect::<Vec<_>>(),
                 QueryType::CurrentState => {
                     let entity_ids_refs: Option<Vec<&str>> = ticket
                         .entity_ids
@@ -327,7 +297,7 @@ impl FlightService for SolocFlightService {
                     if result.num_rows() == 0 {
                         vec![]
                     } else {
-                        vec![inject_registry(&result, &registry)?]
+                        vec![result]
                     }
                 }
             }
@@ -355,41 +325,14 @@ impl FlightService for SolocFlightService {
         while let Some(batch) = batch_stream.next().await {
             let batch = batch.map_err(|e| Status::internal(e.to_string()))?;
 
-            // Merge any registry embedded in the batch into the server's canonical
-            // registry, then re-tag the batch before storing. This ensures every ledger
-            // entry is self-describing with the full merged frame map, and that custom
-            // frames from clients accumulate in the server's persistent registry.
-            let tagged = {
-                let batch_reg = batch
-                    .schema()
-                    .metadata()
-                    .get(STS_REGISTRY_METADATA_KEY)
-                    .and_then(|json| FrameRegistry::from_json(json).ok());
-
-                let mut server_reg = state
-                    .registry
-                    .write()
-                    .map_err(|_| Status::internal("registry lock poisoned"))?;
-
-                if let Some(ref br) = batch_reg {
-                    let merged = server_reg
-                        .merge(br)
-                        .map_err(|e| Status::internal(format!("registry merge failed: {e}")))?;
-                    *server_reg = merged;
-                }
-
-                let tagged = inject_registry(&batch, &server_reg)?;
-                let snapshot = server_reg.clone();
-                drop(server_reg);
-                state.persist_registry(&snapshot);
-                tagged
-            };
-
+            // Topology is derived from the rows themselves by `Ledger::append`, so the
+            // batch is stored as-is. A batch introducing a cycle or an unresolvable parent
+            // frame is rejected here.
             state
                 .ledger
                 .write()
                 .map_err(|_| Status::internal("ledger lock poisoned"))?
-                .append(tagged)
+                .append(batch)
                 .map_err(|e| Status::invalid_argument(format!("append failed: {e}")))?;
         }
 
@@ -426,7 +369,7 @@ impl FlightService for SolocFlightService {
         let mut transformed: Vec<RecordBatch> = Vec::new();
         while let Some(batch) = batch_stream.next().await {
             let batch = batch.map_err(|e| Status::internal(e.to_string()))?;
-            transformed.push(transform_with_server_registry(&state, &batch, &desc)?);
+            transformed.push(transform_with_ledger_frames(&state, &batch, &desc)?);
         }
 
         let out_stream = FlightDataEncoderBuilder::new()
@@ -444,16 +387,16 @@ impl FlightService for SolocFlightService {
     ) -> Result<Response<Self::ListActionsStream>, Status> {
         let actions = vec![
             Ok(ActionType {
-                r#type: "register_frame".to_string(),
-                description: "Add a custom frame. Body: {local_name, parent, translation:[f64;3], rotation_quat:[f64;4]}".to_string(),
+                r#type: "export_topology".to_string(),
+                description: "Export the full transform-tree event log for federation. \
+                              No body. Returns an Arrow IPC file of topology_schema() rows."
+                    .to_string(),
             }),
             Ok(ActionType {
-                r#type: "remove_frame".to_string(),
-                description: "Remove a frame by local name. Body: {local_name}".to_string(),
-            }),
-            Ok(ActionType {
-                r#type: "list_frames".to_string(),
-                description: "List all registered frame names. Returns a JSON array.".to_string(),
+                r#type: "import_topology".to_string(),
+                description: "Merge a topology log exported by a peer's export_topology. \
+                              Body: the raw Arrow IPC bytes. Rejected if it would form a cycle."
+                    .to_string(),
             }),
             Ok(ActionType {
                 r#type: "save_ledger".to_string(),
@@ -486,71 +429,38 @@ impl FlightService for SolocFlightService {
         let action = request.into_inner();
 
         match action.r#type.as_str() {
-            "register_frame" => {
-                let body: RegisterFrameBody =
-                    serde_json::from_slice(&action.body).map_err(|e| {
-                        Status::invalid_argument(format!("invalid register_frame body: {e}"))
+            "export_topology" => {
+                let batch = self
+                    .state
+                    .ledger
+                    .read()
+                    .map_err(|_| Status::internal("ledger lock poisoned"))?
+                    .export_topology()
+                    .map_err(|e| Status::internal(format!("export_topology failed: {e}")))?;
+                let bytes = batch_to_ipc_bytes(&batch)?;
+                let result = arrow_flight::Result {
+                    body: bytes.into(),
+                };
+                Ok(Response::new(Box::pin(futures::stream::once(
+                    futures::future::ready(Ok(result)),
+                ))))
+            }
+
+            "import_topology" => {
+                let batch = batch_from_ipc_bytes(&action.body)?;
+                let applied = self
+                    .state
+                    .ledger
+                    .write()
+                    .map_err(|_| Status::internal("ledger lock poisoned"))?
+                    .merge_topology(&batch)
+                    .map_err(|e| {
+                        Status::invalid_argument(format!("import_topology failed: {e}"))
                     })?;
-                let mut registry = self
-                    .state
-                    .registry
-                    .write()
-                    .map_err(|_| Status::internal("registry lock poisoned"))?;
-                let almanac = self
-                    .state
-                    .almanac
-                    .read()
-                    .map_err(|_| Status::internal("almanac lock poisoned"))?;
-                registry
-                    .add_frame_validated(
-                        &body.local_name,
-                        &body.parent,
-                        body.translation,
-                        body.rotation_quat,
-                        &almanac,
-                    )
-                    .map_err(|e| Status::invalid_argument(format!("register_frame failed: {e}")))?;
-                let qualified = registry.qualify(&body.local_name);
-                self.state.persist_registry(&registry);
                 let result = arrow_flight::Result {
-                    body: qualified.into_bytes().into(),
-                };
-                Ok(Response::new(Box::pin(futures::stream::once(
-                    futures::future::ready(Ok(result)),
-                ))))
-            }
-
-            "remove_frame" => {
-                let body: RemoveFrameBody = serde_json::from_slice(&action.body).map_err(|e| {
-                    Status::invalid_argument(format!("invalid remove_frame body: {e}"))
-                })?;
-                let mut registry = self
-                    .state
-                    .registry
-                    .write()
-                    .map_err(|_| Status::internal("registry lock poisoned"))?;
-                let existed = registry.remove_frame(&body.local_name);
-                self.state.persist_registry(&registry);
-                let flag: &[u8] = if existed { b"true" } else { b"false" };
-                let result = arrow_flight::Result {
-                    body: flag.to_vec().into(),
-                };
-                Ok(Response::new(Box::pin(futures::stream::once(
-                    futures::future::ready(Ok(result)),
-                ))))
-            }
-
-            "list_frames" => {
-                let registry = self
-                    .state
-                    .registry
-                    .read()
-                    .map_err(|_| Status::internal("registry lock poisoned"))?;
-                let frames: Vec<&str> = registry.list_frames();
-                let json =
-                    serde_json::to_string(&frames).map_err(|e| Status::internal(e.to_string()))?;
-                let result = arrow_flight::Result {
-                    body: json.into_bytes().into(),
+                    body: format!("applied {applied} topology events")
+                        .into_bytes()
+                        .into(),
                 };
                 Ok(Response::new(Box::pin(futures::stream::once(
                     futures::future::ready(Ok(result)),

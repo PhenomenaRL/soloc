@@ -1,15 +1,12 @@
 use anise::almanac::Almanac;
 use soloc::ledger::Ledger;
 use soloc::schemas::entity::entity_schema;
-use spacetimestamp::schema::FrameRegistry;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 pub struct ServerState {
     pub ledger: Arc<RwLock<Ledger>>,
-    pub registry: Arc<RwLock<FrameRegistry>>,
     pub almanac: Arc<RwLock<Almanac>>,
-    pub registry_path: Option<PathBuf>,
     pub ledger_path: Option<PathBuf>,
     /// Object-store URL for the ledger (e.g. `s3://bucket/key`, `gs://bucket/key`,
     /// `az://container/key`, `file:///abs/path`).  When set, takes priority over
@@ -21,19 +18,11 @@ pub struct ServerState {
 impl ServerState {
     pub async fn new(
         almanac: Almanac,
-        registry_path: Option<PathBuf>,
         ledger_path: Option<PathBuf>,
         ledger_url: Option<String>,
         schema_path: Option<PathBuf>,
         id_column: String,
     ) -> Self {
-        let registry = registry_path
-            .as_ref()
-            .filter(|p| p.exists())
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|json| FrameRegistry::from_json(&json).ok())
-            .unwrap_or_default();
-
         let ledger = if let Some(ref url) = ledger_url {
             match object_store_download(url, &id_column).await {
                 Ok(l) => {
@@ -76,20 +65,10 @@ impl ServerState {
 
         Self {
             ledger: Arc::new(RwLock::new(ledger)),
-            registry: Arc::new(RwLock::new(registry)),
             almanac: Arc::new(RwLock::new(almanac)),
-            registry_path,
             ledger_path,
             ledger_url,
             id_column,
-        }
-    }
-
-    pub fn persist_registry(&self, registry: &FrameRegistry) {
-        if let Some(ref path) = self.registry_path {
-            if let Ok(json) = registry.to_json() {
-                let _ = std::fs::write(path, json);
-            }
         }
     }
 
