@@ -21,3 +21,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 [[bench]]
 name = "spacetimestamp_bench"
 harness = false
+
+[[bench]]
+name = "topology_bench"
+harness = false
