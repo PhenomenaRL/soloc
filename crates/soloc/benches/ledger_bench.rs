@@ -12,7 +12,7 @@ fn j2000_epoch() -> Epoch {
 
 /// One snapshot batch: n_rows entities on a LEO orbit, each 1 ms apart.
 fn make_entity_batch(n_rows: usize, t_offset_ns: u64) -> arrow::record_batch::RecordBatch {
-    let mut builder = EntityBuilder::new(n_rows, None);
+    let mut builder = EntityBuilder::new(n_rows);
     for i in 0..n_rows {
         let angle = (i as f64) * 2.0 * std::f64::consts::PI / (n_rows as f64);
         builder.append_entity(
@@ -37,7 +37,7 @@ fn make_entity_batch(n_rows: usize, t_offset_ns: u64) -> arrow::record_batch::Re
 }
 
 fn make_ledger(n_batches: usize, rows_per_batch: usize) -> Ledger {
-    let mut ledger = Ledger::new(&entity_schema(None), "entity_id").unwrap();
+    let mut ledger = Ledger::new(&entity_schema(), "entity_id").unwrap();
     for i in 0..n_batches {
         let t_offset = (i as u64) * (rows_per_batch as u64) * 1_000_000;
         ledger
@@ -64,7 +64,7 @@ fn bench_entity_ingestion(c: &mut Criterion) {
     for n_rows in [1_000usize, 10_000, 100_000] {
         group.bench_with_input(BenchmarkId::new("rows", n_rows), &n_rows, |b, &n| {
             b.iter(|| {
-                let mut builder = soloc::entity::EntityBuilder::new(n, None);
+                let mut builder = soloc::entity::EntityBuilder::new(n);
                 for i in 0..n {
                     let angle = (i as f64) * 2.0 * std::f64::consts::PI / (n as f64);
                     builder.append_entity(
@@ -101,7 +101,7 @@ fn bench_append(c: &mut Criterion) {
             &n_batches,
             |b, &n| {
                 b.iter(|| {
-                    let mut ledger = Ledger::new(&entity_schema(None), "entity_id").unwrap();
+                    let mut ledger = Ledger::new(&entity_schema(), "entity_id").unwrap();
                     for _ in 0..n {
                         ledger.append(black_box(batch.clone())).unwrap();
                     }

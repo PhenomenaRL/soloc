@@ -268,30 +268,24 @@ fn apply_boolean_mask(
 mod tests {
     use super::*;
     use crate::ephemeris::j2000_tai;
-    use crate::schema::{FrameRegistry, SpaceTimestampBuilder, sts_schema};
+    use crate::schema::{SpaceTimestampBuilder, sts_schema};
     use arrow::datatypes::{DataType, Field, Schema};
     use hifitime::Duration;
 
-    fn make_sts_batch(
-        builder: &mut SpaceTimestampBuilder,
-        reg: Option<&FrameRegistry>,
-    ) -> RecordBatch {
+    fn make_sts_batch(builder: &mut SpaceTimestampBuilder) -> RecordBatch {
         let struct_array = builder.finish_as_struct();
-        let sts_ref = sts_schema(reg);
-        let schema = Arc::new(
-            Schema::new(vec![Field::new(
-                "spacetimestamp",
-                DataType::Struct(sts_ref.fields().clone()),
-                false,
-            )])
-            .with_metadata(sts_ref.metadata().clone()),
-        );
+        let sts_ref = sts_schema();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "spacetimestamp",
+            DataType::Struct(sts_ref.fields().clone()),
+            false,
+        )]));
         RecordBatch::try_new(schema, vec![Arc::new(struct_array)]).unwrap()
     }
 
     #[test]
     fn test_no_filter_returns_all_rows() {
-        let mut builder = SpaceTimestampBuilder::new(2, None);
+        let mut builder = SpaceTimestampBuilder::new(2);
         builder.append_spacetimestamp(
             "ICRF",
             "km",
@@ -318,7 +312,7 @@ mod tests {
             None,
             None,
         );
-        let batch = make_sts_batch(&mut builder, None);
+        let batch = make_sts_batch(&mut builder);
         let result = filter_batch(&batch, &SpatiotemporalFilter::new()).unwrap();
         assert_eq!(result.num_rows(), 2);
     }
@@ -329,7 +323,7 @@ mod tests {
         let t1 = j2000 + Duration::from_parts(0, 500);
         let t2 = j2000 + Duration::from_parts(0, 1500);
 
-        let mut builder = SpaceTimestampBuilder::new(3, None);
+        let mut builder = SpaceTimestampBuilder::new(3);
         // Row 0: ns=0 — before range, excluded
         builder.append_spacetimestamp(
             "ICRF",
@@ -373,7 +367,7 @@ mod tests {
             None,
         );
 
-        let batch = make_sts_batch(&mut builder, None);
+        let batch = make_sts_batch(&mut builder);
         let result =
             filter_batch(&batch, &SpatiotemporalFilter::new().with_time_range(t1, t2)).unwrap();
         assert_eq!(result.num_rows(), 1);
@@ -381,7 +375,7 @@ mod tests {
 
     #[test]
     fn test_spatial_filter_keeps_rows_within_radius() {
-        let mut builder = SpaceTimestampBuilder::new(3, None);
+        let mut builder = SpaceTimestampBuilder::new(3);
         // Row 0: origin — inside
         builder.append_spacetimestamp(
             "ICRF",
@@ -425,7 +419,7 @@ mod tests {
             None,
         );
 
-        let batch = make_sts_batch(&mut builder, None);
+        let batch = make_sts_batch(&mut builder);
         let result = filter_batch(
             &batch,
             &SpatiotemporalFilter::new().with_spatial([0.0, 0.0, 0.0], 5.0),
@@ -436,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_mixed_frame_returns_helpful_error() {
-        let mut builder = SpaceTimestampBuilder::new(2, None);
+        let mut builder = SpaceTimestampBuilder::new(2);
         builder.append_spacetimestamp(
             "ICRF",
             "km",
@@ -464,7 +458,7 @@ mod tests {
             None,
         );
 
-        let batch = make_sts_batch(&mut builder, None);
+        let batch = make_sts_batch(&mut builder);
         let err = filter_batch(
             &batch,
             &SpatiotemporalFilter::new().with_spatial([0.0, 0.0, 0.0], 100.0),
@@ -481,7 +475,7 @@ mod tests {
         let t_start = j2000 + Duration::from_parts(0, 0);
         let t_end = j2000 + Duration::from_parts(0, 1000);
 
-        let mut builder = SpaceTimestampBuilder::new(3, None);
+        let mut builder = SpaceTimestampBuilder::new(3);
         // Row 0: in time range, inside sphere → kept
         builder.append_spacetimestamp(
             "ICRF",
@@ -525,7 +519,7 @@ mod tests {
             None,
         );
 
-        let batch = make_sts_batch(&mut builder, None);
+        let batch = make_sts_batch(&mut builder);
         let result = filter_batch(
             &batch,
             &SpatiotemporalFilter::new()

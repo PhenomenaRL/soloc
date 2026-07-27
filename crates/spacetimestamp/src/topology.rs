@@ -626,7 +626,7 @@ mod tests {
             ),
             Field::new(
                 STS_COLUMN,
-                DataType::Struct(sts_schema(None).fields().clone()),
+                DataType::Struct(sts_schema().fields().clone()),
                 false,
             ),
         ]))
@@ -637,7 +637,7 @@ mod tests {
         use arrow::array::StringDictionaryBuilder;
 
         let mut ids = StringDictionaryBuilder::<UInt32Type>::new();
-        let mut sts = SpaceTimestampBuilder::new(rows.len(), None);
+        let mut sts = SpaceTimestampBuilder::new(rows.len());
         for (id, frame, ns) in rows {
             ids.append_value(id);
             sts.append_spacetimestamp(

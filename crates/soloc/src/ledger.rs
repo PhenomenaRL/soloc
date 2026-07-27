@@ -40,7 +40,7 @@ use std::path::Path;
 use anise::prelude::Almanac;
 use spacetimestamp::ephemeris::j2000_tai;
 use spacetimestamp::query::{SpatiotemporalFilter, filter_batch};
-use spacetimestamp::schema::{FrameRegistry, STS_COLUMN, is_entity_uri};
+use spacetimestamp::schema::{STS_COLUMN, is_entity_uri};
 use spacetimestamp::topology::TransformTree;
 use spacetimestamp::transforms::{normalize_batch_to_tai, transform_batch};
 use spacetimestamp::validation::validate_spacetimestamp_batch;
@@ -65,10 +65,10 @@ const CURRENT_STATE_WINDOW_NS: u64 = 3_600 * 1_000_000_000; // 1 hour
 ///
 /// For the standard entity schema, construct with:
 /// ```rust,ignore
-/// use soloc::entity::entity_schema;
+/// use soloc::schemas::entity::entity_schema;
 /// use soloc::ledger::Ledger;
 ///
-/// let ledger = Ledger::new(&entity_schema(None), "spacetimestamp", "entity_id").unwrap();
+/// let ledger = Ledger::new(&entity_schema(), "entity_id").unwrap();
 /// ```
 #[derive(Debug)]
 pub struct Ledger {
@@ -123,10 +123,10 @@ impl Ledger {
     ///
     /// ```rust,ignore
     /// use soloc::schemas::entity::EntitySchema;
-    /// let ledger = Ledger::for_schema::<EntitySchema>(None)?;
+    /// let ledger = Ledger::for_schema::<EntitySchema>()?;
     /// ```
-    pub fn for_schema<S: SolocSchema>(registry: Option<&FrameRegistry>) -> Result<Self, String> {
-        Self::new(&S::schema(registry), S::id_column())
+    pub fn for_schema<S: SolocSchema>() -> Result<Self, String> {
+        Self::new(&S::schema(), S::id_column())
     }
 
     /// Returns the Arrow schema this ledger was created with.
@@ -426,7 +426,7 @@ impl Ledger {
     ///
     /// ```rust,ignore
     /// let almanac = MetaAlmanac::latest()?;
-    /// let mut ledger = Ledger::new(&entity_schema(None), "spacetimestamp", "entity_id")?;
+    /// let mut ledger = Ledger::new(&entity_schema(), "entity_id")?;
     /// ledger.seed_solar_system(&almanac, CelestialBody::ALL, epoch)?;
     /// ```
     pub fn seed_solar_system(
@@ -447,9 +447,8 @@ impl Ledger {
     /// supplies the almanac so the ledger itself remains a pure data store.
     ///
     /// Entity-URI `frame_id` values (e.g. `"demo:truck_A"`) are resolved by looking up
-    /// the parent entity's latest pose in the ledger at the batch's epoch and composing
-    /// the isometry chain. Static [`spacetimestamp::schema::FrameRegistry`] entries embedded
-    /// in `batch`'s schema metadata are honoured automatically.
+    /// the parent entity's latest pose in the ledger at each row's epoch and composing
+    /// the isometry chain, following the topology derived from the appended rows.
     ///
     /// ```rust,ignore
     /// let result = ledger.transform(&my_batch, "ICRF", "km", &almanac)?;
@@ -651,8 +650,7 @@ impl Ledger {
         Ok(())
     }
 
-    /// Writes the ledger's schema (and embedded [`FrameRegistry`] metadata) to an Arrow IPC
-    /// file with zero data batches.
+    /// Writes the ledger's schema to an Arrow IPC file with zero data batches.
     ///
     /// The file can be read back by [`Ledger::load_schema_ipc`] or by any language that
     /// speaks Arrow IPC (Python `pyarrow`, Java, Go, …) — the schema and all metadata are
@@ -676,7 +674,8 @@ impl Ledger {
     /// with that schema.
     ///
     /// Any data batches present in the file are ignored — this function only cares about
-    /// the schema and its metadata (e.g. an embedded [`FrameRegistry`]).
+    /// the schema and its metadata. Frame topology is *not* carried by the schema; it is
+    /// rebuilt from the rows themselves as batches are appended or loaded.
     ///
     /// Pair with [`Ledger::save_schema_ipc`] for schema distribution (e.g. baking a
     /// schema file into a Docker image).
@@ -1171,7 +1170,7 @@ mod tests {
 
     /// Schema matching make_batch() — just a spacetimestamp struct, no entity_id.
     fn sts_only_schema() -> SchemaRef {
-        let sts_ref = sts_schema(None);
+        let sts_ref = sts_schema();
         Arc::new(
             Schema::new(vec![Field::new(
                 "spacetimestamp",
@@ -1184,7 +1183,7 @@ mod tests {
 
     /// Build a minimal single-row batch that embeds a spacetimestamp struct column.
     fn make_batch(pos: [f64; 3], ns: u64) -> RecordBatch {
-        let mut builder = SpaceTimestampBuilder::new(1, None);
+        let mut builder = SpaceTimestampBuilder::new(1);
         builder.append_spacetimestamp(
             "ICRF",
             "km",
@@ -1209,7 +1208,7 @@ mod tests {
 
     fn make_entity_ledger() -> Ledger {
         use crate::schemas::entity::entity_schema;
-        Ledger::new(&entity_schema(None), "entity_id").unwrap()
+        Ledger::new(&entity_schema(), "entity_id").unwrap()
     }
 
     #[test]
@@ -1393,39 +1392,6 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_ipc_preserves_frame_registry_metadata() {
-        use spacetimestamp::schema::{FrameRegistry, sts_schema};
-        let mut reg = FrameRegistry::new_with_namespace("test_ns");
-        reg.add_frame("cam", "ICRF", [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
-        let sts_ref = sts_schema(Some(&reg));
-        let schema = Arc::new(
-            Schema::new(vec![Field::new(
-                "spacetimestamp",
-                DataType::Struct(sts_ref.fields().clone()),
-                false,
-            )])
-            .with_metadata(sts_ref.metadata().clone()),
-        );
-        let ledger = Ledger::new(&schema, "").unwrap();
-
-        let bytes = ledger.schema_to_ipc_bytes().unwrap();
-        let loaded = Ledger::from_schema_ipc_bytes(&bytes, "").unwrap();
-
-        let meta = loaded
-            .schema()
-            .metadata()
-            .get("soloc.frame_registry")
-            .cloned();
-        assert!(
-            meta.is_some(),
-            "FrameRegistry metadata must survive schema IPC round-trip"
-        );
-        let recovered = FrameRegistry::from_json(&meta.unwrap()).unwrap();
-        assert_eq!(recovered.namespace, "test_ns");
-        assert!(recovered.frames.contains_key("test_ns:cam"));
-    }
-
-    #[test]
     fn test_save_schema_ipc_accepts_empty_ledger() {
         // Unlike save_ipc, save_schema_ipc must not error on an empty ledger.
         let ledger = make_sts_ledger();
@@ -1486,7 +1452,7 @@ mod tests {
         // Build a spacetimestamp struct where `duration_ns` is Int32 instead of UInt64.
         // validate_schema must catch the type mismatch before any runtime downcast panic.
         use spacetimestamp::schema::sts_schema;
-        let sts_ref = sts_schema(None);
+        let sts_ref = sts_schema();
         let mut fields: Vec<Field> = sts_ref.fields().iter().map(|f| (**f).clone()).collect();
         let ns_idx = fields
             .iter()
@@ -1514,7 +1480,7 @@ mod tests {
     fn test_new_rejects_missing_sts_field() {
         // Build a struct that is missing the `position` field entirely.
         use spacetimestamp::schema::sts_schema;
-        let sts_ref = sts_schema(None);
+        let sts_ref = sts_schema();
         let fields: Vec<Field> = sts_ref
             .fields()
             .iter()
@@ -1546,7 +1512,7 @@ mod tests {
         ns: u64,
     ) -> RecordBatch {
         use crate::schemas::entity::EntityBuilder;
-        let mut b = EntityBuilder::new(1, None);
+        let mut b = EntityBuilder::new(1);
         b.append_entity(
             entity_id, frame_id, "km", "TAI", "test:src", "MEASURED", pos, quat, 0, ns, None, None,
             None, None, None,
@@ -1685,6 +1651,44 @@ mod tests {
         );
     }
 
+    /// A parent frame that is neither an entity URI nor a name anise knows would leave the
+    /// child dangling off nothing. Catching it at append preserves the "typo caught early"
+    /// property the old `add_frame_validated` provided at registration time.
+    #[test]
+    fn test_append_rejects_floating_frame() {
+        let mut ledger = make_entity_ledger();
+        let err = ledger
+            .append(make_entity_batch(
+                "demo:rover",
+                "IAU_MRAS", // typo for IAU_MARS
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap_err();
+        assert!(
+            err.contains("IAU_MRAS"),
+            "error should name the offending frame: {err}"
+        );
+        assert_eq!(ledger.len(), 0, "rejected batch must not be stored");
+    }
+
+    /// Raw NAIF integer IDs are a legal parent and must survive the floating-frame check.
+    #[test]
+    fn test_append_accepts_naif_integer_parent() {
+        let mut ledger = make_entity_ledger();
+        ledger
+            .append(make_entity_batch(
+                "demo:lander",
+                "499", // Mars
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
+        assert_eq!(ledger.len(), 1);
+    }
+
     // -----------------------------------------------------------------------
     // topology derivation, persistence, and federation tests
     // -----------------------------------------------------------------------
@@ -1760,6 +1764,93 @@ mod tests {
             err.contains("not found in ledger"),
             "expected a missing-pose error, got: {err}"
         );
+    }
+
+    /// End-to-end through the public `transform` API: topology derived from appended rows →
+    /// pose cache → resolver → `transform_batch`. The individual pieces are covered above;
+    /// this pins the composition, which is the seam the transform-tree redesign rewired.
+    ///
+    /// Chain: `demo:sensor` @ [1,0,0] in `demo:robot` @ [5,0,0] in `demo:facility` @ [50,0,0]
+    /// in Earth. Reprojected into Earth the offsets sum to 56 km.
+    #[test]
+    fn test_transform_resolves_derived_chain_end_to_end() {
+        let mut ledger = make_entity_ledger();
+        ledger
+            .append(make_entity_batch(
+                "demo:facility",
+                "Earth",
+                [50.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
+        ledger
+            .append(make_entity_batch(
+                "demo:robot",
+                "demo:facility",
+                [5.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
+
+        // A reading expressed in the robot's frame — never appended, just reprojected.
+        let observation = make_entity_batch(
+            "demo:sensor",
+            "demo:robot",
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+        );
+
+        let result = ledger
+            .transform(&observation, "Earth", "km", &Almanac::default())
+            .expect("transform should resolve the full derived chain");
+
+        let sts = result
+            .column_by_name(STS_COLUMN)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let pos = sts
+            .column_by_name("position")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeListArray>()
+            .unwrap();
+        let vals = pos
+            .values()
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+
+        assert!(
+            (vals.value(0) - 56.0).abs() < 1e-9,
+            "expected 50 + 5 + 1 = 56 km, got {}",
+            vals.value(0)
+        );
+        assert!(vals.value(1).abs() < 1e-9);
+        assert!(vals.value(2).abs() < 1e-9);
+    }
+
+    /// A batch with no entity-URI frames must take `transform`'s no-resolver fast path and
+    /// still come back correct.
+    #[test]
+    fn test_transform_passthrough_batch_needs_no_topology() {
+        let ledger = make_entity_ledger();
+        let observation = make_entity_batch(
+            "demo:probe",
+            "Earth",
+            [7.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+        );
+
+        let result = ledger
+            .transform(&observation, "Earth", "km", &Almanac::default())
+            .expect("astronomical-only batch needs no ledger topology");
+        assert_eq!(result.num_rows(), 1);
     }
 
     /// Re-parenting is an ordinary append, and queries at different epochs must see the
@@ -1968,7 +2059,7 @@ mod tests {
     fn test_pose_cache_normalises_units_to_km() {
         use crate::schemas::entity::EntityBuilder;
         let mut ledger = make_entity_ledger();
-        let mut b = EntityBuilder::new(1, None);
+        let mut b = EntityBuilder::new(1);
         b.append_entity(
             "demo:A",
             "ICRF",
@@ -2055,7 +2146,7 @@ mod tests {
         estimate_type: &str,
     ) -> RecordBatch {
         use crate::schemas::entity::EntityBuilder;
-        let mut b = EntityBuilder::new(1, None);
+        let mut b = EntityBuilder::new(1);
         b.append_entity(
             entity_id,
             "ICRF",
@@ -2202,7 +2293,7 @@ mod tests {
         let mut ledger = make_entity_ledger();
         use crate::schemas::entity::EntityBuilder;
         let batch0 = {
-            let mut b = EntityBuilder::new(2, None);
+            let mut b = EntityBuilder::new(2);
             b.append_entity(
                 "demo:A",
                 "ICRF",

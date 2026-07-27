@@ -18,7 +18,63 @@ use hifitime::{Duration, Epoch, TimeScale};
 use nalgebra::{Rotation3, UnitQuaternion};
 use std::str::FromStr;
 
-use crate::schema::{KNOWN_EXTERNAL_FRAMES, SpaceTimestampBuilder};
+use crate::schema::SpaceTimestampBuilder;
+
+// ---------------------------------------------------------------------------
+// Known external frames
+// ---------------------------------------------------------------------------
+
+/// Astronomical frame names statically trusted as external roots.
+///
+/// A `frame_id` naming one of these entries is an astronomical anchor — the terminal
+/// node of a transform chain — rather than an entity whose pose must be looked up in a
+/// ledger. Entries are trusted without a runtime anise probe because not all of them
+/// resolve as body centers (`ICRF`, for example, is an orientation), so
+/// [`is_valid_astronomical_frame`] accepts them directly.
+///
+/// All entries must nonetheless be resolvable by [`resolve_astronomical_frame`]
+/// (verified by `test_known_external_frames_all_resolve`). Do not add names here that
+/// anise cannot map to a NAIF frame — they will pass validation but fail at transform time.
+///
+/// This list is not exhaustive: `IAU_*` body-fixed names and raw NAIF integer IDs are
+/// accepted by [`is_valid_astronomical_frame`] through their own resolution paths and
+/// do not need an entry here.
+///
+/// Earth-fixed frames: use `IAU_EARTH` (NAIF PCK body-fixed model). `ITRF`, `ECEF`, and
+/// `ECI` are not NAIF frame names and are intentionally absent. `TEME` (True Equator Mean
+/// Equinox, used in TLE/SGP4) requires a custom FK kernel not loaded by default and is
+/// also absent; it will be added when TLE support is implemented.
+pub const KNOWN_EXTERNAL_FRAMES: &[&str] = &[
+    // Inertial / quasi-inertial (NAIF orientation ID 1 = J2000/ICRF)
+    "ICRF",
+    "J2000",
+    "GCRF",
+    "EME2000",
+    // Barycenters (NAIF body IDs: SSB=0, EMB=3)
+    "SSB",
+    "EMB",
+    // Solar system body centers with J2000 orientation
+    "Sun",
+    "Mercury",
+    "Venus",
+    "Earth",
+    "Moon",
+    "Mars",
+    "Jupiter",
+    "Saturn",
+    "Uranus",
+    "Neptune",
+    "Pluto",
+    // Major moon body centers with J2000 orientation
+    "Phobos",
+    "Deimos",
+    "Io",
+    "Europa",
+    "Ganymede",
+    "Callisto",
+    "Titan",
+    "Enceladus",
+];
 
 // ---------------------------------------------------------------------------
 // Epoch helpers
@@ -156,7 +212,8 @@ pub(crate) fn resolve_astronomical_frame(name: &str) -> Option<Frame> {
 ///
 /// Accepts entries in [`KNOWN_EXTERNAL_FRAMES`] (statically trusted), any `IAU_BODY` name
 /// resolvable by [`iau_frame_from_name`], and any name resolvable at runtime by anise.
-/// This is the single source of truth shared by validation and `add_frame_validated`.
+/// This is the single source of truth shared by batch validation and the topology
+/// floating-frame check.
 pub(crate) fn is_valid_astronomical_frame(name: &str) -> bool {
     KNOWN_EXTERNAL_FRAMES.contains(&name) || resolve_astronomical_frame(name).is_some()
 }
@@ -455,7 +512,7 @@ pub fn celestial_sts_snapshot(
         return Err("bodies list is empty — provide at least one CelestialBody".to_string());
     }
     let (centuries, ns) = epoch_to_parts(epoch);
-    let mut builder = SpaceTimestampBuilder::new(bodies.len(), None);
+    let mut builder = SpaceTimestampBuilder::new(bodies.len());
     for &body in bodies {
         let cs = query_celestial_state(almanac, body, epoch)?;
         builder.append_spacetimestamp(
@@ -482,7 +539,6 @@ pub fn celestial_sts_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::KNOWN_EXTERNAL_FRAMES;
     use hifitime::Duration;
 
     /// Every entry in KNOWN_EXTERNAL_FRAMES must be resolvable by anise at transform time.
