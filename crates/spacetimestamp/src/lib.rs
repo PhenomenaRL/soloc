@@ -7,6 +7,7 @@
 pub mod ephemeris;
 pub mod query;
 pub mod schema;
+pub mod topology;
 pub mod transforms;
 pub mod validation;
 
