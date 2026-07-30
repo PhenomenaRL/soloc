@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 anise = "0.9.4"
-arrow = "57.1.0"
+arrow = "59.1.0"
 hifitime = "4.2.4"
 log = "0.4"
 nalgebra = "0.34"

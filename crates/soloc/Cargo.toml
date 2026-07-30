@@ -9,7 +9,7 @@ spacetimestamp = { path = "../spacetimestamp" }
 anise = "0.9.4"
 nalgebra = "0.34"
 hifitime = "4.2.3"
-arrow = "57.1.0"
+arrow = "59.1.0"
 log = "0.4"
 
 [dev-dependencies]
