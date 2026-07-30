@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 spacetimestamp = { path = "../spacetimestamp" }
-anise = "0.9.4"
+anise = "0.10.4"
 nalgebra = "0.34"
 hifitime = "4.2.3"
 arrow = "57.1.0"
