@@ -1515,7 +1515,7 @@ mod tests {
         let mut b = EntityBuilder::new(1);
         b.append_entity(
             entity_id, frame_id, "km", "TAI", "test:src", "MEASURED", pos, quat, 0, ns, None, None,
-            None, None, None,
+            None, None, None, None,
         );
         b.flush()
     }
@@ -2076,6 +2076,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         ledger.append(b.flush()).unwrap();
 
@@ -2158,6 +2159,7 @@ mod tests {
             [1.0, 0.0, 0.0, 0.0],
             0,
             ns,
+            None,
             None,
             None,
             None,
@@ -2310,6 +2312,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
             b.append_entity(
                 "demo:B",
@@ -2322,6 +2325,7 @@ mod tests {
                 [1.0, 0.0, 0.0, 0.0],
                 0,
                 100,
+                None,
                 None,
                 None,
                 None,
