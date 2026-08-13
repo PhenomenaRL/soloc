@@ -94,6 +94,7 @@ pub fn celestial_snapshot(
             None,
             cs.mass_kg,
             None,
+            None,
         );
     }
 
@@ -148,6 +149,7 @@ pub fn naif_snapshot(
             ns,
             Some(cs.velocity_km_s),
             cs.angular_velocity,
+            None,
             None,
             None,
             None,
@@ -335,12 +337,20 @@ mod tests {
         assert!(batch.schema().field_with_name("spacetimestamp").is_ok());
         assert!(batch.schema().field_with_name("velocity").is_ok());
         assert!(batch.schema().field_with_name("mass_kg").is_ok());
+        assert!(batch.schema().field_with_name("dimensions").is_ok());
 
         let vel = batch.column_by_name("velocity").unwrap();
         assert_eq!(vel.null_count(), 0, "all bodies should have velocity");
 
         let mass = batch.column_by_name("mass_kg").unwrap();
         assert_eq!(mass.null_count(), 0, "all bodies should have mass");
+
+        let dimensions = batch.column_by_name("dimensions").unwrap();
+        assert_eq!(
+            dimensions.null_count(),
+            batch.num_rows(),
+            "celestial dimensions are not populated by this helper"
+        );
 
         let ang_vel = batch.column_by_name("angular_velocity").unwrap();
         assert_eq!(

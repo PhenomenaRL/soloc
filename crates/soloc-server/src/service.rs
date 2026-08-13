@@ -646,6 +646,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         b.flush()
     }

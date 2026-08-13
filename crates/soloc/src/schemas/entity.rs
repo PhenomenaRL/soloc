@@ -1,8 +1,9 @@
 //! The standard entity schema — a reference implementation of [`SolocSchema`].
 //!
 //! An Entity is a tracked object in the solar system: a spacecraft, planet, robot,
-//! or sensor. It embeds a `spacetimestamp` for its pose and adds optional kinematic
-//! fields (`velocity`, `angular_velocity`, `acceleration`, `mass_kg`, `state_covariance`).
+//! or sensor. It embeds a `spacetimestamp` for its pose and adds optional kinematic and
+//! physical-property fields (`velocity`, `angular_velocity`, `acceleration`, `mass_kg`,
+//! `state_covariance`, `dimensions`).
 //!
 //! This is the first-party schema bundled with `soloc`, but it is not hardcoded anywhere
 //! in the ledger or server. Users can supply a different schema by implementing
@@ -60,6 +61,9 @@ impl SolocSchema for EntitySchema {
 /// 1. Static IoT Sensors (only `spacetimestamp` populated).
 /// 2. Planets/Spacecraft (populate `velocity` and `mass_kg`).
 /// 3. Drones/Robots (populate `velocity`, `angular_velocity`, and `acceleration`).
+///
+/// `dimensions` contains full physical extents in metres along the entity-local `[x, y, z]`
+/// axes. It is null when an entity's physical extent is unknown.
 pub fn entity_schema() -> SchemaRef {
     let sts = sts_schema();
 
@@ -103,6 +107,13 @@ pub fn entity_schema() -> SchemaRef {
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 21),
             true,
         ),
+        // Full physical dimensions in metres along the entity-local [x, y, z] axes.
+        // Null when unknown.
+        Field::new(
+            "dimensions",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 3),
+            true,
+        ),
     ]))
 }
 
@@ -119,6 +130,7 @@ pub struct EntityBuilder {
     acceleration: FixedSizeListBuilder<Float64Builder>,
     mass_kg: Float64Builder,
     state_covariance: FixedSizeListBuilder<Float64Builder>,
+    dimensions: FixedSizeListBuilder<Float64Builder>,
 }
 
 impl EntityBuilder {
@@ -138,6 +150,7 @@ impl EntityBuilder {
                 Float64Builder::with_capacity(capacity * 21),
                 21,
             ),
+            dimensions: FixedSizeListBuilder::new(Float64Builder::with_capacity(capacity * 3), 3),
         }
     }
 
@@ -152,6 +165,9 @@ impl EntityBuilder {
     }
 
     /// Appends a single row of Entity data to the internal builders.
+    ///
+    /// `dimensions_m` contains full physical extents along the entity-local `[x, y, z]` axes;
+    /// pass `None` when the dimensions are unknown.
     #[allow(clippy::too_many_arguments)]
     pub fn append_entity(
         &mut self,
@@ -170,6 +186,7 @@ impl EntityBuilder {
         acceleration: Option<[f64; 3]>,
         mass_kg: Option<f64>,
         state_covariance: Option<[f64; 21]>,
+        dimensions_m: Option<[f64; 3]>,
     ) {
         self.entity_id.append_value(entity_id);
 
@@ -226,6 +243,21 @@ impl EntityBuilder {
             }
         }
 
+        match dimensions_m {
+            Some(dimensions) => {
+                for value in dimensions {
+                    self.dimensions.values().append_value(value);
+                }
+                self.dimensions.append(true);
+            }
+            None => {
+                for _ in 0..3 {
+                    self.dimensions.values().append_null();
+                }
+                self.dimensions.append(false);
+            }
+        }
+
         self.sts_builder.append_spacetimestamp(
             frame_id,
             units_pos,
@@ -256,6 +288,7 @@ impl EntityBuilder {
                 Arc::new(self.acceleration.finish()),
                 Arc::new(self.mass_kg.finish()),
                 Arc::new(self.state_covariance.finish()),
+                Arc::new(self.dimensions.finish()),
             ],
         )
         .expect("should create record batch")
@@ -265,13 +298,13 @@ impl EntityBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::StructArray;
+    use arrow::array::{Array, FixedSizeListArray, Float64Array, StructArray};
     use spacetimestamp::validation::validate_spacetimestamp_batch;
 
     #[test]
     fn test_entity_schema_definition() {
         let schema = entity_schema();
-        assert_eq!(schema.fields().len(), 7);
+        assert_eq!(schema.fields().len(), 8);
 
         let entity_id = schema.field_with_name("entity_id").unwrap();
         match entity_id.data_type() {
@@ -287,6 +320,16 @@ mod tests {
 
         let vel = schema.field_with_name("velocity").unwrap();
         assert!(vel.is_nullable());
+
+        let dimensions = schema.field_with_name("dimensions").unwrap();
+        assert!(dimensions.is_nullable());
+        match dimensions.data_type() {
+            DataType::FixedSizeList(item, size) => {
+                assert_eq!(*size, 3);
+                assert_eq!(item.data_type(), &DataType::Float64);
+            }
+            _ => panic!("dimensions should be FixedSizeList(3, Float64)"),
+        }
     }
 
     #[test]
@@ -316,6 +359,7 @@ mod tests {
             None,
             Some(5.972e24),
             None,
+            Some([12_742_000.0, 12_742_000.0, 12_714_000.0]),
         );
         builder.append_entity(
             "demo:sensor_1",
@@ -333,12 +377,30 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let batch = builder.flush();
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.column_by_name("velocity").unwrap().null_count(), 1);
         assert_eq!(batch.column_by_name("mass_kg").unwrap().null_count(), 1);
+
+        let dimensions = batch
+            .column_by_name("dimensions")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert!(!dimensions.is_null(0));
+        assert!(dimensions.is_null(1));
+        let values = dimensions
+            .values()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 12_742_000.0);
+        assert_eq!(values.value(1), 12_742_000.0);
+        assert_eq!(values.value(2), 12_714_000.0);
     }
 
     #[test]
@@ -360,6 +422,7 @@ mod tests {
             None,
             Some(5.972e24),
             None,
+            Some([12_742_000.0, 12_742_000.0, 12_714_000.0]),
         );
         let batch = builder.flush();
 

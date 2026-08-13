@@ -31,6 +31,7 @@ fn make_entity_batch(n_rows: usize, t_offset_ns: u64) -> arrow::record_batch::Re
             None,
             Some(500.0),
             None,
+            None,
         );
     }
     builder.flush()
@@ -82,6 +83,7 @@ fn bench_entity_ingestion(c: &mut Criterion) {
                         None,
                         None,
                         Some(500.0),
+                        None,
                         None,
                     );
                 }
