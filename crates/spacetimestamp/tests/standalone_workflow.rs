@@ -51,6 +51,7 @@ fn build_batch() -> RecordBatch {
             None,
             None,
             None,
+            None,
         );
     }
     builder.flush()
@@ -111,7 +112,11 @@ fn build_validate_derive_topology_and_transform_without_a_ledger() {
     let outcome = tree
         .ingest_batch(&batch, "entity_id")
         .expect("topology should derive from an entity batch");
-    assert_eq!(outcome.events.len(), 3, "one edge per entity on first sight");
+    assert_eq!(
+        outcome.events.len(),
+        3,
+        "one edge per entity on first sight"
+    );
     assert_eq!(tree.current_parent("demo:robot"), Some("demo:truck"));
 
     // 3. Walk the structure to its astronomical anchor.
@@ -169,13 +174,17 @@ fn topology_rejects_an_unreachable_frame_without_a_ledger() {
         None,
         None,
         None,
+        None,
     );
     let batch = builder.flush();
 
     let mut tree = TransformTree::new();
     let err = tree.ingest_batch(&batch, "entity_id").unwrap_err();
     assert!(err.contains("NOT_A_FRAME"), "error should name it: {err}");
-    assert!(tree.is_empty(), "a rejected batch must leave the tree empty");
+    assert!(
+        tree.is_empty(),
+        "a rejected batch must leave the tree empty"
+    );
 }
 
 fn assert_positions_match(actual: [f64; 3], expected: [f64; 3], label: &str) {

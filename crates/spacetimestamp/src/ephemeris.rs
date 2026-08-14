@@ -608,6 +608,7 @@ pub fn celestial_snapshot(
             None,
             cs.mass_kg,
             None,
+            None,
         );
     }
 
@@ -662,6 +663,7 @@ pub fn naif_snapshot(
             ns,
             Some(cs.velocity_km_s),
             cs.angular_velocity,
+            None,
             None,
             None,
             None,
