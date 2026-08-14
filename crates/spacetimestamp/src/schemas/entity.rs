@@ -1,13 +1,17 @@
-//! The standard entity schema — a reference implementation of [`SolocSchema`].
+//! The standard entity schema — a reference implementation of [`SpaceTimestampSchema`].
 //!
 //! An Entity is a tracked object in the solar system: a spacecraft, planet, robot,
 //! or sensor. It embeds a `spacetimestamp` for its pose and adds optional kinematic and
 //! physical-property fields (`velocity`, `angular_velocity`, `acceleration`, `mass_kg`,
 //! `state_covariance`, `dimensions`).
 //!
-//! This is the first-party schema bundled with `soloc`, but it is not hardcoded anywhere
-//! in the ledger or server. Users can supply a different schema by implementing
-//! [`SolocSchema`] and passing it to [`crate::ledger::Ledger::for_schema`].
+//! This is the first-party schema bundled with this crate, but it is not hardcoded
+//! anywhere in the ledger or server. Users can supply a different schema by implementing
+//! [`SpaceTimestampSchema`].
+//!
+//! Because this schema carries an `entity_id` alongside the `spacetimestamp` struct, batches
+//! built with [`EntityBuilder`] can be fed straight to [`crate::topology::TransformTree`] and
+//! [`crate::transforms::transform_batch`] — no ledger required.
 //!
 //! # Semantics: Target vs. Observer
 //!
@@ -22,27 +26,27 @@ use alloc::sync::Arc;
 use arrow::array::{FixedSizeListBuilder, Float64Builder, StringDictionaryBuilder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt32Type};
 use arrow::record_batch::RecordBatch;
-use spacetimestamp::schema::{SpaceTimestampBuilder, sts_schema};
+use crate::schema::{SpaceTimestampBuilder, sts_schema};
 
-use super::SolocSchema;
+use super::SpaceTimestampSchema;
 
 // ---------------------------------------------------------------------------
 // Schema + trait impl
 // ---------------------------------------------------------------------------
 
-/// Unit struct that implements [`SolocSchema`] for the standard entity schema.
+/// Unit struct that implements [`SpaceTimestampSchema`] for the standard entity schema.
 ///
-/// Pass this as the type parameter to [`crate::ledger::Ledger::for_schema`]:
+/// Pass this as the type parameter to `soloc::ledger::Ledger::for_schema`:
 ///
 /// ```rust,ignore
-/// use soloc::schemas::entity::EntitySchema;
+/// use spacetimestamp::schemas::entity::EntitySchema;
 /// use soloc::ledger::Ledger;
 ///
 /// let ledger = Ledger::for_schema::<EntitySchema>()?;
 /// ```
 pub struct EntitySchema;
 
-impl SolocSchema for EntitySchema {
+impl SpaceTimestampSchema for EntitySchema {
     fn schema() -> SchemaRef {
         entity_schema()
     }
@@ -298,8 +302,8 @@ impl EntityBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, FixedSizeListArray, Float64Array, StructArray};
-    use spacetimestamp::validation::validate_spacetimestamp_batch;
+    use arrow::array::StructArray;
+    use crate::validation::validate_spacetimestamp_batch;
 
     #[test]
     fn test_entity_schema_definition() {

@@ -45,7 +45,7 @@ use spacetimestamp::topology::TransformTree;
 use spacetimestamp::transforms::{normalize_batch_to_tai, transform_batch};
 use spacetimestamp::validation::validate_spacetimestamp_batch;
 
-use crate::schemas::SolocSchema;
+use spacetimestamp::schemas::SpaceTimestampSchema;
 
 /// Merge batches in memory when the count exceeds this to keep query latency bounded.
 ///
@@ -117,7 +117,7 @@ impl Ledger {
         })
     }
 
-    /// Creates an empty ledger from a [`SolocSchema`] implementor.
+    /// Creates an empty ledger from a [`SpaceTimestampSchema`] implementor.
     ///
     /// This is the preferred constructor when working with a known schema type:
     ///
@@ -125,7 +125,7 @@ impl Ledger {
     /// use soloc::schemas::entity::EntitySchema;
     /// let ledger = Ledger::for_schema::<EntitySchema>()?;
     /// ```
-    pub fn for_schema<S: SolocSchema>() -> Result<Self, String> {
+    pub fn for_schema<S: SpaceTimestampSchema>() -> Result<Self, String> {
         Self::new(&S::schema(), S::id_column())
     }
 

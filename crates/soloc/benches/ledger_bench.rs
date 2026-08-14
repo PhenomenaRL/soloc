@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hifitime::{Duration, Epoch};
-use soloc::entity::{EntityBuilder, entity_schema};
+use spacetimestamp::schemas::entity::{EntityBuilder, entity_schema};
 use soloc::ledger::Ledger;
 use spacetimestamp::ephemeris::j2000_tai;
 use spacetimestamp::query::SpatiotemporalFilter;
@@ -65,7 +65,7 @@ fn bench_entity_ingestion(c: &mut Criterion) {
     for n_rows in [1_000usize, 10_000, 100_000] {
         group.bench_with_input(BenchmarkId::new("rows", n_rows), &n_rows, |b, &n| {
             b.iter(|| {
-                let mut builder = soloc::entity::EntityBuilder::new(n);
+                let mut builder = EntityBuilder::new(n);
                 for i in 0..n {
                     let angle = (i as f64) * 2.0 * std::f64::consts::PI / (n as f64);
                     builder.append_entity(
