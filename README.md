@@ -18,9 +18,14 @@ Each observation is stored in its **original reference frame and native units, f
 
 | Crate | Description |
 |---|---|
-| [`spacetimestamp`](crates/spacetimestamp/) | Core Arrow schema, row-derived transform tree, and physics transforms |
-| [`soloc`](crates/soloc/) | custom schemas, append-only ledger |
+| [`spacetimestamp`](crates/spacetimestamp/) | Arrow schemas and builders, row-derived transform tree, physics transforms, spatiotemporal filters |
+| [`soloc`](crates/soloc/) | Append-only ledger: persistence, pose cache, federation |
 | [`soloc-server`](crates/soloc-server/) | Arrow Flight gRPC server |
+
+`spacetimestamp` stands alone — build a batch, derive its frame topology, and reproject it into
+any astronomical frame without a ledger anywhere in the picture. Reach for `soloc` when you want
+those observations *kept*: durable storage, fast "where is X now" lookups, and federation with
+peers. See `crates/spacetimestamp/tests/standalone_workflow.rs` for the ledger-free pipeline.
 
 ## Quick Start
 
