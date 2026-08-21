@@ -5,11 +5,11 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
-anise = "0.9.4"
+anise = "0.10.4"
 arrow = "57.1.0"
 hifitime = "4.2.4"
 log = "0.4"
-nalgebra = "0.34"
+nalgebra = "0.35"
 
 [dev-dependencies]
 test-log = "0.2.19"
