@@ -1,4 +1,4 @@
-//! The standard entity schema — a reference implementation of [`SpaceTimestampSchema`].
+//! The standard entity schema. A Reference implementation of [`SpaceTimestampSchema`].
 //!
 //! An Entity is a tracked object in the solar system: a spacecraft, planet, robot,
 //! or sensor. It embeds a `spacetimestamp` for its pose and adds optional kinematic and
@@ -9,10 +9,6 @@
 //! anywhere in the ledger or server. Users can supply a different schema by implementing
 //! [`SpaceTimestampSchema`].
 //!
-//! Because this schema carries an `entity_id` alongside the `spacetimestamp` struct, batches
-//! built with [`EntityBuilder`] can be fed straight to [`crate::topology::TransformTree`] and
-//! [`crate::transforms::transform_batch`] — no ledger required.
-//!
 //! # Semantics: Target vs. Observer
 //!
 //! * **Target** (`entity_id`): The entity whose state is being described.
@@ -21,11 +17,12 @@
 
 extern crate alloc;
 
-use crate::schema::{SpaceTimestampBuilder, sts_schema};
-use alloc::boxed::Box;
+use crate::identity::{PrescribedId, id_builder, id_field};
+use crate::schema::{SpaceTimestampBuilder, append_optional_list, sts_schema};
+use crate::vocabulary::{EstimateType, LengthUnit, TimeScaleCode};
 use alloc::sync::Arc;
-use arrow::array::{FixedSizeListBuilder, Float64Builder, StringDictionaryBuilder};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt32Type};
+use arrow::array::{FixedSizeBinaryBuilder, FixedSizeListBuilder, Float64Builder};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use super::SpaceTimestampSchema;
@@ -35,15 +32,6 @@ use super::SpaceTimestampSchema;
 // ---------------------------------------------------------------------------
 
 /// Unit struct that implements [`SpaceTimestampSchema`] for the standard entity schema.
-///
-/// Pass this as the type parameter to `soloc::ledger::Ledger::for_schema`:
-///
-/// ```rust,ignore
-/// use spacetimestamp::schemas::entity::EntitySchema;
-/// use soloc::ledger::Ledger;
-///
-/// let ledger = Ledger::for_schema::<EntitySchema>()?;
-/// ```
 pub struct EntitySchema;
 
 impl SpaceTimestampSchema for EntitySchema {
@@ -66,37 +54,36 @@ impl SpaceTimestampSchema for EntitySchema {
 /// 2. Planets/Spacecraft (populate `velocity` and `mass_kg`).
 /// 3. Drones/Robots (populate `velocity`, `angular_velocity`, and `acceleration`).
 ///
-/// `dimensions` contains full physical extents in metres along the entity-local `[x, y, z]`
-/// axes. It is null when an entity's physical extent is unknown.
+/// `dimensions` defines bounding box in metres along the entity-local `[x, y, z]`
+/// axes. Currently convention: body reference frame is geometrically centered,
+/// and all entities have a rectangular bounding box centered on body reference frame
+/// (ie. use x/2, y/2, z/2 in each direction from the center).
+/// Will likely need to update/enforce this.
 pub fn entity_schema() -> SchemaRef {
     let sts = sts_schema();
 
     Arc::new(Schema::new(vec![
-        // Federated entity ID (e.g., "nasa.gov:perseverance" or "naif:499" for Mars)
-        Field::new(
-            "entity_id",
-            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
-            false,
-        ),
+        // Prescribed entity identity: minted.
+        id_field("entity_id"),
         // Embed the sts_schema fields as a single Struct column
         Field::new(
             "spacetimestamp",
             DataType::Struct(sts.fields().clone()),
             false,
         ),
-        // Linear Velocity (e.g., km/s or m/s) [vx, vy, vz]
+        // Linear velocity in m/s [vx, vy, vz]
         Field::new(
             "velocity",
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 3),
             true,
         ),
-        // Angular velocity (e.g., rad/s) [wx, wy, wz]
+        // Angular velocity in rad/s [wx, wy, wz]
         Field::new(
             "angular_velocity",
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 3),
             true,
         ),
-        // Linear Acceleration (e.g., m/s^2) [ax, ay, az]
+        // Linear acceleration in m/s^2 [ax, ay, az]
         Field::new(
             "acceleration",
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 3),
@@ -105,7 +92,8 @@ pub fn entity_schema() -> SchemaRef {
         // Physical mass
         Field::new("mass_kg", DataType::Float64, true),
         // Full 6×6 state covariance over [x,y,z,vx,vy,vz] — upper triangle, row-major (21 values).
-        // Null when unknown.
+        // Mixed units, following the blocks it covers: position in units_pos², velocity in
+        // (m/s)², cross terms in units_pos·m/s. Null when unknown.
         Field::new(
             "state_covariance",
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 21),
@@ -127,7 +115,7 @@ pub fn entity_schema() -> SchemaRef {
 
 /// An efficient builder for creating [`RecordBatch`]es following the Entity schema.
 pub struct EntityBuilder {
-    entity_id: StringDictionaryBuilder<UInt32Type>,
+    entity_id: FixedSizeBinaryBuilder,
     sts_builder: SpaceTimestampBuilder,
     velocity: FixedSizeListBuilder<Float64Builder>,
     angular_velocity: FixedSizeListBuilder<Float64Builder>,
@@ -141,7 +129,7 @@ impl EntityBuilder {
     /// Creates a new EntityBuilder pre-allocated for the given capacity.
     pub fn new(capacity: usize) -> Self {
         Self {
-            entity_id: StringDictionaryBuilder::<UInt32Type>::with_capacity(capacity, 10, 100),
+            entity_id: id_builder(capacity),
             sts_builder: SpaceTimestampBuilder::new(capacity),
             velocity: FixedSizeListBuilder::new(Float64Builder::with_capacity(capacity * 3), 3),
             angular_velocity: FixedSizeListBuilder::new(
@@ -169,98 +157,38 @@ impl EntityBuilder {
     }
 
     /// Appends a single row of Entity data to the internal builders.
-    ///
-    /// `dimensions_m` contains full physical extents along the entity-local `[x, y, z]` axes;
-    /// pass `None` when the dimensions are unknown.
     #[allow(clippy::too_many_arguments)]
     pub fn append_entity(
         &mut self,
-        entity_id: &str,
-        frame_id: &str,
-        units_pos: &str,
-        timescale_id: &str,
-        source_id: &str,
-        estimate_type: &str,
+        entity_id: PrescribedId,
+        frame_id: PrescribedId,
+        units_pos: LengthUnit,
+        timescale_id: TimeScaleCode,
+        source_id: PrescribedId,
+        estimate_type: EstimateType,
         position: [f64; 3],
         quaternion: [f64; 4],
         duration_centuries: i16,
         duration_ns: u64,
-        velocity: Option<[f64; 3]>,
-        angular_velocity: Option<[f64; 3]>,
-        acceleration: Option<[f64; 3]>,
+        velocity_m_s: Option<[f64; 3]>,
+        angular_velocity_rad_s: Option<[f64; 3]>,
+        acceleration_m_s2: Option<[f64; 3]>,
         mass_kg: Option<f64>,
         state_covariance: Option<[f64; 21]>,
         dimensions_m: Option<[f64; 3]>,
     ) {
-        self.entity_id.append_value(entity_id);
+        self.entity_id
+            .append_value(entity_id.as_bytes())
+            .expect("PrescribedId is 16 bytes");
 
-        if let Some(v) = velocity {
-            for val in v {
-                self.velocity.values().append_value(val);
-            }
-            self.velocity.append(true);
-        } else {
-            for _ in 0..3 {
-                self.velocity.values().append_null();
-            }
-            self.velocity.append(false);
-        }
-
-        if let Some(w) = angular_velocity {
-            for val in w {
-                self.angular_velocity.values().append_value(val);
-            }
-            self.angular_velocity.append(true);
-        } else {
-            for _ in 0..3 {
-                self.angular_velocity.values().append_null();
-            }
-            self.angular_velocity.append(false);
-        }
-
-        if let Some(a) = acceleration {
-            for val in a {
-                self.acceleration.values().append_value(val);
-            }
-            self.acceleration.append(true);
-        } else {
-            for _ in 0..3 {
-                self.acceleration.values().append_null();
-            }
-            self.acceleration.append(false);
-        }
+        append_optional_list(&mut self.velocity, velocity_m_s);
+        append_optional_list(&mut self.angular_velocity, angular_velocity_rad_s);
+        append_optional_list(&mut self.acceleration, acceleration_m_s2);
 
         self.mass_kg.append_option(mass_kg);
 
-        match state_covariance {
-            Some(cov) => {
-                for val in cov {
-                    self.state_covariance.values().append_value(val);
-                }
-                self.state_covariance.append(true);
-            }
-            None => {
-                for _ in 0..21 {
-                    self.state_covariance.values().append_null();
-                }
-                self.state_covariance.append(false);
-            }
-        }
-
-        match dimensions_m {
-            Some(dimensions) => {
-                for value in dimensions {
-                    self.dimensions.values().append_value(value);
-                }
-                self.dimensions.append(true);
-            }
-            None => {
-                for _ in 0..3 {
-                    self.dimensions.values().append_null();
-                }
-                self.dimensions.append(false);
-            }
-        }
+        append_optional_list(&mut self.state_covariance, state_covariance);
+        append_optional_list(&mut self.dimensions, dimensions_m);
 
         self.sts_builder.append_spacetimestamp(
             frame_id,
@@ -305,19 +233,27 @@ mod tests {
     use crate::validation::validate_spacetimestamp_batch;
     use arrow::array::{Array, FixedSizeListArray, Float64Array, StructArray};
 
+    /// An entity whose pose comes from ledger rows.
+    fn entity(authority: &str, name: &str) -> PrescribedId {
+        PrescribedId::new(authority, name).expect("test entity id should be valid")
+    }
+
+    /// A terminal astronomical frame id.
+    fn frame(name: &str) -> PrescribedId {
+        PrescribedId::astronomical_from_name(name).expect("test frame name should be valid")
+    }
+
     #[test]
     fn test_entity_schema_definition() {
         let schema = entity_schema();
         assert_eq!(schema.fields().len(), 8);
 
         let entity_id = schema.field_with_name("entity_id").unwrap();
-        match entity_id.data_type() {
-            DataType::Dictionary(k, v) => {
-                assert_eq!(**k, DataType::UInt32);
-                assert_eq!(**v, DataType::Utf8);
-            }
-            _ => panic!("entity_id should be Dictionary(UInt32, Utf8)"),
-        }
+        assert_eq!(
+            entity_id,
+            &crate::identity::id_field("entity_id"),
+            "entity_id must be built by id_field"
+        );
 
         let sts = schema.field_with_name("spacetimestamp").unwrap();
         assert!(matches!(sts.data_type(), DataType::Struct(_)));
@@ -348,12 +284,12 @@ mod tests {
         let mut builder = EntityBuilder::new(10);
 
         builder.append_entity(
-            "naif:399",
-            "ICRF",
-            "km",
-            "TDB",
-            "naif:de440s",
-            "PREDICTED",
+            entity("naif", "399"),
+            frame("ICRF"),
+            LengthUnit::km,
+            TimeScaleCode::TDB,
+            PrescribedId::abstract_source("naif", "de440s").unwrap(),
+            EstimateType::ESTIMATED,
             [1.0, 0.0, 0.0],
             [1.0, 0.0, 0.0, 0.0],
             0,
@@ -366,12 +302,12 @@ mod tests {
             Some([12_742_000.0, 12_742_000.0, 12_714_000.0]),
         );
         builder.append_entity(
-            "demo:sensor_1",
-            "IAU_MARS",
-            "m",
-            "TAI",
-            "demo:sensor_1",
-            "MEASURED",
+            entity("demo", "sensor_1"),
+            frame("IAU_MARS"),
+            LengthUnit::m,
+            TimeScaleCode::TAI,
+            entity("demo", "sensor_1"),
+            EstimateType::MEASURED,
             [1.2, 0.0, 0.0],
             [1.0, 0.0, 0.0, 0.0],
             0,
@@ -411,12 +347,12 @@ mod tests {
     fn test_entity_batch_validation() {
         let mut builder = EntityBuilder::new(10);
         builder.append_entity(
-            "naif:399",
-            "ICRF",
-            "km",
-            "TDB",
-            "naif:de440s",
-            "PREDICTED",
+            entity("naif", "399"),
+            frame("ICRF"),
+            LengthUnit::km,
+            TimeScaleCode::TDB,
+            PrescribedId::abstract_source("naif", "de440s").unwrap(),
+            EstimateType::ESTIMATED,
             [1.0, 0.0, 0.0],
             [1.0, 0.0, 0.0, 0.0],
             0,

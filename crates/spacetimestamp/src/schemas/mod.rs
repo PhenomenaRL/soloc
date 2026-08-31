@@ -2,23 +2,24 @@ pub mod entity;
 
 use arrow::datatypes::SchemaRef;
 
-/// Marker trait for a batch-level Arrow schema built around a `spacetimestamp` column.
+/// Marker trait for batched Arrow schemas that embed `spacetimestamp` schema.
 ///
 /// Implementors define the full Arrow schema (which must embed a `spacetimestamp`
-/// struct column) and the column names used for spatiotemporal indexing and entity
-/// identity.
+/// struct column).
 ///
-/// The identity column is what makes a batch usable with
-/// [`crate::topology::TransformTree`]: topology is derived from `(id, frame_id, epoch)`
-/// triples, so a schema with no identity column can carry poses but not parenting.
+/// The identity column indicates the name of the column that holds PrescribedIds for the
+/// parent schema.[`crate::topology::TransformTree`]: topology is derived from
+/// `(id, frame_id, epoch)` triples, so a schema with no identity column can
+/// carry poses but not parenting.
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```
 /// use spacetimestamp::schemas::{SpaceTimestampSchema, entity::EntitySchema};
 ///
 /// let schema = EntitySchema::schema();
 /// let id_column = EntitySchema::id_column();
+/// assert_eq!(id_column, "entity_id");
 /// ```
 ///
 /// A `soloc::ledger::Ledger` can be constructed directly from an implementor via

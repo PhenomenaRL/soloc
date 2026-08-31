@@ -1,15 +1,8 @@
-//! Proves `spacetimestamp` is usable on its own, with no ledger and no `soloc` dependency.
+//! Proves `spacetimestamp` is usable on its own, with no ledger and no `soloc` crate
+//! dependency.
 //!
-//! This is the acceptance criterion for the crate split: everything needed to go from raw
-//! measurements to a reprojected batch — build, validate, derive topology, transform — must
-//! be reachable through this crate's public API alone. Living in `tests/` rather than `src/`
-//! is deliberate: an integration test can only touch `pub` items, so if this compiles, an
-//! external user can do the same thing.
-//!
-//! The scenario is the motivating one: a robot on a truck at a facility on Earth, each pose
-//! recorded in its parent's frame, transformed ad-hoc into an astronomical frame. The caller
-//! supplies the poses (that is what a ledger would otherwise do); this crate supplies the
-//! structure and the physics.
+//! The scenario is: a robot on a truck at a facility on Earth, each pose
+//! recorded in its parent's frame, transformed ad-hoc into an astronomical frame.
 
 use anise::prelude::{Almanac, Epoch};
 use arrow::array::{Array, FixedSizeListArray, Float64Array, RecordBatch, StructArray};
@@ -17,31 +10,47 @@ use nalgebra::{Isometry3, Translation3, UnitQuaternion};
 use std::collections::HashMap;
 
 use spacetimestamp::ephemeris::j2000_tai;
+use spacetimestamp::identity::PrescribedId;
 use spacetimestamp::schemas::entity::EntityBuilder;
 use spacetimestamp::topology::TransformTree;
 use spacetimestamp::transforms::transform_batch;
 use spacetimestamp::validation::validate_spacetimestamp_batch;
+use spacetimestamp::vocabulary::{EstimateType, LengthUnit, TimeScaleCode};
+
+/// An entity this demo owns. `"demo"` is the authority, and the name is
+/// free-form, so a bare `"robot"` needs no prefix to be globally unambiguous.
+fn entity(name: &str) -> PrescribedId {
+    PrescribedId::new("demo", name).expect("demo entity names are valid")
+}
+
+fn earth() -> PrescribedId {
+    PrescribedId::astronomical_from_name("Earth").expect("Earth is a frame anise recognises")
+}
 
 /// `(entity_id, parent_frame, position_km)` for the three-deep chain under test.
 ///
 /// Each pose is expressed in its parent's frame, so composing the chain must yield
 /// `[1000, 20, 3]` km for the robot in the Earth frame.
-const RIG: &[(&str, &str, [f64; 3])] = &[
-    ("demo:facility", "Earth", [1000.0, 0.0, 0.0]),
-    ("demo:truck", "demo:facility", [0.0, 20.0, 0.0]),
-    ("demo:robot", "demo:truck", [0.0, 0.0, 3.0]),
-];
+fn rig() -> Vec<(PrescribedId, PrescribedId, [f64; 3])> {
+    vec![
+        (entity("facility"), earth(), [1000.0, 0.0, 0.0]),
+        (entity("truck"), entity("facility"), [0.0, 20.0, 0.0]),
+        (entity("robot"), entity("truck"), [0.0, 0.0, 3.0]),
+    ]
+}
 
 fn build_batch() -> RecordBatch {
-    let mut builder = EntityBuilder::new(RIG.len());
-    for (id, frame, position) in RIG {
+    let rig = rig();
+    let source = PrescribedId::abstract_source("demo", "rig").unwrap();
+    let mut builder = EntityBuilder::new(rig.len());
+    for (id, frame, position) in &rig {
         builder.append_entity(
-            id,
-            frame,
-            "km",
-            "TAI",
-            "demo:rig",
-            "MEASURED",
+            *id,
+            *frame,
+            LengthUnit::km,
+            TimeScaleCode::TAI,
+            source,
+            EstimateType::MEASURED,
             *position,
             [1.0, 0.0, 0.0, 0.0],
             0,
@@ -57,12 +66,13 @@ fn build_batch() -> RecordBatch {
     builder.flush()
 }
 
-/// The caller's own pose store — the role a ledger plays in the `soloc` stack.
-fn pose_map() -> HashMap<String, Isometry3<f64>> {
-    RIG.iter()
+/// The caller's own pose store: the role a ledger plays in the `soloc` stack.
+fn pose_map() -> HashMap<PrescribedId, Isometry3<f64>> {
+    rig()
+        .into_iter()
         .map(|(id, _, position)| {
             (
-                id.to_string(),
+                id,
                 Isometry3::from_parts(
                     Translation3::new(position[0], position[1], position[2]),
                     UnitQuaternion::identity(),
@@ -104,7 +114,7 @@ fn build_validate_derive_topology_and_transform_without_a_ledger() {
     let poses = pose_map();
     let epoch = j2000_tai();
 
-    // 1. Validate — frame and timescale identifiers are well-formed.
+    // 1. Validate: frame and timescale identifiers are well-formed.
     validate_spacetimestamp_batch(&batch).expect("rig batch should validate");
 
     // 2. Derive topology straight from the rows. No registration step, no ledger.
@@ -117,34 +127,51 @@ fn build_validate_derive_topology_and_transform_without_a_ledger() {
         3,
         "one edge per entity on first sight"
     );
-    assert_eq!(tree.current_parent("demo:robot"), Some("demo:truck"));
+    assert_eq!(tree.current_parent(entity("robot")), Some(entity("truck")));
 
     // 3. Walk the structure to its astronomical anchor.
     let chain = tree
-        .resolve_chain("demo:robot", epoch - j2000_tai())
+        .ancestry_at(entity("robot"), epoch - j2000_tai())
         .expect("robot chain should reach an astronomical root");
     assert_eq!(
         chain,
-        vec!["demo:robot", "demo:truck", "demo:facility", "Earth"]
+        vec![
+            entity("robot"),
+            entity("truck"),
+            entity("facility"),
+            earth()
+        ]
     );
 
     // 4. Compose per-hop poses into an isometry for each entity frame. This is the caller's
-    //    job — the tree supplies structure only, never a pose value.
-    let resolve = |frame: &str, at: Epoch| -> Option<(String, Isometry3<f64>)> {
-        let chain = tree.resolve_chain(frame, at - j2000_tai()).ok()?;
+    //    job. The tree supplies structure only, never a pose value.
+    let resolve = |frame: PrescribedId, at: Epoch| -> Option<(PrescribedId, Isometry3<f64>)> {
+        let chain = tree.ancestry_at(frame, at - j2000_tai()).ok()?;
         let (root, hops) = chain.split_last()?;
         // Walk inward from the root so each hop composes onto its parent's accumulated pose.
         let mut acc = Isometry3::identity();
         for node in hops.iter().rev() {
             acc *= poses.get(node)?;
         }
-        Some((root.clone(), acc))
+        Some((*root, acc))
     };
 
     // 5. Transform every row into the Earth frame in one pass. An empty almanac suffices
-    //    because the chain already terminates at the target frame — no kernels needed.
-    let result = transform_batch(&batch, "Earth", &Almanac::default(), "km", Some(&resolve))
-        .expect("transform should succeed");
+    //    because the chain already terminates at the target frame.
+    //
+    // Note: While in this example we are showing all entities being transformed to Earth
+    //       centered reference frame, this does not make sense for the robot entity.
+    //       This scenario shows how flexible the functionality is: ie. the caller
+    //       can decide to filter by entities first, and only transform those that they desire
+    //       to transform into another reference frame.
+    let result = transform_batch(
+        &batch,
+        "Earth",
+        &Almanac::default(),
+        LengthUnit::km,
+        Some(&resolve),
+    )
+    .expect("transform should succeed");
 
     assert_eq!(result.num_rows(), 3);
     // Row 0 is already in Earth frame and passes through untouched.
@@ -155,16 +182,22 @@ fn build_validate_derive_topology_and_transform_without_a_ledger() {
 }
 
 #[test]
-fn topology_rejects_an_unreachable_frame_without_a_ledger() {
-    // The append-time typo check is part of the standalone path too, not a ledger feature.
+fn typos_and_abstract_frames_are_rejected_without_a_ledger() {
+    // 1. A misspelled astronomical name fails at mint time, before any batch exists.
+    let err = PrescribedId::astronomical_from_name("NOT_A_FRAME").unwrap_err();
+    assert!(err.contains("NOT_A_FRAME"), "error should name it: {err}");
+
+    // 2. An abstract id is well-formed, so it *can* reach a frame column, and ingest is
+    //    what stops it. `demo:rig` is the batch's own source id, used here as a frame.
+    let source = PrescribedId::abstract_source("demo", "rig").unwrap();
     let mut builder = EntityBuilder::new(1);
     builder.append_entity(
-        "demo:sat",
-        "NOT_A_FRAME",
-        "km",
-        "TAI",
-        "demo:rig",
-        "MEASURED",
+        entity("sat"),
+        source,
+        LengthUnit::km,
+        TimeScaleCode::TAI,
+        source,
+        EstimateType::MEASURED,
         [0.0, 0.0, 0.0],
         [1.0, 0.0, 0.0, 0.0],
         0,
@@ -180,7 +213,10 @@ fn topology_rejects_an_unreachable_frame_without_a_ledger() {
 
     let mut tree = TransformTree::new();
     let err = tree.ingest_batch(&batch, "entity_id").unwrap_err();
-    assert!(err.contains("NOT_A_FRAME"), "error should name it: {err}");
+    assert!(
+        err.contains(&source.to_string()),
+        "error should name the offending id: {err}"
+    );
     assert!(
         tree.is_empty(),
         "a rejected batch must leave the tree empty"

@@ -15,14 +15,11 @@ use serde::Deserialize;
 use tonic::{Request, Response, Status, Streaming};
 
 use anise::almanac::metaload::MetaFile;
-use soloc::ephemeris::naif_snapshot;
+use soloc::ephemeris::celestial_snapshot;
+use spacetimestamp::identity::PrescribedId;
+use spacetimestamp::ipc;
 use spacetimestamp::query::SpatiotemporalFilter;
-use spacetimestamp::schema::STS_COLUMN;
-use spacetimestamp::transforms::transform_batch;
-
-use arrow::array::{Array, DictionaryArray, StringArray, StructArray};
-use arrow::datatypes::UInt32Type;
-use hifitime::Epoch;
+use spacetimestamp::vocabulary::{LengthUnit, Vocabulary};
 
 use crate::state::ServerState;
 
@@ -39,15 +36,86 @@ struct LoadKernelBody {
     source: String,
 }
 
+/// An identity as it arrives over the wire, in any of the three forms a client can hold.
+///
+/// A client that minted an id from a common name still has that name; a client that read one
+/// out of a query result holds 16 opaque bytes and nothing else. Both have to be able to name
+/// the same entity, so both forms are accepted:
+///
+/// ```jsonc
+/// {"authority": "acme.com", "name": "truck_A"}  // KIND_SOLOC, minted here
+/// {"ephemeris_id": 399, "orientation_id": 399}  // KIND_ASTRO (Earth), minted here
+/// {"id": "018f2a...c41d"}                       // 32 hex digits, hyphens optional
+/// ```
 #[derive(Deserialize)]
-struct NaifBodyEntry {
-    naif_id: i32,
-    entity_id: String,
+#[serde(untagged)]
+enum WireId {
+    Named {
+        authority: String,
+        name: String,
+    },
+    Astronomical {
+        ephemeris_id: i32,
+        orientation_id: i32,
+    },
+    Hex {
+        id: String,
+    },
+}
+
+impl WireId {
+    /// Resolves to the 16-byte id, validating as it goes
+    fn mint(&self) -> Result<PrescribedId, String> {
+        match self {
+            WireId::Named { authority, name } => PrescribedId::new(authority, name),
+            WireId::Astronomical {
+                ephemeris_id,
+                orientation_id,
+            } => PrescribedId::astronomical(*ephemeris_id, *orientation_id),
+            WireId::Hex { id } => parse_hex_id(id),
+        }
+    }
+}
+
+/// Parses the 32 hex digits of [`PrescribedId::to_hyphenated`], with or without hyphens.
+///
+/// Both spellings are accepted because clients produce both: `bytes.hex()` in Python gives
+/// the bare form, `uuid.UUID(bytes=...)` gives the hyphenated one, and neither is more
+/// correct than the other for bytes read straight out of an Arrow column.
+fn parse_hex_id(s: &str) -> Result<PrescribedId, String> {
+    let digits: String = s.chars().filter(|c| *c != '-').collect();
+    if digits.len() != 32 {
+        return Err(format!(
+            "id must be 32 hex digits (hyphens optional), got {} in '{s}'",
+            digits.len()
+        ));
+    }
+    let mut bytes = [0u8; 16];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&digits[i * 2..i * 2 + 2], 16)
+            .map_err(|_| format!("id is not valid hex: '{s}'"))?;
+    }
+    PrescribedId::from_bytes(&bytes)
+}
+
+/// Mints a whole list, reporting which entry failed — `field` names the list and an index
+/// locates the bad one when a client sends fifty.
+fn mint_all(ids: &[WireId], field: &str) -> Result<Vec<PrescribedId>, Status> {
+    ids.iter()
+        .enumerate()
+        .map(|(i, w)| {
+            w.mint()
+                .map_err(|e| Status::invalid_argument(format!("{field}[{i}]: {e}")))
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
 struct AppendSnapshotBody {
-    bodies: Vec<NaifBodyEntry>,
+    /// The bodies to snapshot, each a [`WireId`] for its `(naif, naif)` astronomical id —
+    /// e.g. `{"ephemeris_id": 399, "orientation_id": 399}` for Earth. The id carries the body,
+    /// so there is no separate `naif_id`.
+    bodies: Vec<WireId>,
     /// Epoch expressed as TAI seconds past J2000.
     epoch_tai_s: f64,
 }
@@ -56,7 +124,7 @@ struct AppendSnapshotBody {
 struct ExchangeDescriptor {
     target_frame: String,
     #[serde(default = "default_km")]
-    target_units: String,
+    target_units: u8,
 }
 
 #[derive(Deserialize, Default)]
@@ -78,13 +146,13 @@ struct GetTicket {
     #[serde(default)]
     query_type: QueryType,
     #[serde(default)]
-    entity_ids: Option<Vec<String>>,
+    entity_ids: Option<Vec<WireId>>,
     #[serde(default)]
     not_before_tai_s: Option<f64>,
 }
 
-fn default_km() -> String {
-    "km".to_string()
+fn default_km() -> u8 {
+    LengthUnit::km.code()
 }
 
 pub struct SolocFlightService {
@@ -103,38 +171,21 @@ fn unimplemented<T>() -> Result<Response<T>, Status> {
 
 /// Serialises a single batch as a self-contained Arrow IPC file, for use as a DoAction body.
 fn batch_to_ipc_bytes(batch: &RecordBatch) -> Result<Vec<u8>, Status> {
-    use arrow::ipc::writer::FileWriter;
-    let mut buf: Vec<u8> = Vec::new();
-    {
-        let mut writer = FileWriter::try_new(&mut buf, &batch.schema())
-            .map_err(|e| Status::internal(format!("IPC writer init failed: {e}")))?;
-        writer
-            .write(batch)
-            .map_err(|e| Status::internal(format!("IPC write failed: {e}")))?;
-        writer
-            .finish()
-            .map_err(|e| Status::internal(format!("IPC finalise failed: {e}")))?;
-    }
-    Ok(buf)
+    ipc::write_bytes(std::slice::from_ref(batch), &batch.schema())
+        .map_err(|e| Status::internal(format!("IPC write failed: {e}")))
 }
 
 /// Reads back a single batch written by [`batch_to_ipc_bytes`]. Multi-batch payloads are
 /// concatenated so a peer that chunked its export still merges correctly.
 fn batch_from_ipc_bytes(bytes: &[u8]) -> Result<RecordBatch, Status> {
-    use arrow::ipc::reader::FileReader;
-    let reader = FileReader::try_new(std::io::Cursor::new(bytes), None)
+    let (schema, batches) = ipc::read_bytes(bytes)
         .map_err(|e| Status::invalid_argument(format!("invalid Arrow IPC body: {e}")))?;
-    let schema = reader.schema();
-    let batches: Vec<RecordBatch> = reader
-        .collect::<Result<_, _>>()
-        .map_err(|e| Status::invalid_argument(format!("failed to read IPC batches: {e}")))?;
     arrow::compute::concat_batches(&schema, &batches)
         .map_err(|e| Status::invalid_argument(format!("failed to concat IPC batches: {e}")))
 }
 
-/// Transforms a batch into the descriptor's target frame. Entity-URI frame IDs are resolved
-/// through the ledger's transform tree so that child entities (e.g. a robot with
-/// frame_id = "urn:soloc:truck_A") are correctly placed.
+/// Transforms a batch into the descriptor's target frame. Frame IDs that name another entity
+/// are resolved through the ledger's transform tree
 fn transform_with_ledger_frames(
     state: &ServerState,
     batch: &RecordBatch,
@@ -144,61 +195,18 @@ fn transform_with_ledger_frames(
         .almanac
         .read()
         .map_err(|_| Status::internal("almanac lock poisoned"))?;
-
-    // Fast path: no entity-URI frames means no ledger lookups, so don't take the lock.
-    if !batch_has_uri_frames(batch) {
-        return transform_batch(
-            batch,
-            &desc.target_frame,
-            &almanac,
-            &desc.target_units,
-            None,
-        )
-        .map_err(|e| Status::internal(format!("transform failed: {e}")));
-    }
-
     let ledger = state
         .ledger
         .read()
         .map_err(|_| Status::internal("ledger lock poisoned"))?;
 
-    // Each row resolves at its own epoch. The previous version derived one epoch from the
-    // batch's first row and applied it to every row, which was wrong for a batch spanning
-    // multiple timesteps.
-    let resolver = |frame: &str, epoch: Epoch| ledger.resolve_to_root(frame, epoch);
+    // An unknown unit is a client error, not a silent km.
+    let target_units = LengthUnit::from_code(desc.target_units)
+        .map_err(|e| Status::invalid_argument(format!("target_units: {e}")))?;
 
-    transform_batch(
-        batch,
-        &desc.target_frame,
-        &almanac,
-        &desc.target_units,
-        Some(&resolver),
-    )
-    .map_err(|e| Status::internal(format!("transform failed: {e}")))
-}
-
-/// Whether the batch's `frame_id` dictionary contains any entity URI (e.g. `"demo:truck_A"`),
-/// meaning the transform will need ledger lookups to resolve them.
-fn batch_has_uri_frames(batch: &RecordBatch) -> bool {
-    let Some(sts_col) = batch
-        .column_by_name(STS_COLUMN)
-        .and_then(|c| c.as_any().downcast_ref::<StructArray>())
-    else {
-        return false;
-    };
-    let Some(frames) = sts_col
-        .column_by_name("frame_id")
-        .and_then(|c| c.as_any().downcast_ref::<DictionaryArray<UInt32Type>>())
-    else {
-        return false;
-    };
-    let Some(frames_dict) = frames.values().as_any().downcast_ref::<StringArray>() else {
-        return false;
-    };
-
-    (0..frames_dict.len())
-        .filter(|&i| !frames_dict.is_null(i))
-        .any(|i| spacetimestamp::schema::is_entity_uri(frames_dict.value(i)))
+    ledger
+        .transform(batch, &desc.target_frame, target_units, &almanac)
+        .map_err(|e| Status::internal(format!("transform failed: {e}")))
 }
 
 #[tonic::async_trait]
@@ -289,11 +297,12 @@ impl FlightService for SolocFlightService {
                     .filter(|b| b.num_rows() > 0)
                     .collect::<Vec<_>>(),
                 QueryType::CurrentState => {
-                    let entity_ids_refs: Option<Vec<&str>> = ticket
+                    let minted: Option<Vec<PrescribedId>> = ticket
                         .entity_ids
-                        .as_ref()
-                        .map(|v| v.iter().map(|s| s.as_str()).collect());
-                    let entity_ids: Option<&[&str]> = entity_ids_refs.as_deref();
+                        .as_deref()
+                        .map(|ids| mint_all(ids, "entity_ids"))
+                        .transpose()?;
+                    let entity_ids: Option<&[PrescribedId]> = minted.as_deref();
                     let not_before = ticket
                         .not_before_tai_s
                         .map(hifitime::Epoch::from_tai_seconds);
@@ -422,9 +431,24 @@ impl FlightService for SolocFlightService {
             }),
             Ok(ActionType {
                 r#type: "append_snapshot".to_string(),
-                description: "Query the almanac for arbitrary NAIF bodies at a given epoch and \
+                description: "Query the almanac for astronomical bodies at a given epoch and \
                               append the result to the ledger. \
-                              Body: {bodies: [{naif_id, entity_id}], epoch_tai_s}"
+                              Body: {bodies: [<astronomical id>], epoch_tai_s}"
+                    .to_string(),
+            }),
+            Ok(ActionType {
+                r#type: "export_names".to_string(),
+                description: "Export the display-name registry for federation. No body. \
+                              Returns an Arrow IPC file binding each 16-byte id to the \
+                              (authority, common_name) it was minted from."
+                    .to_string(),
+            }),
+            Ok(ActionType {
+                r#type: "import_names".to_string(),
+                description: "Merge a name registry exported by a peer's export_names. \
+                              Body: the raw Arrow IPC bytes. Every binding is re-minted and \
+                              rejected if it does not hash to the id it claims. Names are \
+                              display-only: importing none costs legibility, never correctness."
                     .to_string(),
             }),
         ];
@@ -464,10 +488,43 @@ impl FlightService for SolocFlightService {
                     .map_err(|e| {
                         Status::invalid_argument(format!("import_topology failed: {e}"))
                     })?;
+                // `merge_topology` counts events it had not already seen, so re-importing the
+                // same peer log correctly reports 0 rather than the row count.
                 let result = arrow_flight::Result {
                     body: format!("applied {applied} topology events")
                         .into_bytes()
                         .into(),
+                };
+                Ok(Response::new(Box::pin(futures::stream::once(
+                    futures::future::ready(Ok(result)),
+                ))))
+            }
+
+            "export_names" => {
+                let bytes = self
+                    .state
+                    .ledger
+                    .read()
+                    .map_err(|_| Status::internal("ledger lock poisoned"))?
+                    .names_to_ipc_bytes()
+                    .map_err(|e| Status::internal(format!("export_names failed: {e}")))?;
+                let result = arrow_flight::Result { body: bytes.into() };
+                Ok(Response::new(Box::pin(futures::stream::once(
+                    futures::future::ready(Ok(result)),
+                ))))
+            }
+
+            "import_names" => {
+                // Verification is all-or-nothing across the whole payload
+                let merged = self
+                    .state
+                    .ledger
+                    .write()
+                    .map_err(|_| Status::internal("ledger lock poisoned"))?
+                    .merge_names_from_ipc_bytes(&action.body)
+                    .map_err(|e| Status::invalid_argument(format!("import_names failed: {e}")))?;
+                let result = arrow_flight::Result {
+                    body: format!("merged {merged} names").into_bytes().into(),
                 };
                 Ok(Response::new(Box::pin(futures::stream::once(
                     futures::future::ready(Ok(result)),
@@ -574,11 +631,7 @@ impl FlightService for SolocFlightService {
                 }
 
                 let epoch = hifitime::Epoch::from_tai_seconds(body.epoch_tai_s);
-                let pairs: Vec<(i32, String)> = body
-                    .bodies
-                    .iter()
-                    .map(|b| (b.naif_id, b.entity_id.clone()))
-                    .collect();
+                let ids = mint_all(&body.bodies, "bodies")?;
 
                 let almanac = self
                     .state
@@ -586,12 +639,8 @@ impl FlightService for SolocFlightService {
                     .read()
                     .map_err(|_| Status::internal("almanac lock poisoned"))?;
 
-                // Build the &str slice from the owned Strings.
-                let ref_pairs: Vec<(i32, &str)> =
-                    pairs.iter().map(|(id, eid)| (*id, eid.as_str())).collect();
-
-                let batch = naif_snapshot(&almanac, &ref_pairs, epoch)
-                    .map_err(|e| Status::internal(format!("naif_snapshot failed: {e}")))?;
+                let batch = celestial_snapshot(&almanac, &ids, epoch)
+                    .map_err(|e| Status::internal(format!("celestial_snapshot failed: {e}")))?;
                 drop(almanac);
 
                 let n = batch.num_rows();
@@ -626,17 +675,23 @@ mod tests {
     use super::*;
     use anise::almanac::Almanac;
     use soloc::schemas::entity::EntityBuilder;
+    use spacetimestamp::vocabulary::{EstimateType, TimeScaleCode};
+
+    /// Mints a test entity id under the `demo` authority.
+    fn demo(name: &str) -> PrescribedId {
+        PrescribedId::new("demo", name).unwrap()
+    }
 
     /// A one-row entity batch placing `entity_id` relative to `frame_id`.
-    fn entity_batch(entity_id: &str, frame_id: &str, x: f64) -> RecordBatch {
+    fn entity_batch(entity_id: PrescribedId, frame_id: PrescribedId, x: f64) -> RecordBatch {
         let mut b = EntityBuilder::new(1);
         b.append_entity(
             entity_id,
             frame_id,
-            "km",
-            "TAI",
-            "test:src",
-            "MEASURED",
+            LengthUnit::km,
+            TimeScaleCode::TAI,
+            PrescribedId::abstract_source("test", "src").unwrap(),
+            EstimateType::MEASURED,
             [x, 0.0, 0.0],
             [1.0, 0.0, 0.0, 0.0],
             0,
@@ -687,11 +742,12 @@ mod tests {
         let exporter = make_service().await;
         {
             let mut ledger = exporter.state.ledger.write().unwrap();
+            let earth = PrescribedId::astronomical_from_name("IAU_EARTH").unwrap();
             ledger
-                .append(entity_batch("demo:facility", "IAU_EARTH", 50.0))
+                .append(entity_batch(demo("facility"), earth, 50.0))
                 .unwrap();
             ledger
-                .append(entity_batch("demo:robot", "demo:facility", 5.0))
+                .append(entity_batch(demo("robot"), demo("facility"), 5.0))
                 .unwrap();
         }
 
@@ -731,7 +787,7 @@ mod tests {
     #[tokio::test]
     async fn test_import_topology_rejects_garbage_body() {
         let service = make_service().await;
-        // The Ok variant is a boxed stream and so is not Debug — match rather than expect_err.
+        // The Ok variant is a boxed stream and so is not Debug
         let result = service
             .do_action(Request::new(Action {
                 r#type: "import_topology".to_string(),
@@ -767,5 +823,132 @@ mod tests {
             listed.contains(&"import_topology".to_string()),
             "{listed:?}"
         );
+        assert!(listed.contains(&"export_names".to_string()), "{listed:?}");
+        assert!(listed.contains(&"import_names".to_string()), "{listed:?}");
+    }
+
+    fn wire(json: &str) -> Result<PrescribedId, String> {
+        serde_json::from_str::<WireId>(json)
+            .map_err(|e| e.to_string())
+            .and_then(|w| w.mint())
+    }
+
+    /// Each wire form must reach the id its client meant, and the three must agree with the
+    /// constructors they stand in for.
+    #[test]
+    fn test_wire_id_forms_mint_their_constructors() {
+        assert_eq!(
+            wire(r#"{"authority": "acme.com", "name": "truck_A"}"#).unwrap(),
+            PrescribedId::new("acme.com", "truck_A").unwrap()
+        );
+        assert_eq!(
+            wire(r#"{"ephemeris_id": 0, "orientation_id": 1}"#).unwrap(),
+            PrescribedId::astronomical(0, 1).unwrap()
+        );
+    }
+
+    /// An unrecognised frame pair is rejected at the wire boundary, not stored as garbage.
+    #[test]
+    fn test_wire_astronomical_rejects_an_unrecognised_pair() {
+        assert!(wire(r#"{"ephemeris_id": 399, "orientation_id": 499}"#).is_err());
+    }
+
+    /// The reserved authority must not imply the astronomical kind. A soloc id minted under
+    /// authority `astro` with name `ICRF` and the real astronomical ICRF frame are different
+    /// ids — the kind is part of the identity
+    #[test]
+    fn test_astro_authority_does_not_mint_the_astronomical_id() {
+        let squatter = wire(r#"{"authority": "astro", "name": "ICRF"}"#).unwrap();
+        let real = wire(r#"{"ephemeris_id": 0, "orientation_id": 1}"#).unwrap();
+        assert_ne!(squatter, real);
+        assert!(squatter.is_soloc());
+        assert!(real.is_astro());
+    }
+
+    /// A client that read raw bytes out of a query result holds no name, so the hex form has
+    /// to round-trip
+    #[test]
+    fn test_hex_wire_id_round_trips_hyphenated_and_bare() {
+        let id = demo("truck_A");
+        let hyphenated = id.to_hyphenated();
+        let bare: String = hyphenated.chars().filter(|c| *c != '-').collect();
+
+        assert_eq!(wire(&format!(r#"{{"id": "{hyphenated}"}}"#)).unwrap(), id);
+        assert_eq!(wire(&format!(r#"{{"id": "{bare}"}}"#)).unwrap(), id);
+    }
+
+    /// Malformed ids must fail at the wire boundary
+    #[test]
+    fn test_malformed_hex_wire_ids_are_rejected() {
+        assert!(wire(r#"{"id": "abcd"}"#).is_err(), "too short");
+        assert!(
+            wire(r#"{"id": "zz2233445566778899aabbccddeeff00"}"#).is_err(),
+            "not hex"
+        );
+        // 32 valid hex digits, but version nibble 0x4
+        assert!(
+            wire(r#"{"id": "00112233445566778899aabbccddeeff"}"#).is_err(),
+            "version and variant bits must be checked"
+        );
+    }
+
+    /// The name half of federation, mirroring the topology round trip: a peer's exported
+    /// bindings must survive the wire and land in the importer's registry.
+    #[tokio::test]
+    async fn test_export_import_names_round_trip() {
+        let exporter = make_service().await;
+        let truck = demo("truck_A");
+        exporter
+            .state
+            .ledger
+            .write()
+            .unwrap()
+            .register_name(truck, "demo", "truck_A")
+            .unwrap();
+
+        let exported = exporter
+            .do_action(Request::new(Action {
+                r#type: "export_names".to_string(),
+                body: Default::default(),
+            }))
+            .await
+            .expect("export_names should succeed");
+        let bytes = action_body(exported).await;
+
+        let importer = make_service().await;
+        // Before importing, the id has no name and renders as hex.
+        assert_eq!(
+            importer.state.ledger.read().unwrap().names().display(truck),
+            truck.to_hyphenated()
+        );
+
+        let imported = importer
+            .do_action(Request::new(Action {
+                r#type: "import_names".to_string(),
+                body: bytes.into(),
+            }))
+            .await
+            .expect("import_names should succeed");
+        let msg = String::from_utf8(action_body(imported).await).unwrap();
+        assert!(msg.starts_with("merged "), "{msg}");
+
+        assert_eq!(
+            importer.state.ledger.read().unwrap().names().display(truck),
+            "truck_A"
+        );
+    }
+
+    /// An astronomical root resolves and displays straight from its embedded pair,
+    /// with an empty registry Aliased frames collapse to their mapped name
+    /// (`(399,399)` → `Earth`, `(0,1)` → `ICRF`).
+    #[tokio::test]
+    async fn test_astronomical_frames_display_from_the_pair_with_no_registry() {
+        let service = make_service().await;
+        let ledger = service.state.ledger.read().unwrap();
+        assert!(ledger.names().is_empty(), "no astro names are registered");
+        for (name, canonical) in [("IAU_EARTH", "Earth"), ("J2000", "ICRF"), ("Mars", "Mars")] {
+            let id = PrescribedId::astronomical_from_name(name).unwrap();
+            assert_eq!(ledger.names().display(id), canonical);
+        }
     }
 }

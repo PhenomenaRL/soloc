@@ -131,7 +131,7 @@ impl ServerState {
 /// Creates an empty ledger using `schema_path` (if provided) or the default entity schema.
 fn new_empty_ledger(schema_path: &Option<PathBuf>, id_column: &str) -> Ledger {
     if let Some(ref path) = schema_path {
-        match read_schema_from_ipc(path) {
+        match spacetimestamp::ipc::read_file_schema(path) {
             Ok(schema) => match Ledger::new(&schema, id_column) {
                 Ok(l) => {
                     eprintln!("soloc-server: empty ledger created from schema {:?}", path);
@@ -152,16 +152,6 @@ fn new_empty_ledger(schema_path: &Option<PathBuf>, id_column: &str) -> Ledger {
 
     Ledger::new(&entity_schema(), id_column)
         .expect("entity_schema is always valid for 'spacetimestamp'/'entity_id'")
-}
-
-/// Reads only the schema from an Arrow IPC file (works for zero-row files).
-fn read_schema_from_ipc(path: &PathBuf) -> Result<arrow::datatypes::SchemaRef, String> {
-    use arrow::ipc::reader::FileReader;
-    use std::fs::File;
-    let file = File::open(path).map_err(|e| format!("Failed to open {:?}: {e}", path))?;
-    let reader = FileReader::try_new(file, None)
-        .map_err(|e| format!("Failed to read IPC schema from {:?}: {e}", path))?;
-    Ok(reader.schema())
 }
 
 /// Downloads and deserialises a ledger from any object-store URL.

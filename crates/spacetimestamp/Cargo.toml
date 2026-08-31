@@ -10,15 +10,8 @@ arrow = "57.1.0"
 hifitime = "4.2.4"
 log = "0.4"
 nalgebra = "0.35"
+sha2 = "0.10"
 
 [dev-dependencies]
 test-log = "0.2.19"
 criterion = { version = "0.8", features = ["html_reports"] }
-
-[[bench]]
-name = "spacetimestamp_bench"
-harness = false
-
-[[bench]]
-name = "topology_bench"
-harness = false

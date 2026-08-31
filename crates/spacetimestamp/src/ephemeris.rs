@@ -1,20 +1,18 @@
-//! Canonical epoch helpers and ephemeris query functions.
+//! Helpers for ephemeris/astronomical functionality.
 //!
 //! This module provides the single source of truth for the J2000 TAI reference epoch,
 //! the duration-encoding helpers used throughout the spacetimestamp schema, the
 //! [`CelestialBody`] catalog, and query functions that extract state vectors from an
 //! [`anise::almanac::Almanac`].
 //!
-//! Three output shapes are available, in increasing structure:
+//! Two output shapes are available, in increasing structure:
 //!
-//! - [`query_celestial_state`] / [`query_naif_state`] — raw [`CelestialState`], no Arrow.
-//! - [`celestial_sts_snapshot`] — a flat spacetimestamp [`RecordBatch`]: pose and time only.
-//! - [`celestial_snapshot`] / [`naif_snapshot`] — full entity batches carrying `entity_id`,
+//! - [`celestial_state`]: a raw [`CelestialState`] for one KIND_ASTRO body id, not Arrow.
+//! - [`celestial_snapshot`]: a full entity batch for a list of body ids, carrying `entity_id`,
 //!   velocity, and mass, ready for [`crate::topology::TransformTree`] or a `soloc` ledger.
 
 use anise::constants::celestial_objects::{
-    EARTH, JUPITER, JUPITER_BARYCENTER, MARS, MERCURY, MOON, NEPTUNE, NEPTUNE_BARYCENTER, SATURN,
-    SATURN_BARYCENTER, SUN, URANUS, URANUS_BARYCENTER, VENUS,
+    EARTH, JUPITER, MARS, MERCURY, MOON, NEPTUNE, SATURN, SUN, URANUS, VENUS,
 };
 use anise::constants::frames::SSB_J2000;
 use anise::prelude::{Almanac, Frame};
@@ -23,63 +21,87 @@ use hifitime::{Duration, Epoch, TimeScale};
 use nalgebra::{Rotation3, UnitQuaternion};
 use std::str::FromStr;
 
-use crate::schema::SpaceTimestampBuilder;
+use crate::identity::PrescribedId;
+
 use crate::schemas::entity::EntityBuilder;
+use crate::vocabulary::{EstimateType, LengthUnit, TimeScaleCode};
 
 // ---------------------------------------------------------------------------
-// Known external frames
+// Canonical astronomical frames
 // ---------------------------------------------------------------------------
 
-/// Astronomical frame names statically trusted as external roots.
+/// The single source of truth mapping an astronomical frame name to its anise
+/// `(ephemeris_id, orientation_id)` pair, and defining which pairs a [`PrescribedId`] may
+/// embed.
 ///
-/// A `frame_id` naming one of these entries is an astronomical anchor — the terminal
-/// node of a transform chain — rather than an entity whose pose must be looked up in a
-/// ledger. Entries are trusted without a runtime anise probe because not all of them
-/// resolve as body centers (`ICRF`, for example, is an orientation), so
-/// [`is_valid_astronomical_frame`] accepts them directly.
+/// A KIND_ASTRO id embeds one of these pairs rather than hashing a name, so this table is
+/// the mint gate. No kernel load req. Names are byte-exact and case-sensitive.
 ///
-/// All entries must nonetheless be resolvable by [`resolve_astronomical_frame`]
-/// (verified by `test_known_external_frames_all_resolve`). Do not add names here that
-/// anise cannot map to a NAIF frame — they will pass validation but fail at transform time.
-///
-/// This list is not exhaustive: `IAU_*` body-fixed names and raw NAIF integer IDs are
-/// accepted by [`is_valid_astronomical_frame`] through their own resolution paths and
-/// do not need an entry here.
-///
-/// Earth-fixed frames: use `IAU_EARTH` (NAIF PCK body-fixed model). `ITRF`, `ECEF`, and
-/// `ECI` are not NAIF frame names and are intentionally absent. `TEME` (True Equator Mean
-/// Equinox, used in TLE/SGP4) requires a custom FK kernel not loaded by default and is
-/// also absent; it will be added when TLE support is implemented.
-pub const KNOWN_EXTERNAL_FRAMES: &[&str] = &[
-    // Inertial / quasi-inertial (NAIF orientation ID 1 = J2000/ICRF)
-    "ICRF",
-    "J2000",
-    "GCRF",
-    "EME2000",
-    // Barycenters (NAIF body IDs: SSB=0, EMB=3)
-    "SSB",
-    "EMB",
-    // Solar system body centers with J2000 orientation
-    "Sun",
-    "Mercury",
-    "Venus",
-    "Earth",
-    "Moon",
-    "Mars",
-    "Jupiter",
-    "Saturn",
-    "Uranus",
-    "Neptune",
-    "Pluto",
-    // Major moon body centers with J2000 orientation
-    "Phobos",
-    "Deimos",
-    "Io",
-    "Europa",
-    "Ganymede",
-    "Callisto",
-    "Titan",
-    "Enceladus",
+/// Curation: a bare body name resolves to that body's IAU body-fixed frame `(naif, naif)`,
+/// so `"Earth"` and `"IAU_EARTH"` are one id. Bodies with no PCK body-fixed model, and pure
+/// reference frames, stay inertial `(naif, 1)`.
+pub(crate) const ASTRO_FRAMES: &[(&str, i32, i32)] = &[
+    // Reference / inertial frames (SSB- or Earth-centred, J2000 orientation id 1).
+    ("ICRF", 0, 1),
+    ("J2000", 0, 1),
+    ("SSB", 0, 1),
+    ("GCRF", 399, 1),
+    ("EME2000", 399, 1),
+    ("EMB", 3, 1),
+    // The ten well-known bodies: bare name = body-fixed (naif, naif).
+    ("Sun", 10, 10),
+    ("Mercury", 199, 199),
+    ("Venus", 299, 299),
+    ("Earth", 399, 399),
+    ("Moon", 301, 301),
+    ("Mars", 499, 499),
+    ("Jupiter", 599, 599),
+    ("Saturn", 699, 699),
+    ("Uranus", 799, 799),
+    ("Neptune", 899, 899),
+    // Bodies with no PCK body-fixed model stay inertial (naif, 1).
+    ("Pluto", 999, 1),
+    ("Phobos", 401, 1),
+    ("Deimos", 402, 1),
+    ("Io", 501, 1),
+    ("Europa", 502, 1),
+    ("Ganymede", 503, 1),
+    ("Callisto", 504, 1),
+    ("Titan", 606, 1),
+    ("Enceladus", 602, 1),
+    // IAU body-fixed frames (naif, naif). The ten bodies above already carry these pairs
+    // under their bare names; these add the IAU_ spelling and the bodies outside the ten.
+    ("IAU_SUN", 10, 10),
+    ("IAU_MERCURY", 199, 199),
+    ("IAU_VENUS", 299, 299),
+    ("IAU_EARTH", 399, 399),
+    ("IAU_MOON", 301, 301),
+    ("IAU_MARS", 499, 499),
+    ("IAU_JUPITER", 599, 599),
+    ("IAU_SATURN", 699, 699),
+    ("IAU_URANUS", 799, 799),
+    ("IAU_NEPTUNE", 899, 899),
+    ("IAU_PLUTO", 999, 999),
+    ("IAU_CHARON", 901, 901),
+    ("IAU_PHOBOS", 401, 401),
+    ("IAU_DEIMOS", 402, 402),
+    ("IAU_IO", 501, 501),
+    ("IAU_EUROPA", 502, 502),
+    ("IAU_GANYMEDE", 503, 503),
+    ("IAU_CALLISTO", 504, 504),
+    ("IAU_MIMAS", 601, 601),
+    ("IAU_ENCELADUS", 602, 602),
+    ("IAU_TETHYS", 603, 603),
+    ("IAU_DIONE", 604, 604),
+    ("IAU_RHEA", 605, 605),
+    ("IAU_TITAN", 606, 606),
+    ("IAU_IAPETUS", 608, 608),
+    ("IAU_ARIEL", 701, 701),
+    ("IAU_UMBRIEL", 702, 702),
+    ("IAU_TITANIA", 703, 703),
+    ("IAU_OBERON", 704, 704),
+    ("IAU_MIRANDA", 705, 705),
+    ("IAU_TRITON", 801, 801),
 ];
 
 // ---------------------------------------------------------------------------
@@ -88,7 +110,6 @@ pub const KNOWN_EXTERNAL_FRAMES: &[&str] = &[
 
 /// Returns the J2000 TAI reference epoch: 2000-01-01T12:00:00 TAI.
 ///
-/// This is the single canonical definition used by every module in this workspace.
 /// All `duration_centuries` / `duration_ns` fields in the spacetimestamp schema are
 /// offsets from this epoch.
 pub fn j2000_tai() -> Epoch {
@@ -98,7 +119,7 @@ pub fn j2000_tai() -> Epoch {
 /// Returns the J2000 reference epoch in the given timescale.
 ///
 /// `(duration_centuries, duration_ns)` stored with `timescale_id` equal to `ts` are
-/// SI-second offsets from this calendar moment — `2000-01-01T12:00:00` in that timescale.
+/// SI-second offsets from this calendar moment. `2000-01-01T12:00:00` in that timescale.
 /// Each timescale's J2000 is a different physical moment (e.g. J2000 UTC is 32 SI seconds
 /// earlier than J2000 TAI due to the leap-second offset in 2000).
 pub fn j2000_in_timescale(ts: TimeScale) -> Epoch {
@@ -125,103 +146,48 @@ pub fn epoch_to_parts(epoch: Epoch) -> (i16, u64) {
 // Astronomical frame resolution
 // ---------------------------------------------------------------------------
 
-/// Resolves an `IAU_BODY` string to an anise body-fixed [`Frame`] by NAIF ID.
+/// Resolves an astronomical frame name to its anise `(ephemeris_id, orientation_id)` pair.
 ///
-/// The caller must have already stripped the `"IAU_"` prefix, passing only the uppercase
-/// body name (e.g. `"EARTH"`, `"TITAN"`). Returns `None` for unrecognised bodies.
-pub(crate) fn iau_frame_from_name(body_upper: &str) -> Option<Frame> {
-    let naif_id: i32 = match body_upper {
-        "SUN" => 10,
-        "MERCURY" => 199,
-        "VENUS" => 299,
-        "EARTH" => 399,
-        "MOON" => 301,
-        "MARS" => 499,
-        "JUPITER" => 599,
-        "SATURN" => 699,
-        "URANUS" => 799,
-        "NEPTUNE" => 899,
-        "PLUTO" => 999,
-        "CHARON" => 901,
-        "PHOBOS" => 401,
-        "DEIMOS" => 402,
-        "IO" => 501,
-        "EUROPA" => 502,
-        "GANYMEDE" => 503,
-        "CALLISTO" => 504,
-        "MIMAS" => 601,
-        "ENCELADUS" => 602,
-        "TETHYS" => 603,
-        "DIONE" => 604,
-        "RHEA" => 605,
-        "TITAN" => 606,
-        "IAPETUS" => 608,
-        "MIRANDA" => 705,
-        "ARIEL" => 701,
-        "UMBRIEL" => 702,
-        "TITANIA" => 703,
-        "OBERON" => 704,
-        "TRITON" => 801,
-        _ => return None,
-    };
-    Some(Frame::new(naif_id, naif_id))
+/// The convenience half of the resolver, for callers that still hold a name
+pub fn frame_pair(name: &str) -> Option<(i32, i32)> {
+    ASTRO_FRAMES
+        .iter()
+        .find(|(frame_name, _, _)| *frame_name == name)
+        .map(|(_, e, o)| (*e, *o))
 }
 
-/// Maps well-known NAIF frame names to [`Frame`] objects by explicit NAIF body and
-/// orientation IDs, covering names that `Frame::from_name` does not resolve by string.
+/// Returns `true` if `(ephemeris_id, orientation_id)` is a recognised astronomical frame.
 ///
-/// All IDs are from the NAIF body ID catalog. Orientation ID 1 is the NAIF J2000
-/// inertial frame (effectively ICRF in modern usage; difference is sub-milliarcsecond).
-fn frame_by_naif_id(name: &str) -> Option<Frame> {
-    const J2000_ORIENTATION: i32 = 1;
-    let (ephemeris_id, orientation_id) = match name {
-        // Inertial / quasi-inertial — SSB (0) centered, J2000 oriented.
-        // ICRF and J2000 are both orientation ID 1 in NAIF (differ by < 17 mas).
-        // GCRF and EME2000 are Earth-centered (399) J2000-oriented inertial frames.
-        "ICRF" | "J2000" | "SSB" => (0, J2000_ORIENTATION),
-        "GCRF" | "EME2000" => (399, J2000_ORIENTATION),
-        // Barycenters
-        "EMB" => (3, J2000_ORIENTATION),
-        // Major moons — J2000-oriented, body-center origin (for IAU body-fixed use IAU_*)
-        "Phobos" => (401, J2000_ORIENTATION),
-        "Deimos" => (402, J2000_ORIENTATION),
-        "Io" => (501, J2000_ORIENTATION),
-        "Europa" => (502, J2000_ORIENTATION),
-        "Ganymede" => (503, J2000_ORIENTATION),
-        "Callisto" => (504, J2000_ORIENTATION),
-        "Titan" => (606, J2000_ORIENTATION),
-        "Enceladus" => (602, J2000_ORIENTATION),
-        _ => return None,
-    };
-    Some(Frame::new(ephemeris_id, orientation_id))
+/// The KIND_ASTRO mint gate: it accepts exactly the pairs in [`ASTRO_FRAMES`], rejecting
+/// nonsense combinations like `(399, 499)` that a component-wise check would pass.
+pub fn recognised(ephemeris_id: i32, orientation_id: i32) -> bool {
+    ASTRO_FRAMES
+        .iter()
+        .any(|(_, e, o)| *e == ephemeris_id && *o == orientation_id)
+}
+
+/// The canonical display name for an `(ephemeris_id, orientation_id)` pair, or `None` if the
+/// pair is not a recognised astronomical frame.
+///
+/// The reverse of [`frame_pair`]
+pub fn frame_name(ephemeris_id: i32, orientation_id: i32) -> Option<&'static str> {
+    ASTRO_FRAMES
+        .iter()
+        .find(|(_, e, o)| *e == ephemeris_id && *o == orientation_id)
+        .map(|(name, _, _)| *name)
+}
+
+/// Every astronomical frame name a fresh deployment can name without setup.
+pub fn registrable_frame_names() -> impl Iterator<Item = &'static str> {
+    ASTRO_FRAMES.iter().map(|(name, _, _)| *name)
 }
 
 /// Resolves a bare astronomical frame name to an anise [`Frame`].
 ///
-/// Tries four paths in order:
-/// 1. `Frame::from_name(name, "J2000")` — major body centers (Earth, Moon, Mars, …)
-/// 2. `Frame::from_name("SSB", name)` — SSB-centred orientation frames
-/// 3. `IAU_BODY` prefix — strips `"IAU_"` and looks up the NAIF body-fixed frame
-/// 4. [`frame_by_naif_id`] — explicit NAIF ID table for inertial frames, barycenters,
-///    and minor moons that the string-based paths above do not cover
-///
-/// Returns `None` if none of the four paths succeeds.
+/// Thin wrapper over [`frame_pair`]. Kept for the name-based `transform_batch` target path
+/// until frame resolution moves to ids.
 pub(crate) fn resolve_astronomical_frame(name: &str) -> Option<Frame> {
-    Frame::from_name(name, "J2000")
-        .ok()
-        .or_else(|| Frame::from_name("SSB", name).ok())
-        .or_else(|| name.strip_prefix("IAU_").and_then(iau_frame_from_name))
-        .or_else(|| frame_by_naif_id(name))
-}
-
-/// Returns `true` if `name` is a valid astronomical frame identifier.
-///
-/// Accepts entries in [`KNOWN_EXTERNAL_FRAMES`] (statically trusted), any `IAU_BODY` name
-/// resolvable by [`iau_frame_from_name`], and any name resolvable at runtime by anise.
-/// This is the single source of truth shared by batch validation and the topology
-/// floating-frame check.
-pub(crate) fn is_valid_astronomical_frame(name: &str) -> bool {
-    KNOWN_EXTERNAL_FRAMES.contains(&name) || resolve_astronomical_frame(name).is_some()
+    frame_pair(name).map(|(e, o)| Frame::new(e, o))
 }
 
 // ---------------------------------------------------------------------------
@@ -230,9 +196,9 @@ pub(crate) fn is_valid_astronomical_frame(name: &str) -> bool {
 
 /// Well-known solar system bodies whose ephemeris is available in the DE440 SPK family.
 ///
-/// Each variant maps to a NAIF body center ID via [`naif_id`](Self::naif_id), which is
-/// used to construct both the IAU body-fixed frame ([`iau_frame`](Self::iau_frame)) and
-/// the J2000 barycenter frame ([`frame`](Self::frame)).
+/// A convenience catalog for naming the ten bodies; each maps to a NAIF body center ID via
+/// [`naif_id`](Self::naif_id) and to its `(naif, naif)` body-fixed id via
+/// [`entity_id`](Self::entity_id). State comes from [`celestial_state`], not from here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CelestialBody {
     Sun,
@@ -264,9 +230,9 @@ impl CelestialBody {
 
     /// NAIF body center integer ID for this body.
     ///
-    /// By NAIF convention this also serves as the IAU orientation ID — the body's
-    /// IAU body-fixed frame has the same integer for both ephemeris origin and
-    /// orientation (see [`iau_frame`](Self::iau_frame)).
+    /// By NAIF convention this also serves as the IAU orientation ID: the body's IAU
+    /// body-fixed frame is `(naif_id, naif_id)`, which is what [`entity_id`](Self::entity_id)
+    /// embeds.
     pub fn naif_id(self) -> i32 {
         match self {
             CelestialBody::Sun => SUN,         // 10
@@ -282,76 +248,19 @@ impl CelestialBody {
         }
     }
 
-    /// The IAU body-fixed frame for this body.
+    /// [`PrescribedId`] for this body as stored in the soloc ledger.
     ///
-    /// Constructed as `Frame::new(naif_id, naif_id)` — the ephemeris origin is
-    /// the planet body center and the orientation follows the IAU rotation model
-    /// stored in the loaded PCK (e.g. `pck11.pca` from `MetaAlmanac::latest()`).
-    /// The z-axis of this frame is the body's north pole (rotation axis); the
-    /// x-axis points toward the prime meridian.
-    ///
-    /// This convention holds for all supported bodies including the Sun, for which
-    /// anise does not export a named constant but the NAIF ID (10) is correct.
-    pub fn iau_frame(self) -> Frame {
-        Frame::new(self.naif_id(), self.naif_id())
-    }
-
-    /// The J2000-oriented frame used to query this body's state vector from DE440.
-    ///
-    /// Inner planets use their body center NaifId (same as their IAU frame origin).
-    /// Outer planets (Jupiter–Neptune) use their system barycenter NaifId, which is
-    /// what DE440 provides directly without additional satellite SPK files.
-    pub fn frame(self) -> Frame {
-        let orientation = 1; // J2000 orientation NaifId
-        match self {
-            CelestialBody::Jupiter => Frame::new(JUPITER_BARYCENTER, orientation),
-            CelestialBody::Saturn => Frame::new(SATURN_BARYCENTER, orientation),
-            CelestialBody::Uranus => Frame::new(URANUS_BARYCENTER, orientation),
-            CelestialBody::Neptune => Frame::new(NEPTUNE_BARYCENTER, orientation),
-            _ => Frame::new(self.naif_id(), orientation),
-        }
-    }
-
-    /// Canonical entity ID for this body as stored in the soloc ledger.
-    ///
-    /// Uses NAIF body-center IDs (`naif:<id>`) as the globally unique identifier.
-    pub fn entity_id(self) -> &'static str {
-        match self {
-            CelestialBody::Sun => "naif:10",
-            CelestialBody::Mercury => "naif:199",
-            CelestialBody::Venus => "naif:299",
-            CelestialBody::Earth => "naif:399",
-            CelestialBody::Moon => "naif:301",
-            CelestialBody::Mars => "naif:499",
-            CelestialBody::Jupiter => "naif:599",
-            CelestialBody::Saturn => "naif:699",
-            CelestialBody::Uranus => "naif:799",
-            CelestialBody::Neptune => "naif:899",
-        }
-    }
-
-    /// Standard gravitational parameter GM in km³/s² (DE440 / IAU 2012).
-    pub fn gm_km3_s2(self) -> f64 {
-        match self {
-            CelestialBody::Sun => 1.327_124_400_419_393e11,
-            CelestialBody::Mercury => 2.203_186_855_140_000_3e4,
-            CelestialBody::Venus => 3.248_585_920_000_000_6e5,
-            CelestialBody::Earth => 3.986_004_418e5,
-            CelestialBody::Moon => 4.904_869_5e3,
-            CelestialBody::Mars => 4.282_837_362_069_909e4,
-            CelestialBody::Jupiter => 1.266_865_34e8,
-            CelestialBody::Saturn => 3.793_120_8e7,
-            CelestialBody::Uranus => 5.793_951_322_279_009e6,
-            CelestialBody::Neptune => 6.835_099_502_439_672e6,
-        }
-    }
-
-    /// Mass in kg, derived from GM / G where G = 6.674×10⁻²⁰ km³/(kg·s²).
-    pub fn mass_kg(self) -> f64 {
-        const G_KM3_KG_S2: f64 = 6.674e-20;
-        self.gm_km3_s2() / G_KM3_KG_S2
+    /// A body is its own IAU body-fixed frame `(naif, naif)`, so `Earth` and `IAU_EARTH` are
+    /// one id. Any producer that starts from the same NAIF integer arrives at the same id
+    /// without having to agree with anyone.
+    pub fn entity_id(self) -> PrescribedId {
+        PrescribedId::astronomical(self.naif_id(), self.naif_id())
+            .expect("a body's (naif, naif) frame is in the canonical table")
     }
 }
+
+/// Gravitational constant G in km³/(kg·s²), for converting a GM (km³/s²) to a mass (kg).
+const G_KM3_KG_S2: f64 = 6.674e-20;
 
 // ---------------------------------------------------------------------------
 // CelestialState
@@ -359,312 +268,185 @@ impl CelestialBody {
 
 /// Raw state vector returned by ephemeris queries.
 ///
-/// All fields are in ICRF relative to the Solar System Barycentre (SSB),
-/// in km and km/s. The duration fields are the standard spacetimestamp
-/// offset from J2000 TAI.
+/// All fields are in ICRF relative to the Solar System Barycentre (SSB). Units are mixed and
+/// each field name carries its own: position stays km, anise's native unit and the
+/// astrodynamics convention, while the rates are SI to match the entity schema. The duration
+/// fields are the standard spacetimestamp offset from J2000 TAI.
 ///
-/// This struct is schema-neutral — it carries no Arrow dependency.
-/// Callers in `soloc::ephemeris` convert it into entity [`RecordBatch`]es.
-///
-/// [`RecordBatch`]: arrow::record_batch::RecordBatch
+/// This struct is schema-neutral. It carries no Arrow dependency.
 #[derive(Debug)]
 pub struct CelestialState {
     pub position_km: [f64; 3],
-    pub velocity_km_s: [f64; 3],
-    /// Rotation from the body's IAU body-fixed frame to ICRF, as `[w, x, y, z]`.
+    pub velocity_m_s: [f64; 3],
     pub orientation: [f64; 4],
-    pub angular_velocity: Option<[f64; 3]>,
+    pub angular_velocity_rad_s: Option<[f64; 3]>,
     pub mass_kg: Option<f64>,
     pub duration_centuries: i16,
     pub duration_ns: u64,
 }
 
+/// Converts an anise velocity, which is always km/s, to the m/s the entity schema stores.
+///
+/// The one place this conversion happens; putting it at the `append_entity` call sites instead
+/// would reintroduce the duplicated-table shape the vocabulary work exists to remove.
+fn velocity_to_m_s(km_s: [f64; 3]) -> [f64; 3] {
+    km_s.map(|v| LengthUnit::convert(v, LengthUnit::km, LengthUnit::m))
+}
+
 // ---------------------------------------------------------------------------
-// Query functions
+// Query function
 // ---------------------------------------------------------------------------
 
-/// Queries the almanac for a well-known [`CelestialBody`] and returns a raw [`CelestialState`].
+/// Queries the almanac for a KIND_ASTRO body `id` and returns a raw [`CelestialState`].
 ///
-/// - Position and velocity come from DE440 (body center relative to SSB).
-/// - Orientation is the rotation from the IAU body-fixed frame to ICRF (from the loaded PCK).
-/// - Angular velocity is derived from the PCK rotation derivative when available.
-/// - Mass is populated from the DE440/IAU 2012 GM constants on [`CelestialBody`].
+/// The id embeds the anise `(ephemeris_id, orientation_id)` pair (see
+/// [`PrescribedId::astro_frame`](crate::identity::PrescribedId::astro_frame)); the frame is
+/// reconstructed from it and queried directly, so this needs no name registry.
+///
+/// - Position and velocity come from `translate` (body center relative to SSB).
+/// - Orientation is the rotation from the body-fixed frame to ICRF, from `rotate`.
+/// - Angular velocity is the PCK rotation derivative, present only when the PCK carries one.
+/// - Mass is `GM / G` with GM from the loaded planetary data ([`Almanac::frame_info`]).
+///
+/// There is **no silent fallback**: a missing position, orientation, or GM is an error.
+/// ICRF, SSB frames have no GM and are never body-queried, so they do not reach here.
 ///
 /// # Errors
 ///
-/// Returns `Err` if the almanac cannot resolve position or orientation for the body.
-pub fn query_celestial_state(
+/// - `id` is not a KIND_ASTRO id.
+/// - The almanac cannot resolve position, orientation, or GM (a kernel or PCK is missing).
+pub fn celestial_state(
     almanac: &Almanac,
-    body: CelestialBody,
+    id: PrescribedId,
     epoch: Epoch,
 ) -> Result<CelestialState, String> {
-    let iau = body.iau_frame();
+    let (ephemeris_id, orientation_id) = id.astro_frame().ok_or_else(|| {
+        format!("{id} is not an astronomical id; celestial_state needs a KIND_ASTRO body")
+    })?;
+    let frame = Frame::new(ephemeris_id, orientation_id);
+    let uid = format!("({ephemeris_id}, {orientation_id})");
 
     let state = almanac
-        .translate(iau, SSB_J2000, epoch, None)
+        .translate(frame, SSB_J2000, epoch, None)
         .map_err(|e| {
             format!(
-                "Failed to get body-center position for {:?} at {epoch}: {e}. \
-             Inner planets require DE440; outer planets (Jupiter+) additionally \
-             need a satellite SPK (e.g. jup365.bsp for Jupiter). Load via \
-             MetaAlmanac or supply the file directly.",
-                body,
+                "no position for {uid} at {epoch}: {e}. Inner planets require DE440; outer \
+             planets additionally need a satellite SPK (e.g. jup365.bsp for Jupiter)."
             )
         })?;
 
-    let dcm = almanac.rotate(iau, SSB_J2000, epoch).map_err(|e| {
+    let dcm = almanac.rotate(frame, SSB_J2000, epoch).map_err(|e| {
         format!(
-            "Failed to get IAU orientation for {:?} at {epoch}: {e}. \
-             Ensure a PCK (e.g. pck11.pca) is loaded, available via \
-             MetaAlmanac::latest().",
-            body,
+            "no orientation for {uid} at {epoch}: {e}. Ensure a PCK (e.g. pck11.pca) is loaded."
         )
     })?;
-
     let q = UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(dcm.rot_mat));
-    let angular_velocity = dcm.rot_mat_dt.map(|r_dt| {
+    // The PCK rotation derivative is already rad/s; no conversion, only the name.
+    let angular_velocity_rad_s = dcm.rot_mat_dt.map(|r_dt| {
         let omega = r_dt * dcm.rot_mat.transpose();
         [omega[(2, 1)], omega[(0, 2)], omega[(1, 0)]]
     });
 
+    let gm_km3_s2 = almanac
+        .frame_info(frame)
+        .map_err(|e| format!("no GM for {uid}: {e}. Ensure a PCK (e.g. pck11.pca) is loaded."))?
+        .mu_km3_s2()
+        .map_err(|e| format!("no GM for {uid}: {e}"))?;
+
     let (duration_centuries, duration_ns) = epoch_to_parts(epoch);
 
     Ok(CelestialState {
         position_km: [state.radius_km.x, state.radius_km.y, state.radius_km.z],
-        velocity_km_s: [
+        velocity_m_s: velocity_to_m_s([
             state.velocity_km_s.x,
             state.velocity_km_s.y,
             state.velocity_km_s.z,
-        ],
+        ]),
         orientation: [q.w, q.i, q.j, q.k],
-        angular_velocity,
-        mass_kg: Some(body.mass_kg()),
-        duration_centuries,
-        duration_ns,
-    })
-}
-
-/// Queries the almanac for an arbitrary NAIF body by integer ID and returns a raw [`CelestialState`].
-///
-/// Unlike [`query_celestial_state`], orientation silently falls back to the identity quaternion
-/// and `angular_velocity` to `None` when the loaded PCK has no rotation model for the body —
-/// so this succeeds for any body that has SPK position data, regardless of PCK coverage.
-/// Mass is not populated (unknown for arbitrary bodies).
-///
-/// # Errors
-///
-/// Returns `Err` if the almanac cannot resolve the position of the body (SPK data missing).
-pub fn query_naif_state(
-    almanac: &Almanac,
-    naif_id: i32,
-    epoch: Epoch,
-) -> Result<CelestialState, String> {
-    let iau = Frame::new(naif_id, naif_id);
-
-    let state = almanac
-        .translate(iau, SSB_J2000, epoch, None)
-        .map_err(|e| format!("Failed to get position for NAIF ID {naif_id} at {epoch}: {e}.",))?;
-
-    let (orientation, angular_velocity) = match almanac.rotate(iau, SSB_J2000, epoch) {
-        Ok(dcm) => {
-            let q = UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(
-                dcm.rot_mat,
-            ));
-            let ang_vel = dcm.rot_mat_dt.map(|r_dt| {
-                let omega = r_dt * dcm.rot_mat.transpose();
-                [omega[(2, 1)], omega[(0, 2)], omega[(1, 0)]]
-            });
-            ([q.w, q.i, q.j, q.k], ang_vel)
-        }
-        Err(_) => ([1.0, 0.0, 0.0, 0.0], None),
-    };
-
-    let (duration_centuries, duration_ns) = epoch_to_parts(epoch);
-
-    Ok(CelestialState {
-        position_km: [state.radius_km.x, state.radius_km.y, state.radius_km.z],
-        velocity_km_s: [
-            state.velocity_km_s.x,
-            state.velocity_km_s.y,
-            state.velocity_km_s.z,
-        ],
-        orientation,
-        angular_velocity,
-        mass_kg: None,
+        angular_velocity_rad_s,
+        mass_kg: Some(gm_km3_s2 / G_KM3_KG_S2),
         duration_centuries,
         duration_ns,
     })
 }
 
 // ---------------------------------------------------------------------------
-// STS snapshot
+// Ids used by the snapshot builders
 // ---------------------------------------------------------------------------
 
-/// Queries the ephemeris for the given bodies at `epoch` and returns a plain
-/// SpaceTimestamp [`RecordBatch`].
+/// The id of the ICRF frame every snapshot row is expressed in.
+fn icrf_id() -> PrescribedId {
+    PrescribedId::astronomical(0, 1).expect("ICRF (0, 1) is in the canonical table")
+}
+
+/// The source id every snapshot row carries: the rows are resolved through the almanac.
 ///
-/// Each row contains position, orientation, and time in ICRF/TAI/km — the core
-/// spatiotemporal data only. There are no schema-specific fields (velocity, mass,
-/// entity_id). Use [`celestial_snapshot`] when you need those.
-///
-/// # Errors
-/// Returns `Err` if `bodies` is empty or the almanac cannot resolve any body.
-pub fn celestial_sts_snapshot(
-    almanac: &Almanac,
-    bodies: &[CelestialBody],
-    epoch: Epoch,
-) -> Result<RecordBatch, String> {
-    if bodies.is_empty() {
-        return Err("bodies list is empty — provide at least one CelestialBody".to_string());
-    }
-    let (centuries, ns) = epoch_to_parts(epoch);
-    let mut builder = SpaceTimestampBuilder::new(bodies.len());
-    for &body in bodies {
-        let cs = query_celestial_state(almanac, body, epoch)?;
-        builder.append_spacetimestamp(
-            "ICRF",
-            "km",
-            "TAI",
-            "naif:de440s",
-            "MEASURED",
-            cs.position_km,
-            cs.orientation,
-            centuries,
-            ns,
-            None,
-            None,
-        );
-    }
-    Ok(builder.flush())
+/// [`KIND_ABSTRACT`](crate::identity::KIND_ABSTRACT): a kernel is a data source, never a
+/// frame, so handing this to frame resolution is rejected rather than resolved.
+fn anise_source_id() -> PrescribedId {
+    PrescribedId::abstract_source("anise", "almanac").expect("static source name is valid")
 }
 
 // ---------------------------------------------------------------------------
 // Entity snapshots
 // ---------------------------------------------------------------------------
 
-/// Queries the ephemeris for the given bodies at `epoch` and returns a standard entity
+/// Queries the almanac for each KIND_ASTRO body `id` at `epoch` and returns a standard entity
 /// [`RecordBatch`], following [`crate::schemas::entity::entity_schema`].
 ///
-/// All rows use `frame_id = "ICRF"`, `units_pos = "km"`, `timescale_id = "TAI"`,
-/// `source_id = "naif:de440s"`, and `estimate_type = "MEASURED"`.
+/// Each id is queried through its embedded `(ephemeris_id, orientation_id)` frame via
+/// [`celestial_state`] and stored under that same id, so a body is recorded under its own
+/// canonical astronomical id (`Earth` = `IAU_EARTH` = `(399, 399)`); there is no separate
+/// query-vs-store id. A body list is therefore just a list of `(naif, naif)` ids, e.g.
+/// `CelestialBody::ALL.iter().map(|b| b.entity_id())`.
 ///
-/// - **Position**: body center relative to the Solar System Barycentre (SSB), from DE440.
-/// - **Velocity**: body-center linear velocity from DE440.
-/// - **Orientation**: quaternion `[w, x, y, z]` encoding the rotation from the body's
-///   IAU body-fixed frame to ICRF.
-/// - **Angular velocity**: body spin in ICRF (rad/s), present when the PCK includes derivatives.
-/// - **Mass**: from DE440/IAU 2012 GM constants.
-///
-/// Celestial bodies are not special — they are entities like any other, recorded with the
-/// same schema as a spacecraft or robot. The returned batch is schema-compatible with any
-/// other entity batch and can be appended directly to a `soloc` ledger:
-///
-/// ```rust,ignore
-/// ledger.append(celestial_snapshot(&almanac, CelestialBody::ALL, epoch)?);
-/// ```
+/// All rows use `frame_id = ICRF`, `units_pos = km`, `timescale_id = TAI`,
+/// `source_id = anise:almanac`, `estimate_type = MEASURED`. Position/velocity, orientation,
+/// angular velocity, and mass come from [`celestial_state`] (see it for the strict, no-fallback
+/// contract). The batch is schema-compatible with any other entity batch and appends directly
+/// to a `soloc` ledger.
 ///
 /// # Data requirements
 ///
-/// - **Inner planets** (Sun, Mercury, Venus, Earth, Moon, Mars): position and orientation
-///   are fully resolved by `MetaAlmanac::latest()` (DE440 + pck11.pca).
-/// - **Outer planets** (Jupiter, Saturn, Uranus, Neptune): orientation is resolved by
-///   `MetaAlmanac::latest()`, but body-center position additionally requires a satellite
-///   SPK (e.g. `jup365.bsp` for Jupiter). Load it via `MetaAlmanac` or supply the file
-///   directly to the `Almanac`.
+/// - **Inner planets** (Sun..Mars, Moon): resolved by `MetaAlmanac::latest()` (DE440 + pck11.pca).
+/// - **Outer planets** (Jupiter..Neptune): body-center position additionally needs a satellite
+///   SPK (e.g. `jup365.bsp` for Jupiter); its absence is a clean per-body error.
 ///
 /// # Errors
 ///
-/// Returns `Err` if:
-/// - `bodies` is empty.
-/// - The almanac fails to resolve position or orientation for any body.
+/// Returns `Err` if `ids` is empty, an id is not a KIND_ASTRO body, or the almanac cannot
+/// resolve a body's position, orientation, or GM.
 pub fn celestial_snapshot(
     almanac: &Almanac,
-    bodies: &[CelestialBody],
+    ids: &[PrescribedId],
     epoch: Epoch,
 ) -> Result<RecordBatch, String> {
-    if bodies.is_empty() {
-        return Err("bodies list is empty — provide at least one CelestialBody".to_string());
+    if ids.is_empty() {
+        return Err("bodies list is empty — provide at least one astronomical body id".to_string());
     }
 
     let (centuries, ns) = epoch_to_parts(epoch);
-    let mut builder = EntityBuilder::new(bodies.len());
+    let (icrf, source) = (icrf_id(), anise_source_id());
+    let mut builder = EntityBuilder::new(ids.len());
 
-    for &body in bodies {
-        let cs = query_celestial_state(almanac, body, epoch)?;
+    for &id in ids {
+        let cs = celestial_state(almanac, id, epoch)?;
 
         builder.append_entity(
-            body.entity_id(),
-            "ICRF",
-            "km",
-            "TAI",
-            "naif:de440s",
-            "MEASURED",
+            id,
+            icrf,
+            LengthUnit::km,
+            TimeScaleCode::TAI,
+            source,
+            EstimateType::MEASURED,
             cs.position_km,
             cs.orientation,
             centuries,
             ns,
-            Some(cs.velocity_km_s),
-            cs.angular_velocity,
+            Some(cs.velocity_m_s),
+            cs.angular_velocity_rad_s,
             None,
             cs.mass_kg,
-            None,
-            None,
-        );
-    }
-
-    Ok(builder.flush())
-}
-
-/// Queries the almanac for arbitrary NAIF bodies at `epoch` and returns a standard entity
-/// [`RecordBatch`].
-///
-/// Each entry in `bodies` is a `(naif_id, entity_id)` pair — `naif_id` is the NAIF integer
-/// ID of the body (e.g. `2099942` for Apophis, `599` for Jupiter center), and `entity_id`
-/// is the URI to store (e.g. `"naif:2099942"` for Apophis, or `"jpl-sb:2004-MN4"`).
-///
-/// Unlike [`celestial_snapshot`], orientation silently falls back to the identity quaternion
-/// and `angular_velocity` to `None` when the loaded PCK has no rotation model for the
-/// requested body — so this function succeeds for any body that has SPK position data,
-/// regardless of PCK coverage. Mass is not populated (unknown for arbitrary bodies).
-///
-/// # Errors
-///
-/// Returns `Err` if:
-/// - `bodies` is empty.
-/// - The almanac cannot resolve the position of any body (SPK data missing).
-pub fn naif_snapshot(
-    almanac: &Almanac,
-    bodies: &[(i32, &str)],
-    epoch: Epoch,
-) -> Result<RecordBatch, String> {
-    if bodies.is_empty() {
-        return Err(
-            "bodies list is empty — provide at least one (naif_id, entity_id) pair".to_string(),
-        );
-    }
-
-    let (centuries, ns) = epoch_to_parts(epoch);
-    let mut builder = EntityBuilder::new(bodies.len());
-
-    for &(naif_id, entity_id) in bodies {
-        let cs = query_naif_state(almanac, naif_id, epoch)
-            .map_err(|e| format!("NAIF ID {naif_id} ({entity_id}): {e}"))?;
-
-        builder.append_entity(
-            entity_id,
-            "ICRF",
-            "km",
-            "TAI",
-            "anise",
-            "MEASURED",
-            cs.position_km,
-            cs.orientation,
-            centuries,
-            ns,
-            Some(cs.velocity_km_s),
-            cs.angular_velocity,
-            None,
-            None,
             None,
             None,
         );
@@ -682,27 +464,71 @@ mod tests {
     use super::*;
     use hifitime::Duration;
 
-    /// Every entry in KNOWN_EXTERNAL_FRAMES must be resolvable by anise at transform time.
-    /// If this test fails for a given name, that name is a static lie — it passes validation
-    /// but will blow up in transform_batch. Either fix the resolution path or remove the entry.
+    /// Every pair in the canonical table must be recognised by its own mint gate, and every
+    /// `IAU_*` frame must be body-fixed `(naif, naif)`. Catches a future edit that adds a name
+    /// without a self-consistent pair.
     #[test]
-    fn test_known_external_frames_all_resolve() {
-        let failures: Vec<&str> = KNOWN_EXTERNAL_FRAMES
-            .iter()
-            .copied()
-            .filter(|&name| resolve_astronomical_frame(name).is_none())
+    fn test_astro_frames_are_self_consistent() {
+        for &(name, e, o) in ASTRO_FRAMES {
+            assert!(recognised(e, o), "{name} = ({e}, {o}) is not recognised");
+            assert_eq!(frame_pair(name), Some((e, o)), "{name} resolves wrong");
+            if name.starts_with("IAU_") {
+                assert_eq!(e, o, "{name}: IAU body-fixed frame must be (naif, naif)");
+            }
+        }
+    }
+
+    #[test]
+    fn test_bare_body_name_is_its_body_fixed_frame() {
+        // Decision B: a bare body name and its IAU_ spelling are one frame, one id.
+        assert_eq!(frame_pair("Earth"), Some((399, 399)));
+        assert_eq!(frame_pair("Earth"), frame_pair("IAU_EARTH"));
+        assert_eq!(
+            PrescribedId::astronomical(399, 399).unwrap(),
+            PrescribedId::astronomical(399, 399).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_frame_pair_is_case_sensitive_and_rejects_unknowns() {
+        assert_eq!(frame_pair("ICRF"), Some((0, 1)));
+        assert_eq!(frame_pair("icrf"), None, "names are byte-exact");
+        assert_eq!(frame_pair("NOT_A_FRAME"), None);
+    }
+
+    #[test]
+    fn test_recognised_rejects_nonsense_pairs() {
+        // Both components are valid NAIF ids, but the combination is not a real frame.
+        assert!(
+            !recognised(399, 499),
+            "(Earth ephem, Mars orient) is nonsense"
+        );
+        assert!(PrescribedId::astronomical(399, 499).is_err());
+    }
+
+    /// Startup registration mints every name it registers, so an entry that cannot be minted
+    /// would be registered nowhere and fail at transform time. The exact failure the static
+    /// list exists to prevent. Fails loudly if a future entry is added that `PrescribedId`
+    /// will not accept.
+    #[test]
+    fn test_every_registrable_frame_name_is_mintable() {
+        let failures: Vec<&str> = registrable_frame_names()
+            .filter(|name| {
+                frame_pair(name)
+                    .map(|(e, o)| PrescribedId::astronomical(e, o).is_err())
+                    .unwrap_or(true)
+            })
             .collect();
         assert!(
             failures.is_empty(),
-            "These KNOWN_EXTERNAL_FRAMES entries are not resolvable by anise and must be \
-             removed or given a dedicated resolution path: {failures:?}"
+            "these names are registered at startup but cannot be minted: {failures:?}"
         );
     }
 
     #[test]
     fn test_j2000_tai_is_correct() {
         let j2000 = j2000_tai();
-        // J2000 is 2000-01-01T12:00:00 TAI — epoch_to_parts should give (0, 0).
+        // J2000 is 2000-01-01T12:00:00 TAI: epoch_to_parts should give (0, 0).
         let (c, n) = epoch_to_parts(j2000);
         assert_eq!(c, 0);
         assert_eq!(n, 0);
@@ -730,6 +556,17 @@ mod tests {
     fn test_j2000_in_timescale_tai_matches_j2000_tai() {
         // J2000 in TAI must exactly equal j2000_tai().
         assert_eq!(j2000_in_timescale(TimeScale::TAI), j2000_tai());
+    }
+
+    /// anise reports velocity in km/s and the entity schema stores m/s, so this must scale
+    /// *up* by 1000. The snapshot test that reads a real velocity is `#[ignore]`d currently
+    #[test]
+    fn velocity_converts_km_s_to_m_s() {
+        assert_eq!(velocity_to_m_s([1.0, -2.5, 0.0]), [1000.0, -2500.0, 0.0]);
+
+        // Earth's orbital speed is ~29.78 km/s, i.e. ~29 780 m/s — not ~0.02978.
+        let [vx, _, _] = velocity_to_m_s([29.78, 0.0, 0.0]);
+        assert!((vx - 29_780.0).abs() < 1e-9, "got {vx}");
     }
 
     #[test]
@@ -794,69 +631,46 @@ mod tests {
 
     #[test]
     fn test_entity_ids_are_unique() {
-        let ids: Vec<&str> = CelestialBody::ALL.iter().map(|b| b.entity_id()).collect();
+        let ids: Vec<PrescribedId> = CelestialBody::ALL.iter().map(|b| b.entity_id()).collect();
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(ids.len(), unique.len(), "duplicate entity IDs detected");
     }
 
     #[test]
-    fn test_entity_ids_use_naif_prefix() {
+    fn test_entity_ids_are_their_body_fixed_frame() {
         for body in CelestialBody::ALL {
             let id = body.entity_id();
-            assert!(
-                id.starts_with("naif:"),
-                "{id:?} does not match expected naif: prefix"
+            let naif = body.naif_id();
+            assert_eq!(id.astro_frame(), Some((naif, naif)), "{body:?} pair");
+            assert_eq!(
+                id,
+                PrescribedId::astronomical(naif, naif).unwrap(),
+                "{body:?} id is its (naif, naif) frame",
             );
+            assert!(id.is_astro(), "{body:?} id should be KIND_ASTRO");
         }
     }
 
     #[test]
-    fn test_all_bodies_have_positive_mass() {
-        for body in CelestialBody::ALL {
-            assert!(body.mass_kg() > 0.0, "{:?} has non-positive mass", body);
-        }
-    }
-
-    #[test]
-    fn test_sun_is_most_massive() {
-        let sun_mass = CelestialBody::Sun.mass_kg();
-        for body in CelestialBody::ALL {
-            if *body != CelestialBody::Sun {
-                assert!(
-                    sun_mass > body.mass_kg(),
-                    "Sun should be heavier than {:?}",
-                    body
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_gm_values_match_propagator_table() {
-        assert!((CelestialBody::Earth.gm_km3_s2() - 3.986_004_418e5).abs() < 1.0);
-        assert!((CelestialBody::Sun.gm_km3_s2() - 1.327_124_400_419_393e11).abs() < 1e6);
-        assert!((CelestialBody::Moon.gm_km3_s2() - 4.904_869_5e3).abs() < 1.0);
-    }
-
-    #[test]
-    fn test_query_celestial_state_fails_without_spk() {
+    fn test_celestial_state_fails_without_kernels() {
         let almanac = Almanac::default();
         let epoch = j2000_tai();
-        let err = query_celestial_state(&almanac, CelestialBody::Earth, epoch).unwrap_err();
+        let err = celestial_state(&almanac, CelestialBody::Earth.entity_id(), epoch).unwrap_err();
         assert!(
-            err.contains("MetaAlmanac") || err.contains("SPK") || err.contains("ephemeris"),
-            "error should guide user to load an SPK; got: {err}"
+            err.contains("position") || err.contains("SPK"),
+            "error should guide user to load a kernel; got: {err}"
         );
     }
 
     #[test]
-    fn test_query_naif_state_fails_without_spk() {
+    fn test_celestial_state_rejects_a_non_astro_id() {
         let almanac = Almanac::default();
         let epoch = j2000_tai();
-        let err = query_naif_state(&almanac, 399, epoch).unwrap_err();
+        let soloc = PrescribedId::new("acme.com", "truck_A").unwrap();
+        let err = celestial_state(&almanac, soloc, epoch).unwrap_err();
         assert!(
-            err.contains("399") || err.contains("position") || err.contains("SPK"),
-            "error should mention the NAIF ID; got: {err}"
+            err.contains("astronomical") || err.contains("KIND_ASTRO"),
+            "a non-astro id should be rejected before any kernel query; got: {err}"
         );
     }
 
@@ -871,21 +685,14 @@ mod tests {
     }
 
     #[test]
-    fn test_naif_snapshot_empty_bodies_returns_error() {
+    fn test_no_kernel_returns_descriptive_error() {
         let almanac = Almanac::default();
         let epoch = j2000_tai();
-        let err = naif_snapshot(&almanac, &[], epoch).unwrap_err();
-        assert!(err.contains("empty"), "got: {err}");
-    }
-
-    #[test]
-    fn test_no_spk_returns_descriptive_error() {
-        let almanac = Almanac::default();
-        let epoch = j2000_tai();
-        let err = celestial_snapshot(&almanac, &[CelestialBody::Earth], epoch).unwrap_err();
+        let err =
+            celestial_snapshot(&almanac, &[CelestialBody::Earth.entity_id()], epoch).unwrap_err();
         assert!(
-            err.contains("MetaAlmanac") || err.contains("SPK") || err.contains("ephemeris"),
-            "error should guide user to load an SPK; got: {err}"
+            err.contains("SPK") || err.contains("position"),
+            "error should guide user to load a kernel; got: {err}"
         );
     }
 
@@ -900,7 +707,8 @@ mod tests {
             anise::prelude::MetaAlmanac::latest().expect("MetaAlmanac::latest() should succeed");
 
         let epoch = j2000_tai();
-        let batch = celestial_snapshot(&almanac, CelestialBody::ALL, epoch)
+        let ids: Vec<PrescribedId> = CelestialBody::ALL.iter().map(|b| b.entity_id()).collect();
+        let batch = celestial_snapshot(&almanac, &ids, epoch)
             .expect("snapshot should succeed with a loaded almanac");
 
         assert_eq!(batch.num_rows(), 10, "one row per body");
