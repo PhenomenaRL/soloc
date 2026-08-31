@@ -2901,6 +2901,7 @@ dependencies = [
  "hifitime",
  "log",
  "nalgebra",
+ "sha2",
  "test-log",
 ]
 
