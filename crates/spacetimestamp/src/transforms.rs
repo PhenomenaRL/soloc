@@ -271,7 +271,7 @@ pub fn transform_batch(
 /// duration_ns)` are SI-second offsets from `2000-01-01T12:00:00 TAI`. Rows already in TAI
 /// are passed through unchanged (fast path when all rows are TAI returns a cheap clone).
 ///
-/// This is called by [`soloc::ledger::Ledger::append`] so that all stored data shares a
+/// This is called by [`soloc_ledger::ledger::Ledger::append`] so that all stored data shares a
 /// single timescale, making temporal comparisons and almanac queries unambiguous.
 pub fn normalize_batch_to_tai(batch: &RecordBatch) -> Result<RecordBatch, String> {
     let schema = batch.schema();

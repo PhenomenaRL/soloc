@@ -9,7 +9,7 @@ name = "soloc-server"
 path = "src/main.rs"
 
 [dependencies]
-soloc = { path = "../soloc" }
+soloc-ledger = { path = "../soloc-ledger" }
 spacetimestamp = { path = "../spacetimestamp" }
 arrow = "57.1.0"
 arrow-flight = "57.1.0"

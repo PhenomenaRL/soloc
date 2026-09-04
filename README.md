@@ -19,7 +19,7 @@ Each observation is stored in its **original reference frame and native units, f
 | Crate | Description |
 |---|---|
 | [`spacetimestamp`](crates/spacetimestamp/) | Arrow schemas and builders, row-derived transform tree, physics transforms, spatiotemporal filters |
-| [`soloc`](crates/soloc/) | Append-only ledger: persistence, pose cache, federation |
+| [`soloc-ledger`](crates/soloc-ledger/) | Append-only ledger: persistence, pose cache, federation |
 | [`soloc-server`](crates/soloc-server/) | Arrow Flight gRPC server |
 
 ## Quick Start
@@ -28,10 +28,10 @@ Each observation is stored in its **original reference frame and native units, f
 
 ```bash
 # Build
-cargo build -p spacetimestamp -p soloc -p soloc-server
+cargo build -p spacetimestamp -p soloc-ledger -p soloc-server
 
 # Test
-cargo test -p spacetimestamp -p soloc -p soloc-server
+cargo test -p spacetimestamp -p soloc-ledger -p soloc-server
 ```
 
 ### Running the server

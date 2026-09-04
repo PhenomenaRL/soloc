@@ -2,7 +2,7 @@
 //!
 //! The snapshot function itself lives in [`spacetimestamp::ephemeris`]. It only needs an
 //! [`anise::almanac::Almanac`] and an entity builder, so it is usable without a ledger. This
-//! module re-exports it so `soloc::ephemeris::celestial_snapshot` keeps resolving for callers
+//! module re-exports it so `soloc_ledger::ephemeris::celestial_snapshot` keeps resolving for callers
 //! who reach for the ledger crate first.
 //!
 //! Appending a snapshot needs no wrapper: `ledger.append(celestial_snapshot(&almanac, &ids,
