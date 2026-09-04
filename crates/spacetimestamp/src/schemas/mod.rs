@@ -22,7 +22,7 @@ use arrow::datatypes::SchemaRef;
 /// assert_eq!(id_column, "entity_id");
 /// ```
 ///
-/// A `soloc::ledger::Ledger` can be constructed directly from an implementor via
+/// A `soloc_ledger::ledger::Ledger` can be constructed directly from an implementor via
 /// `Ledger::for_schema::<EntitySchema>()`. (Plain text, not a doc link: `soloc` depends on
 /// this crate, not the other way around.)
 pub trait SpaceTimestampSchema {

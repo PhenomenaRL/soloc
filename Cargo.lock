@@ -2856,7 +2856,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5dd1c9b1b5d34e1e949deb0dac9ad612e20746c59eaa737e52fd29703c19ec5c"
 
 [[package]]
-name = "soloc"
+name = "soloc-ledger"
 version = "0.1.0"
 dependencies = [
  "anise",
@@ -2883,7 +2883,7 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
- "soloc",
+ "soloc-ledger",
  "spacetimestamp",
  "tokio",
  "toml",

@@ -15,7 +15,7 @@ use serde::Deserialize;
 use tonic::{Request, Response, Status, Streaming};
 
 use anise::almanac::metaload::MetaFile;
-use soloc::ephemeris::celestial_snapshot;
+use soloc_ledger::ephemeris::celestial_snapshot;
 use spacetimestamp::identity::PrescribedId;
 use spacetimestamp::ipc;
 use spacetimestamp::query::SpatiotemporalFilter;
@@ -558,7 +558,7 @@ impl FlightService for SolocFlightService {
                 let body: SaveLedgerBody = serde_json::from_slice(&action.body).map_err(|e| {
                     Status::invalid_argument(format!("invalid load_ledger body: {e}"))
                 })?;
-                let new_ledger = soloc::ledger::Ledger::load_ipc(
+                let new_ledger = soloc_ledger::ledger::Ledger::load_ipc(
                     std::path::Path::new(&body.path),
                     &self.state.id_column,
                 )
@@ -674,7 +674,7 @@ impl FlightService for SolocFlightService {
 mod tests {
     use super::*;
     use anise::almanac::Almanac;
-    use soloc::schemas::entity::EntityBuilder;
+    use soloc_ledger::schemas::entity::EntityBuilder;
     use spacetimestamp::vocabulary::{EstimateType, TimeScaleCode};
 
     /// Mints a test entity id under the `demo` authority.

@@ -52,8 +52,8 @@ const ID_TYPE_DESC: &str = "FixedSizeBinary(16)";
 ///
 /// eg. for the standard entity schema, construct with:
 /// ```
-/// use soloc::schemas::entity::entity_schema;
-/// use soloc::ledger::Ledger;
+/// use soloc_ledger::schemas::entity::entity_schema;
+/// use soloc_ledger::ledger::Ledger;
 ///
 /// let ledger = Ledger::new(&entity_schema(), "entity_id").unwrap();
 /// ```
@@ -113,8 +113,8 @@ impl Ledger {
     /// This is the preferred constructor when working with a known schema type:
     ///
     /// ```
-    /// use soloc::schemas::entity::EntitySchema;
-    /// use soloc::ledger::Ledger;
+    /// use soloc_ledger::schemas::entity::EntitySchema;
+    /// use soloc_ledger::ledger::Ledger;
     ///
     /// let ledger = Ledger::for_schema::<EntitySchema>()?;
     /// # Ok::<(), String>(())

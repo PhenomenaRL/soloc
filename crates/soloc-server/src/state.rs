@@ -1,6 +1,6 @@
 use anise::almanac::Almanac;
-use soloc::ledger::Ledger;
-use soloc::schemas::entity::entity_schema;
+use soloc_ledger::ledger::Ledger;
+use soloc_ledger::schemas::entity::entity_schema;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 

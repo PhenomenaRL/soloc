@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "crates/spacetimestamp",
-    "crates/soloc",
+    "crates/soloc-ledger",
     "crates/soloc-server",
 ]
 resolver = "2"
