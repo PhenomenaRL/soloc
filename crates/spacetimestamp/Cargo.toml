@@ -10,7 +10,7 @@ arrow = "57.1.0"
 hifitime = "4.2.4"
 log = "0.4"
 nalgebra = "0.35"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
 test-log = "0.2.19"
