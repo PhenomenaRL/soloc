@@ -41,6 +41,8 @@ const KNOWN: Record<string, DisplayInfo> = {
   "demo:asteroid-1": {
     label: "Asteroid 1", color: "#b48ead", bodyRadiusKm: 0.04, focusDistKm: 3, kind: "asset",
   },
+  "demo:moon-base-1": { label: "Moon Base", color: "#e6e6a0", focusDistKm: 20, kind: "asset" },
+  "demo:rover-1": { label: "Lunar Rover", color: "#6bd68b", focusDistKm: 5, kind: "asset" },
   "demo:spaceship-1": { label: "Spaceship 1", color: "#4fc3f7", focusDistKm: 4_000, kind: "asset" },
   "demo:miner-1": { label: "Asteroid Miner", color: "#f2b56d", focusDistKm: 2, kind: "asset" },
 };

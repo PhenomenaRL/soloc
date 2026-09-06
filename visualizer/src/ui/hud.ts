@@ -1,6 +1,7 @@
 /**
  * HUD: entity list panel (grouped anchors vs. assets) and a status line.
- * Clicking an entry flies the camera to that entity.
+ * Clicking an entry flies the camera to that entity; its checkbox shows or
+ * hides that entity without touching anything parented to it.
  */
 
 import type { LedgerData } from "../arrow/loader";
@@ -38,9 +39,20 @@ export function buildHud(
       const el = document.createElement("div");
       el.className = "hud-entity";
       el.innerHTML =
+        `<input type="checkbox" class="vis" checked title="show / hide">` +
         `<span class="dot" style="background:${info.color}"></span>` +
         `<span class="name">${info.label}</span>` +
         `<span class="parent"></span>`;
+
+      const box = el.querySelector<HTMLInputElement>(".vis")!;
+      box.addEventListener("change", () => {
+        viewer.setVisible(id, box.checked);
+        el.classList.toggle("hidden-entity", !box.checked);
+      });
+      // The checkbox is inside the row, so its click would otherwise also fly
+      // the camera to an entity the user was only trying to hide.
+      box.addEventListener("click", (e) => e.stopPropagation());
+
       el.addEventListener("click", () => viewer.focus(id));
       panel.append(el);
       rows.set(id, el);

@@ -79,6 +79,15 @@
       .hud-entity.focused { background: rgba(79, 195, 247, 0.16); }
       .hud-entity .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
       .hud-entity .name { flex: 1; }
+      .hud-entity .vis {
+        width: 11px; height: 11px; flex: none; margin: 0; cursor: pointer;
+        accent-color: #4fc3f7;
+      }
+      /* A hidden entity stays listed and still reports its parent — it is out
+         of the render, not out of the ledger. */
+      .hud-entity.hidden-entity .name,
+      .hud-entity.hidden-entity .parent { opacity: 0.4; }
+      .hud-entity.hidden-entity .dot { opacity: 0.25; }
       .hud-entity .parent { color: var(--dim); font-size: 10px; }
 
       #status {

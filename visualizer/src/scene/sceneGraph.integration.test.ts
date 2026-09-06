@@ -31,7 +31,7 @@ function scene(): {
 
 describe.skipIf(!hasFixture)("scene graph mirrors the transform tree", () => {
   it("creates a node per entity", () => {
-    expect(scene().graph.nodes.size).toBe(13);
+    expect(scene().graph.nodes.size).toBe(15);
   });
 
   it("parents groups exactly like the topology (latest epoch)", () => {
@@ -43,6 +43,9 @@ describe.skipIf(!hasFixture)("scene graph mirrors the transform tree", () => {
     // Entity → entity edges: the two scripted re-parents, at the last epoch.
     expect(parentName("demo:spaceship-1")).toBe(idOf("Moon")); // post re-parent
     expect(parentName("demo:miner-1")).toBe(idOf("demo:asteroid-1")); // docked
+    // Three deep: the rover hangs off the base, which hangs off the Moon.
+    expect(parentName("demo:moon-base-1")).toBe(idOf("Moon"));
+    expect(parentName("demo:rover-1")).toBe(idOf("demo:moon-base-1"));
   });
 
   it("places the Moon a real lunar distance from Earth in world space", () => {
@@ -50,6 +53,24 @@ describe.skipIf(!hasFixture)("scene graph mirrors the transform tree", () => {
     const d = worldPos("Moon").distanceTo(worldPos("Earth"));
     expect(d).toBeGreaterThan(3.5e5); // perigee ≈ 356 500 km
     expect(d).toBeLessThan(4.1e5); // apogee ≈ 406 700 km
+  });
+
+  it("converts native units at the node: base sits at lunar radius in km", () => {
+    const { worldPos } = scene();
+    const d = worldPos("demo:moon-base-1").distanceTo(worldPos("Moon"));
+    expect(d).toBeCloseTo(1_737.4, 0); // metres in data → km in scene
+  });
+
+  it("composes two nested frames: the rover ends up on the surface too", () => {
+    const { worldPos } = scene();
+    // Local-level east/north/up, through the base's orientation, through the
+    // Moon's. The curvature drop in the fixture keeps the wheels on the ground.
+    const d = worldPos("demo:rover-1").distanceTo(worldPos("Moon"));
+    expect(d).toBeCloseTo(1_737.4, 0);
+    // ...and it really has driven away from the base — ~12 km over the window.
+    const fromBase = worldPos("demo:rover-1").distanceTo(worldPos("demo:moon-base-1"));
+    expect(fromBase).toBeGreaterThan(10);
+    expect(fromBase).toBeLessThan(14);
   });
 
   it("docked miner is within ~100 m of the asteroid (mm rows)", () => {

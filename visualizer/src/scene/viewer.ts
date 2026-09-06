@@ -7,17 +7,15 @@
  * re-root the world each frame so the *focused* entity sits at the origin —
  * GPU float32 error then lives far from the camera. Combined with a
  * logarithmic depth buffer this holds from Neptune (4.5e9 km) down to a
- * docked miner posed in millimetres.
+ * rover pose in metres.
  */
 
 import {
   AmbientLight,
-  BoxGeometry,
+  AxesHelper,
   BufferAttribute,
   BufferGeometry,
   Color,
-  ConeGeometry,
-  CylinderGeometry,
   Group,
   DynamicDrawUsage,
   Line,
@@ -27,11 +25,10 @@ import {
   Mesh,
   MeshBasicMaterial,
   MeshStandardMaterial,
-  OctahedronGeometry,
+  Object3D,
   PerspectiveCamera,
   PointLight,
   Scene,
-  SphereGeometry,
   Vector3,
   WebGLRenderer,
 } from "three";
@@ -45,18 +42,42 @@ import { posToKm } from "./units";
 import type { EntityNode } from "./sceneGraph";
 import { displayInfo, focusDistanceKm } from "./registry";
 import { buildSceneGraph, type SceneGraph } from "./sceneGraph";
-import { guideLine } from "./orbits";
+import { countAtOrBefore, guideLine, type GuideLine } from "./orbits";
 import {
   applyBodyTextures,
+  bodySphereGeometry,
   makeEarthClouds,
   makeSaturnRings,
   makeSunGlow,
+  setMaxAnisotropy,
 } from "./textures";
 
 interface LabelEntry {
   id: string;
   el: HTMLElement;
   anchor: Vector3;
+}
+
+/** One guide line plus the timing needed to reveal it as playback advances. */
+interface GuideEntry {
+  line: Line | LineLoop;
+  guide: GuideLine;
+}
+
+/**
+ * Everything drawn *for* one entity, as opposed to everything drawn *under* it.
+ *
+ * The distinction is what makes hiding safe. An entity's scene node is also the
+ * frame its children hang off, so switching `node.group.visible` off would take
+ * the spaceship down with the Moon. Its own body, axes and marker therefore live
+ * in a nested `own` group that can be hidden on its own, and its guide lines are
+ * tracked here because they are attached to the *parent's* group, not its own.
+ */
+interface EntityVisuals {
+  own: Group;
+  guides: GuideEntry[];
+  label: HTMLElement | null;
+  visible: boolean;
 }
 
 export class Viewer {
@@ -78,7 +99,11 @@ export class Viewer {
   private controls: OrbitControls;
   private labels: LabelEntry[] = [];
   private labelLayer: HTMLElement;
-  private markerMeshes: { mesh: Mesh; node: Group }[] = [];
+  /** Objects held at a constant on-screen size regardless of camera distance. */
+  private screenScaled: { obj: Object3D; node: Group }[] = [];
+  private visuals = new Map<string, EntityVisuals>();
+  /** The epoch currently displayed — guide lines are revealed up to it. */
+  private nowNs: bigint;
   private flyFrom: Vector3 | null = null;
   private flyTo: Vector3 | null = null;
   private flyT = 1;
@@ -96,6 +121,7 @@ export class Viewer {
   ) {
     this.labelLayer = labelLayer;
     this.names = data.names;
+    this.nowNs = data.minEpochNs;
     this.graph = buildSceneGraph(data.entities, topo, data.minEpochNs);
     this.timelines = buildTimelines(data.entities);
     this.resolver = new WorldResolver(this.timelines);
@@ -106,6 +132,8 @@ export class Viewer {
     this.camera.up.set(0, 0, 1); // dummy orbits live near the xy-plane
     this.renderer = new WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    // Must precede decorate(): textures read this cap as they are built.
+    setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy());
     container.append(this.renderer.domElement);
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
@@ -125,6 +153,7 @@ export class Viewer {
 
   /** Poses every entity at `t` (ns since J2000 TAI), re-parenting live. */
   setTime(epochNs: bigint): void {
+    this.nowNs = epochNs;
     const handoffs: { node: EntityNode; state: PoseState }[] = [];
     for (const [id, timeline] of this.timelines) {
       const node = this.graph.nodes.get(id);
@@ -171,6 +200,8 @@ export class Viewer {
         node.group.position.copy(oldFrame.worldToLocal(this.tmp));
       }
     }
+
+    this.updateGuides();
   }
 
   /** Zoom out to the whole-system view (Sun focus, all orbits in frame). */
@@ -232,10 +263,10 @@ export class Viewer {
     }
     this.controls.update();
 
-    // Screen-constant scale for marker meshes (assets without a real radius).
-    for (const { mesh, node } of this.markerMeshes) {
+    // Screen-constant scale, so body axes stay legible from any distance.
+    for (const { obj, node } of this.screenScaled) {
       const d = this.camera.position.distanceTo(node.getWorldPosition(this.tmp));
-      mesh.scale.setScalar(Math.max(d * 0.006, 1e-6));
+      obj.scale.setScalar(Math.max(d * 0.02, 1e-6));
     }
 
     this.updateTreeLines();
@@ -249,40 +280,54 @@ export class Viewer {
       const info = displayInfo(id, this.names);
       const color = new Color(info.color);
 
+      // Everything this entity draws for itself goes in `own`, never straight
+      // onto `node.group` — see EntityVisuals for why that separation matters.
+      const own = new Group();
+      own.name = `${id}:own`;
+      node.group.add(own);
+
       if (info.bodyRadiusKm) {
         const r = info.bodyRadiusKm;
         const mat =
           info.kind === "star"
             ? new MeshBasicMaterial({ color })
             : new MeshStandardMaterial({ color, roughness: 0.9, metalness: 0 });
-        const body = new Mesh(new SphereGeometry(r, 48, 24), mat);
-        node.group.add(body);
-        void applyBodyTextures(body, key, r);
+        const body = new Mesh(bodySphereGeometry(r), mat);
+        own.add(body);
+        void applyBodyTextures(body, key);
 
         if (info.kind === "star") {
+          // The light goes on the node, not in `own`: hiding the Sun should
+          // remove the Sun, not plunge the rest of the system into darkness.
           node.group.add(new PointLight(0xfff2d5, 2.5, 0, 0));
-          node.group.add(makeSunGlow(r));
+          own.add(makeSunGlow(r));
         }
         if (key === "SATURN_BARYCENTER") {
-          void makeSaturnRings(r).then((rings) => rings && node.group.add(rings));
+          void makeSaturnRings(r).then((rings) => rings && own.add(rings));
         }
         if (key === "Earth") {
-          void makeEarthClouds(r).then((clouds) => clouds && node.group.add(clouds));
+          void makeEarthClouds(r).then((clouds) => clouds && own.add(clouds));
         }
-      } else {
-        // Screen-scaled marker for assets; shape hints at what it is.
-        const geom =
-          key.includes("spaceship") ? new ConeGeometry(0.45, 1.5, 12)
-          : key.includes("miner") ? new CylinderGeometry(0.5, 0.5, 0.9, 6)
-          : new OctahedronGeometry(1);
-        const mesh = new Mesh(geom, new MeshBasicMaterial({ color }));
-        node.group.add(mesh);
-        this.markerMeshes.push({ mesh, node: node.group });
+      }
+
+      // Non-astronomical entities are drawn as their three body axes rather
+      // than a shape: an asset's `dimensions` are not modelled yet, but its
+      // orientation is real and worth seeing. Screen-scaled, so a rover and a
+      // spacecraft are both legible without knowing their size.
+      if (!this.names.isAstronomical(id)) {
+        const axes = new AxesHelper(1);
+        // Depth-test off: the axes are an annotation, and at true scale they
+        // would otherwise vanish inside the body they belong to.
+        (axes.material as LineBasicMaterial).depthTest = false;
+        axes.renderOrder = 1;
+        own.add(axes);
+        this.screenScaled.push({ obj: axes, node: node.group });
       }
 
       // Orbit / trajectory guide lines — one per frame the entity has rows in,
       // each attached to that frame's group (a re-parented entity keeps both
       // its Earth-frame spiral and its Moon-frame capture arc, like Eyes).
+      const guides: GuideEntry[] = [];
       const rows = data.entities.get(id);
       if (rows) {
         for (const frame of new Set(rows.map((r) => r.frameId))) {
@@ -297,6 +342,7 @@ export class Viewer {
           });
           const line = guide.kind === "circle" ? new LineLoop(geom, mat) : new Line(geom, mat);
           this.graph.frameGroup(frame).add(line);
+          guides.push({ line, guide });
         }
       }
 
@@ -307,6 +353,57 @@ export class Viewer {
       el.addEventListener("click", () => this.focus(id));
       this.labelLayer.append(el);
       this.labels.push({ id, el, anchor: new Vector3() });
+
+      this.visuals.set(id, { own, guides, label: el, visible: true });
+    }
+    this.updateGuides();
+  }
+
+  /** Whether `id`'s own visuals are currently drawn. */
+  isVisible(id: string): boolean {
+    return this.visuals.get(id)?.visible ?? false;
+  }
+
+  /**
+   * Show or hide one entity's own visuals.
+   *
+   * Children are unaffected: hiding the Moon leaves a spaceship parented to it
+   * exactly where it was, still riding a frame that is still being posed.
+   */
+  setVisible(id: string, on: boolean): void {
+    const v = this.visuals.get(id);
+    if (!v || v.visible === on) return;
+    v.visible = on;
+    v.own.visible = on;
+    if (v.label) v.label.style.display = on ? "" : "none";
+    this.updateGuides();
+  }
+
+  /**
+   * Reveal each guide line up to the displayed epoch.
+   *
+   * A trail is drawn one sample at a time, so the path grows as it is flown. A
+   * fitted circle has no per-point time — it interpolates a whole orbit from a
+   * sliver of samples — so it appears whole, but only once the entity has
+   * actually entered that frame. Either way nothing is drawn for a frame the
+   * entity has not reached: that is what kept the ship's lunar orbit on screen,
+   * riding along with the Moon, days before launch.
+   */
+  private updateGuides(): void {
+    for (const v of this.visuals.values()) {
+      for (const { line, guide } of v.guides) {
+        if (!v.visible || this.nowNs < guide.sinceNs) {
+          line.visible = false;
+          continue;
+        }
+        if (guide.kind === "circle") {
+          line.visible = true;
+          continue;
+        }
+        const drawn = countAtOrBefore(guide.epochs!, this.nowNs);
+        line.visible = drawn >= 2; // a single point draws nothing anyway
+        line.geometry.setDrawRange(0, drawn);
+      }
     }
   }
 
@@ -320,6 +417,10 @@ export class Viewer {
       const behind = v.z > 1 || v.z < -1;
       // Hide a child label when it overlaps its parent from far away (Moon vs Earth).
       if (behind) {
+        label.el.style.display = "none";
+        continue;
+      }
+      if (!this.isVisible(label.id)) {
         label.el.style.display = "none";
         continue;
       }
@@ -363,6 +464,7 @@ export class Viewer {
     );
     const counts = [0, 0];
     for (const node of this.graph.nodes.values()) {
+      if (!this.isVisible(node.id)) continue;
       const parent = node.group.parent ?? this.graph.root;
       // Edge kind from the actual attachment: another entity's group → kinship
       // edge (bright); the root or any non-entity group → frame-anchor spoke (dim).
@@ -387,3 +489,4 @@ export class Viewer {
     this.renderer.setSize(w, h);
   }
 }
+

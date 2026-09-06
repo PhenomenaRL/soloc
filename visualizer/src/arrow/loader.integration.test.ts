@@ -2,7 +2,7 @@
  * Integration: parse the real fixture written by
  * `cargo run -p soloc-ledger --example gen_visualizer_fixture` and re-derive the
  * transform tree in TypeScript. The expected numbers mirror the generator's
- * own round-trip self-test (16 events, re-parents at T+84 h and T+120 h).
+ * own round-trip self-test (17 events, re-parents at T+84 h and T+120 h).
  *
  * Skipped rather than failed when the fixture is absent: it is gitignored and
  * generating it needs NAIF kernels, so a fresh checkout can still run the unit
@@ -21,9 +21,9 @@ describe.skipIf(!hasFixture)("dummy.arrows fixture", () => {
   it("loads every row of every entity", () => {
     const { data } = fixture();
     // 8 bodies every 12 h (15 samples) + Earth and Moon hourly (169 each)
-    // + 3 demo entities hourly.
-    expect(data.rows.length).toBe(8 * 15 + 2 * 169 + 3 * 169);
-    expect(data.entities.size).toBe(13);
+    // + 5 demo entities hourly.
+    expect(data.rows.length).toBe(8 * 15 + 2 * 169 + 5 * 169);
+    expect(data.entities.size).toBe(15);
     expect(data.numBatches).toBe(1);
   });
 
@@ -38,7 +38,7 @@ describe.skipIf(!hasFixture)("dummy.arrows fixture", () => {
     for (const id of data.entities.keys()) expect(data.names.label(id)).not.toBe(id);
     expect(data.names.key(idOf("Earth"))).toBe("Earth");
     expect(data.names.isAstronomical(idOf("Earth"))).toBe(true);
-    expect(data.names.isAstronomical(idOf("demo:miner-1"))).toBe(false);
+    expect(data.names.isAstronomical(idOf("demo:rover-1"))).toBe(false);
   });
 
   it("keeps native units per entity (store raw, reproject on demand)", () => {
@@ -46,12 +46,33 @@ describe.skipIf(!hasFixture)("dummy.arrows fixture", () => {
     const unitsOf = (key: string) =>
       new Set(data.entities.get(idOf(key))!.map((r) => r.unitsPos));
     expect(unitsOf("Earth")).toEqual(new Set(["km"]));
-    // The miner alone spans two units: km while chasing, mm once docked.
+    expect(unitsOf("demo:moon-base-1")).toEqual(new Set(["m"]));
+    expect(unitsOf("demo:rover-1")).toEqual(new Set(["m"]));
     expect(unitsOf("demo:miner-1")).toEqual(new Set(["km", "mm"]));
   });
 
-  it("re-derives the same 15 topology events as the Rust ledger", () => {
-    expect(topology().events.length).toBe(15);
+  it("re-derives the same 17 topology events as the Rust ledger", () => {
+    expect(topology().events.length).toBe(17);
+  });
+
+  it("resolves the rover's three-deep chain through the base", () => {
+    const { data, idOf } = fixture();
+    const chain = topology().chainAt(idOf("demo:rover-1"), t0 + 12n * NS_PER_HOUR);
+    expect(chain.map((id) => data.names.label(id))).toEqual([
+      "rover-1",
+      "moon-base-1",
+      "Moon",
+      "ICRF",
+    ]);
+  });
+
+  it("keeps the base stationary in the Moon's frame", () => {
+    const { data, idOf } = fixture();
+    const rows = data.entities.get(idOf("demo:moon-base-1"))!;
+    // A surveyed installation does not move relative to the body it sits on;
+    // the Moon's own rows carry the rotation on its behalf.
+    for (const r of rows) expect(r.position).toEqual(rows[0]!.position);
+    expect(Math.hypot(...rows[0]!.position)).toBeCloseTo(1_737_400, 0); // metres
   });
 
   it("sees the spaceship re-parent Earth → Moon at T+84 h", () => {
@@ -92,15 +113,16 @@ describe.skipIf(!hasFixture)("dummy.arrows fixture", () => {
     expect(withCov.every((r) => r.unitsPos === "mm")).toBe(true);
   });
 
-  it("decodes kinematics, and the ship's frame IS the Moon's id", () => {
+  it("decodes kinematics: real body velocities, rover angular velocity", () => {
     const { data, idOf } = fixture();
     const earth = data.entities.get(idOf("Earth"))!;
     expect(earth.every((r) => r.velocity !== null)).toBe(true);
-    // A body is its own body-fixed frame, so the post-TLI ship is parented to
-    // the Moon's own id rather than to some separate IAU_MOON anchor.
-    const ship = data.entities.get(idOf("demo:spaceship-1"))!;
-    expect(ship.at(-1)!.frameId).toBe(idOf("Moon"));
-    expect(ship[0]!.frameId).toBe(idOf("Earth"));
+    const rover = data.entities.get(idOf("demo:rover-1"))!;
+    expect(rover[0]!.angularVelocity).not.toBeNull();
+    // The rover is a child of the base, not of the Moon directly.
+    expect(rover[0]!.frameId).toBe(idOf("demo:moon-base-1"));
+    // ...and the base's frame IS the Moon's id — a body is its own body-fixed frame.
+    expect(data.entities.get(idOf("demo:moon-base-1"))![0]!.frameId).toBe(idOf("Moon"));
   });
 
   it("carries real ephemeris, not a synthetic circle", () => {
@@ -117,7 +139,7 @@ describe.skipIf(!hasFixture)("dummy.arrows fixture", () => {
 
     // Earth's body-fixed orientation must actually turn: a full rotation a day
     // means consecutive hourly samples differ. An identity-quaternion fixture
-    // would leave everything parented to it riding a planet that never rotates.
+    // would leave the rover on a Moon that never rotates.
     const rows = data.entities.get(idOf("Earth"))!;
     expect(rows[0]!.quaternion).not.toEqual(rows[1]!.quaternion);
   });

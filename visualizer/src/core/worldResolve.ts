@@ -24,8 +24,8 @@ export class WorldResolver {
    * A prescribed id that nothing in the ledger poses is a terminal anchor
    * (ICRF and friends) and resolves to identity. A body-fixed frame needs no
    * special case: it *is* its body's id, so it resolves through the body's own
-   * rows — orientation included, which is what puts the post-TLI spaceship on a
-   * Moon that really turns.
+   * rows — orientation included, which is what puts the rover on a Moon that
+   * really turns.
    */
   worldPoseAt(id: string, epoch: bigint, depth = 0): FramePose {
     if (depth > 16) return IDENTITY; // cycle guard; validated data never hits it

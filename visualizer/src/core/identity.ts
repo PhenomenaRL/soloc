@@ -18,8 +18,8 @@
  * - **astronomical** (kind `0x0`) — self-describing. The bytes embed anise's
  *   `(ephemeris_id, orientation_id)` pair rather than a hash, so `Earth` and
  *   `IAU_EARTH` are one id and a body *is* its own body-fixed frame. This is
- *   why the spaceship's `IAU_MOON` frame resolves against the Moon's own rows
- *   with no host table in between.
+ *   why the rover's `IAU_MOON` frame resolves against the Moon's own rows with
+ *   no host table in between.
  * - **soloc** (`0x1`) / **abstract** (`0x2`) — a SHA-256 over
  *   `(kind, authority, common_name)`. Nothing about the name is recoverable
  *   from the bytes, so these are the ids the registry file exists for.
