@@ -7,9 +7,14 @@
 //! straight from [`celestial_snapshot`] against a NAIF almanac, so positions,
 //! velocities, body-fixed orientations, angular velocities and masses are the
 //! ones anise resolves — no invented orbits. The demo half is synthetic, but it
-//! is *hung off* those real states: an asteroid, a spaceship that performs a
-//! trans-lunar injection to where the Moon actually is, and an asteroid miner
-//! that docks in millimetres.
+//! is *hung off* those real states: an asteroid, a surveyed Moon base with a
+//! rover driving away from it, a spaceship that performs a trans-lunar injection
+//! to where the Moon actually is, and an asteroid miner that docks in
+//! millimetres.
+//!
+//! The base gives the tree its deepest chain — `rover → base → Moon → ICRF` —
+//! and the base carries a real local-level orientation, so the rover's stored
+//! coordinates are plain east/north/up metres from the front door.
 //!
 //! Two scripted re-parenting events are the payload:
 //!
@@ -41,7 +46,7 @@ use anise::almanac::Almanac;
 use anise::almanac::metaload::MetaAlmanac;
 use arrow::array::{Int16Array, UInt64Array};
 use hifitime::{Epoch, TimeScale, Unit};
-use nalgebra::{Quaternion, UnitQuaternion, Vector3};
+use nalgebra::{Matrix3, Quaternion, Rotation3, UnitQuaternion, Vector3};
 use soloc_ledger::ephemeris::celestial_snapshot;
 use soloc_ledger::ledger::Ledger;
 use soloc_ledger::schemas::entity::{EntityBuilder, EntitySchema};
@@ -71,8 +76,8 @@ const DOCK_HANDOFF_H: u32 = 120;
 /// A body the fixture snapshots from the almanac.
 ///
 /// `ephemeris`/`orientation` are the anise pair the body's [`PrescribedId`] embeds; a body's
-/// own id *is* its IAU body-fixed frame, which is why the spaceship can sit in `IAU_EARTH`
-/// and later `IAU_MOON` without either frame needing a row of its own.
+/// own id *is* its IAU body-fixed frame, which is why the rover can sit in `IAU_MOON` and the
+/// spaceship in `IAU_EARTH` without either frame needing a row of its own.
 ///
 /// `cadence_h` is how often the body is sampled. It is a *rendering* choice, not a physical
 /// one: a body that hosts another entity must carry an orientation sample fine enough to
@@ -91,7 +96,7 @@ struct Body {
 ///
 /// * Sun, Mercury, Venus, Earth and the Moon have body centres in DE440s, so they are recorded
 ///   at `(naif, naif)` — their own IAU body-fixed frame, carrying a real orientation and
-///   angular velocity. That is what lets the spaceship ride a Moon that turns.
+///   angular velocity. That is what lets the rover ride a Moon that turns.
 /// * From **Mars outward** DE440s carries only the system barycentre; a body centre would
 ///   additionally need a satellite SPK (`mar097.bsp`, `jup365.bsp`, …). Those are recorded at
 ///   `(n, 1)`. The offset is the moons' share of system mass — tens of metres for Mars, a few
@@ -105,7 +110,7 @@ const BODIES: &[Body] = &[
     Body { ephemeris: 199, orientation: 199, cadence_h: 12 }, // Mercury
     Body { ephemeris: 299, orientation: 299, cadence_h: 12 }, // Venus
     Body { ephemeris: 399, orientation: 399, cadence_h:  1 }, // Earth   — hosts the spaceship
-    Body { ephemeris: 301, orientation: 301, cadence_h:  1 }, // Moon    — hosts the ship post-TLI
+    Body { ephemeris: 301, orientation: 301, cadence_h:  1 }, // Moon    — hosts the rover
     Body { ephemeris:   4, orientation:   1, cadence_h: 12 }, // Mars barycentre
     Body { ephemeris:   5, orientation:   1, cadence_h: 12 }, // Jupiter barycentre
     Body { ephemeris:   6, orientation:   1, cadence_h: 12 }, // Saturn barycentre
@@ -138,8 +143,21 @@ const DOCK_DIR: [f64; 3] = [0.585, -0.683, 0.439];
 /// Hull extents in metres for the crewed and robotic demo entities. Chosen to sit sensibly
 /// against their masses, and small enough that the miner's 100 m final standoff still clears
 /// the asteroid.
-const SHIP_DIMS_M: [f64; 3] = [7.0, 5.0, 5.0]; // 12 500 kg — Orion class
-const MINER_DIMS_M: [f64; 3] = [5.5, 3.2, 3.2]; //  3 400 kg
+const ROVER_DIMS_M: [f64; 3] = [3.0, 2.3, 2.2]; //     899 kg — Perseverance class
+const SHIP_DIMS_M: [f64; 3] = [7.0, 5.0, 5.0]; //   12 500 kg — Orion class
+const MINER_DIMS_M: [f64; 3] = [5.5, 3.2, 3.2]; //   3 400 kg
+const BASE_DIMS_M: [f64; 3] = [24.0, 18.0, 7.5]; // 42 000 kg — a habitat and its landing pad
+
+/// Mean lunar radius in metres — where the base's foundations are.
+const R_MOON_M: f64 = 1_737_400.0;
+
+/// Where the base was surveyed, in selenographic degrees.
+const BASE_LAT_DEG: f64 = 5.0;
+const BASE_LON_DEG: f64 = -20.0;
+
+/// How fast the rover drives east, metres per second. About 12 km over the
+/// window — a sane week for something Perseverance-sized.
+const ROVER_EAST_M_S: f64 = 0.02;
 
 /// The spaceship's selenocentric state at the moment of capture, km.
 ///
@@ -180,6 +198,31 @@ fn asteroid_vel_m_s(t_days: f64) -> [f64; 3] {
     // km/s tangential speed → m/s.
     let w = 1000.0 * TAU * ASTEROID_RADIUS_KM / (ASTEROID_PERIOD_DAYS * 86_400.0);
     [-w * s, w * c * ic, w * c * is]
+}
+
+/// The base's pose in the Moon's body-fixed frame: where it stands, and which way is up.
+///
+/// Returns `(position_m, orientation)` where the orientation takes a vector from the base's
+/// **local-level** axes — x east, y north, z up — into Moon body-fixed axes. Storing the base
+/// this way is what makes its child's coordinates readable: the rover's row is plain
+/// east/north/up metres from the front door, not a selenographic vector that has to be
+/// unpicked before it means anything.
+fn base_pose() -> ([f64; 3], [f64; 4]) {
+    let (lat, lon) = (BASE_LAT_DEG.to_radians(), BASE_LON_DEG.to_radians());
+    let (sin_lat, cos_lat) = lat.sin_cos();
+    let (sin_lon, cos_lon) = lon.sin_cos();
+
+    // The standard ENU triad at (lat, lon) on a sphere. `east × north = up`, so the three
+    // columns form a right-handed rotation matrix rather than a mirrored one.
+    let east = Vector3::new(-sin_lon, cos_lon, 0.0);
+    let north = Vector3::new(-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat);
+    let up = Vector3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
+
+    let q = UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(
+        Matrix3::from_columns(&[east, north, up]),
+    ));
+    let p = up * R_MOON_M;
+    ([p.x, p.y, p.z], [q.w, q.i, q.j, q.k])
 }
 
 /// `[w, x, y, z]` unit quaternion for a rotation of `angle` about +Z.
@@ -325,10 +368,14 @@ fn main() -> Result<(), String> {
     let moon = PrescribedId::astronomical(301, 301)?;
 
     let asteroid = PrescribedId::new(DEMO, "asteroid-1")?;
+    let base = PrescribedId::new(DEMO, "moon-base-1")?;
+    let rover = PrescribedId::new(DEMO, "rover-1")?;
     let ship = PrescribedId::new(DEMO, "spaceship-1")?;
     let miner = PrescribedId::new(DEMO, "miner-1")?;
 
     let survey_net = PrescribedId::abstract_source(DEMO, "survey-net")?;
+    let base_survey = PrescribedId::abstract_source(DEMO, "base-1-survey")?;
+    let rover_imu = PrescribedId::abstract_source(DEMO, "rover-1-imu")?;
     let gs_madrid = PrescribedId::abstract_source(DEMO, "gs-madrid")?;
     let miner_nav = PrescribedId::abstract_source(DEMO, "miner-1-nav")?;
 
@@ -353,9 +400,13 @@ fn main() -> Result<(), String> {
     }
     ledger.register_name(icrf, ASTRO_AUTHORITY, "ICRF")?;
     ledger.register_name(asteroid, DEMO, "asteroid-1")?;
+    ledger.register_name(base, DEMO, "moon-base-1")?;
+    ledger.register_name(rover, DEMO, "rover-1")?;
     ledger.register_name(ship, DEMO, "spaceship-1")?;
     ledger.register_name(miner, DEMO, "miner-1")?;
     ledger.register_name(survey_net, DEMO, "survey-net")?;
+    ledger.register_name(base_survey, DEMO, "base-1-survey")?;
+    ledger.register_name(rover_imu, DEMO, "rover-1-imu")?;
     ledger.register_name(gs_madrid, DEMO, "gs-madrid")?;
     ledger.register_name(miner_nav, DEMO, "miner-1-nav")?;
     ledger.register_name(
@@ -393,7 +444,7 @@ fn main() -> Result<(), String> {
         let moon_state = body_state(&almanac, moon, epoch)?;
         let moon_geo_km = moon_state.position_km - earth_state.position_km;
 
-        let mut b = EntityBuilder::new(3);
+        let mut b = EntityBuilder::new(5);
 
         // --- asteroid: synthetic, ICRF, hourly ---------------------------
         let ast_pos = asteroid_pos_km(t_d);
@@ -414,6 +465,60 @@ fn main() -> Result<(), String> {
             Some(ASTEROID_MASS_KG),
             None,
             Some(ASTEROID_DIMS_M),
+        );
+
+        // --- moon base: surveyed, stationary, body-fixed on the real Moon --
+        // Never moves in the Moon's frame, so every row is identical — a fixed
+        // installation is exactly the case where "store raw" costs nothing. The
+        // Moon's own orientation rows carry the rotation, so the base rides it
+        // for free, and so does everything parented to the base.
+        let (base_pos_m, base_quat) = base_pose();
+        b.append_entity(
+            base,
+            moon,
+            LengthUnit::m,
+            TimeScaleCode::TAI,
+            base_survey,
+            EstimateType::MEASURED,
+            base_pos_m,
+            base_quat,
+            cen,
+            ns,
+            None,
+            None,
+            None,
+            Some(42_000.0),
+            None,
+            Some(BASE_DIMS_M),
+        );
+
+        // --- rover: a child of the base, in local-level metres -------------
+        // East/north/up from the front door. The base's own orientation rows do
+        // the work of turning that into a selenographic position, and the Moon's
+        // do the work of turning *that* into an ICRF one — which is the whole
+        // point of a three-deep chain.
+        let east_m = ROVER_EAST_M_S * f64::from(h) * 3_600.0;
+        // The local level is a tangent plane, so driving straight along it would
+        // walk the rover off the Moon. Dropping by d²/2R keeps its wheels on the
+        // surface to well under a metre over this distance.
+        let drop_m = east_m * east_m / (2.0 * R_MOON_M);
+        b.append_entity(
+            rover,
+            base,
+            LengthUnit::m,
+            TimeScaleCode::TAI,
+            rover_imu,
+            EstimateType::MEASURED,
+            [east_m, 40.0 * (0.03 * f64::from(h)).sin(), -drop_m],
+            yaw_quat(0.002 * f64::from(h)),
+            cen,
+            ns,
+            None,
+            Some([0.0, 0.0, 9.7e-8]),
+            None,
+            Some(899.0),
+            None,
+            Some(ROVER_DIMS_M),
         );
 
         // --- spaceship: LEO spiral → trans-lunar injection → lunar orbit --
@@ -538,7 +643,7 @@ fn main() -> Result<(), String> {
     // each.
     let reloaded = Ledger::load_ipc(&out_path, "entity_id")?;
     let topo = reloaded.export_topology()?;
-    let expected_events = BODIES.len() + 3 /* demo entities */ + 2 /* re-parents */;
+    let expected_events = BODIES.len() + 5 /* demo entities */ + 2 /* re-parents */;
     if topo.num_rows() != expected_events {
         return Err(format!(
             "round-trip topology mismatch: expected {expected_events} events, got {}",
