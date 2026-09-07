@@ -6,12 +6,12 @@ license.workspace = true
 
 [dependencies]
 spacetimestamp = { path = "../spacetimestamp" }
-anise = "0.10.4"
-nalgebra = "0.35"
-hifitime = "4.2.3"
-arrow = "57.1.0"
-log = "0.4"
+anise.workspace = true
+nalgebra.workspace = true
+hifitime.workspace = true
+arrow.workspace = true
+log.workspace = true
 
 [dev-dependencies]
-test-log = "0.2.19"
-criterion = { version = "0.8", features = ["html_reports"] }
+test-log.workspace = true
+criterion.workspace = true
