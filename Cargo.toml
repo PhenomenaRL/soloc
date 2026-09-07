@@ -8,3 +8,20 @@ resolver = "2"
 
 [workspace.package]
 license = "Apache-2.0"
+
+# Shared dependency versions. Anything used by more than one crate, plus the
+# pairs that have to move in lockstep, lives here so a bump is a one-line
+# change and member crates can never drift apart.
+[workspace.dependencies]
+# arrow-flight pins arrow-* at its own exact minor, so these two move together.
+arrow = "57.1.0"
+arrow-flight = "57.1.0"
+# anise's nalgebra types cross our API boundary, so the two must be bumped in
+# lockstep to avoid duplicate nalgebra versions in the tree.
+anise = "0.10.4"
+nalgebra = "0.35"
+hifitime = "4.2.4"
+log = "0.4"
+
+test-log = "0.2.19"
+criterion = { version = "0.8", features = ["html_reports"] }

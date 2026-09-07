@@ -6,12 +6,14 @@ updates:
       interval: weekly
     groups:
       arrow:
-        patterns: ["arrow*"]
-      # anise's nalgebra types cross our API boundary, so the two must be
-      # bumped in lockstep to avoid duplicate nalgebra versions in the tree.
+        patterns: ["arrow", "arrow-flight"]
+        update-types: ["major", "minor", "patch"]
       anise:
         patterns: ["anise", "nalgebra"]
+        update-types: ["major", "minor", "patch"]
       minor-and-patch:
+        patterns: ["*"]
+        exclude-patterns: ["arrow", "arrow-flight", "anise", "nalgebra"]
         update-types: ["minor", "patch"]
   - package-ecosystem: github-actions
     directory: /
