@@ -48,14 +48,6 @@ pub(crate) const ASTRO_FRAMES: &[(&str, i32, i32)] = &[
     ("GCRF", 399, 1),
     ("EME2000", 399, 1),
     ("EMB", 3, 1),
-    // Planetary system barycentres. The base DE440/DE440s SPK carries every one of these
-    // directly, but only some *body centres*: the Sun (10), Mercury (199), Venus (299),
-    // Earth (399) and the Moon (301). From Mars outward a body centre needs a satellite SPK
-    // (`mar097.bsp`, `jup365.bsp`, …), so the barycentre is the anchor available to a caller
-    // holding only the base kernels. The offset between the two is bounded by the moons'
-    // share of system mass: metres for Mars, a few hundred kilometres for the giants — well
-    // under 1% of the planet's own radius in every case.
-    //
     // Inertial `(naif, 1)`: a barycentre is a point, not a body, so it has no body-fixed
     // orientation to name. The Earth-Moon barycentre is `EMB`, above.
     ("MERCURY_BARYCENTER", 1, 1),
