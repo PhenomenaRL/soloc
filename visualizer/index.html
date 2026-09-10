@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>soloc visualizer</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #04060c;
+        --panel: rgba(10, 15, 28, 0.88);
+        --border: #1d2740;
+        --text: #c9d4e8;
+        --dim: #6b7894;
+        --accent: #4fc3f7;
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 12px/1.5 "SF Mono", "Cascadia Code", Consolas, monospace;
+        overflow: hidden;
+      }
+      #canvas-host { position: fixed; inset: 0; }
+      #canvas-host canvas { display: block; }
+
+      #labels { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
+      .map-label {
+        position: absolute;
+        top: 0; left: 0;
+        padding: 1px 6px 1px 2px;
+        color: var(--text);
+        white-space: nowrap;
+        cursor: pointer;
+        pointer-events: auto;
+        text-shadow: 0 1px 3px #000;
+        translate: 6px -8px; /* offset from the projected point */
+        user-select: none;
+      }
+      .map-label:hover, .map-label.focused { color: #fff; }
+      .map-label .dot {
+        display: inline-block;
+        width: 7px; height: 7px;
+        border-radius: 50%;
+        margin-right: 5px;
+        box-shadow: 0 0 6px currentColor;
+      }
+      .map-label.focused .dot { outline: 1px solid #fff; outline-offset: 2px; }
+
+      #panel {
+        position: fixed;
+        top: 12px; left: 12px;
+        width: 240px;
+        max-height: calc(100vh - 70px);
+        overflow-y: auto;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 10px 0;
+        backdrop-filter: blur(6px);
+      }
+      .hud-group {
+        color: var(--dim);
+        font-size: 10px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        padding: 8px 14px 4px;
+      }
+      .hud-entity {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 14px;
+        cursor: pointer;
+      }
+      .hud-entity:hover { background: rgba(79, 195, 247, 0.08); }
+      .hud-entity.focused { background: rgba(79, 195, 247, 0.16); }
+      .hud-entity .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+      .hud-entity .name { flex: 1; }
+      .hud-entity .vis {
+        width: 11px; height: 11px; flex: none; margin: 0; cursor: pointer;
+        accent-color: #4fc3f7;
+      }
+      /* A hidden entity stays listed and still reports its parent — it is out
+         of the render, not out of the ledger. */
+      .hud-entity.hidden-entity .name,
+      .hud-entity.hidden-entity .parent { opacity: 0.4; }
+      .hud-entity.hidden-entity .dot { opacity: 0.25; }
+      .hud-entity .parent { color: var(--dim); font-size: 10px; }
+
+      #status {
+        position: fixed;
+        left: 0; right: 0; bottom: 0;
+        padding: 6px 14px;
+        background: var(--panel);
+        border-top: 1px solid var(--border);
+        color: var(--dim);
+      }
+
+      #rightcol {
+        position: fixed;
+        top: 52px; right: 12px; bottom: 84px;
+        width: 300px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        pointer-events: none;
+      }
+      #rightcol > div {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 10px 12px;
+        overflow-y: auto;
+        backdrop-filter: blur(6px);
+        pointer-events: auto;
+      }
+      #treepanel { flex: 0 1 auto; }
+      #inspector { flex: 0 1 auto; }
+      .side-title {
+        color: var(--dim);
+        font-size: 10px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        margin-bottom: 6px;
+      }
+      .tp-anchor { fill: var(--dim); }
+      .tp-label { fill: var(--text); font-size: 11px; }
+      .tp-label-anchor { fill: var(--dim); font-size: 11px; }
+      .tp-node.focused .tp-label { fill: var(--accent); font-weight: 700; }
+      .tp-edge {
+        fill: none;
+        stroke: var(--border);
+        stroke-width: 1.2;
+      }
+      .tp-edge.flash { animation: tp-flash 1.6s ease-out; }
+      @keyframes tp-flash {
+        0% { stroke: var(--accent); stroke-width: 2.5; filter: drop-shadow(0 0 4px var(--accent)); }
+        100% { stroke: var(--border); stroke-width: 1.2; }
+      }
+      .insp-head { margin-bottom: 6px; }
+      .insp-head .dot {
+        display: inline-block;
+        width: 8px; height: 8px;
+        border-radius: 50%;
+        margin-right: 6px;
+      }
+      .insp-line { display: flex; gap: 8px; line-height: 1.7; }
+      .insp-line .k { color: var(--dim); flex: 0 0 96px; }
+      .insp-line .v { word-break: break-word; }
+
+      #toolbar {
+        position: fixed;
+        top: 12px; right: 12px;
+        display: flex;
+        gap: 8px;
+      }
+      #toolbar button {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        color: var(--text);
+        font: inherit;
+        padding: 6px 12px;
+        cursor: pointer;
+        backdrop-filter: blur(6px);
+      }
+      #toolbar button:hover { border-color: var(--accent); }
+      #toolbar button.active {
+        color: var(--accent);
+        border-color: var(--accent);
+        box-shadow: 0 0 8px rgba(79, 195, 247, 0.35);
+      }
+
+      #timebar {
+        position: fixed;
+        left: 0; right: 0; bottom: 28px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 8px 14px;
+        background: var(--panel);
+        border-top: 1px solid var(--border);
+        backdrop-filter: blur(6px);
+      }
+      .tc-play {
+        width: 34px; height: 26px;
+        background: transparent;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        color: var(--accent);
+        font: inherit;
+        cursor: pointer;
+      }
+      .tc-play:hover { border-color: var(--accent); }
+      .tc-speed {
+        background: transparent;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        color: var(--text);
+        font: inherit;
+        padding: 3px 6px;
+      }
+      .tc-track { position: relative; flex: 1; display: flex; align-items: center; }
+      .tc-track input[type="range"] {
+        width: 100%;
+        accent-color: var(--accent);
+      }
+      .tc-tick {
+        position: absolute;
+        top: 50%;
+        width: 3px; height: 14px;
+        translate: -1px -50%;
+        background: var(--dim);
+        border-radius: 2px;
+        pointer-events: auto;
+      }
+      .tc-tick.passed { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+      .tc-clock { color: var(--text); min-width: 185px; text-align: right; }
+
+      .hud-entity .parent.changed { animation: parent-flash 1.2s ease-out; }
+      @keyframes parent-flash {
+        0% { color: var(--accent); text-shadow: 0 0 8px var(--accent); }
+        100% { color: var(--dim); text-shadow: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="canvas-host"></div>
+    <div id="labels"></div>
+    <div id="panel"></div>
+    <div id="toolbar">
+      <button id="btn-tree" class="active" title="show/hide transform-tree edges in the 3D view (T)">⌥ edges</button>
+      <button id="btn-panel" class="active" title="show/hide the tree panel and inspector (P)">⌸ panels</button>
+      <button id="btn-overview" title="zoom out to the whole solar system (O)">⌂ solar system</button>
+    </div>
+    <div id="rightcol">
+      <div id="treepanel"></div>
+      <div id="inspector"></div>
+    </div>
+    <div id="timebar"></div>
+    <div id="status">loading dummy.arrows…</div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
