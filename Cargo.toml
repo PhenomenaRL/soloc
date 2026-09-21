@@ -10,8 +10,8 @@ resolver = "2"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-arrow = "59.3.0"
-arrow-flight = "59.3.0"
+arrow = "60.0.0"
+arrow-flight = "60.0.0"
 anise = "0.10.4"
 nalgebra = "0.35"
 hifitime = "4.2.4"
