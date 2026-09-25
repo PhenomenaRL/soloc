@@ -17,6 +17,7 @@ export function buildHud(
   topo: TransformTopology,
   viewer: Viewer,
 ): (t: bigint) => void {
+  panel.replaceChildren();
   const names = data.names;
   // Astronomical ids are bodies and reference frames; everything else is an
   // asset someone minted. The id's own kind nibble says which — no name test.

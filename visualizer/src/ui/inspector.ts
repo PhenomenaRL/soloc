@@ -26,6 +26,7 @@ const vec = (v: readonly number[] | null, suffix = ""): string | null =>
   v === null ? null : `[${v.map(fmt).join(", ")}]${suffix ? " " + suffix : ""}`;
 
 export function buildInspector(container: HTMLElement, viewer: Viewer): Inspector {
+  container.replaceChildren();
   const title = document.createElement("div");
   title.className = "side-title";
   title.textContent = "row inspector";

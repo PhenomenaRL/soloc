@@ -173,6 +173,30 @@
         border-color: var(--accent);
         box-shadow: 0 0 8px rgba(79, 195, 247, 0.35);
       }
+      #file-input { display: none; }
+
+      /* Full-window drop target highlight — shown only while dragging a file
+         over the page. Actual drop handling is on `window`, so this is purely
+         cosmetic and never intercepts pointer events. */
+      #dropzone {
+        position: fixed;
+        inset: 10px;
+        z-index: 1000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        background: rgba(4, 6, 12, 0.75);
+        border: 2px dashed var(--accent);
+        border-radius: 14px;
+        backdrop-filter: blur(2px);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.12s ease;
+      }
+      #dropzone.active { opacity: 1; }
+      #dropzone .dz-title { font-size: 15px; margin-bottom: 6px; }
+      #dropzone .dz-sub { color: var(--dim); font-size: 11px; }
 
       #timebar {
         position: fixed;
@@ -232,6 +256,7 @@
     <div id="labels"></div>
     <div id="panel"></div>
     <div id="toolbar">
+      <button id="btn-load" title="load a ledger (.arrows file) from disk">⇪ load ledger</button>
       <button id="btn-tree" class="active" title="show/hide transform-tree edges in the 3D view (T)">⌥ edges</button>
       <button id="btn-panel" class="active" title="show/hide the tree panel and inspector (P)">⌸ panels</button>
       <button id="btn-overview" title="zoom out to the whole solar system (O)">⌂ solar system</button>
@@ -241,7 +266,14 @@
       <div id="inspector"></div>
     </div>
     <div id="timebar"></div>
-    <div id="status">loading dummy.arrows…</div>
+    <div id="status">loading…</div>
+    <input type="file" id="file-input" accept=".arrows,.arrow" multiple />
+    <div id="dropzone">
+      <div>
+        <div class="dz-title">drop a ledger (.arrows) here</div>
+        <div class="dz-sub">optionally with its .names.arrow sibling</div>
+      </div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

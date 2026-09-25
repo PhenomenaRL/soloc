@@ -112,6 +112,7 @@ export class Viewer {
   /** [0]: entity→entity edges (bright); [1]: entity→frame-anchor edges (dim). */
   private treeLines: LineSegments[] = [];
   treeLayerOn = true;
+  private resizeHandler = (): void => this.resize();
 
   constructor(
     private container: HTMLElement,
@@ -144,11 +145,25 @@ export class Viewer {
     this.decorate(data, topo);
     this.buildTreeLines();
 
-    window.addEventListener("resize", () => this.resize());
+    window.addEventListener("resize", this.resizeHandler);
     this.resize();
 
     this.overview(); // whole-system opening shot
     this.renderer.setAnimationLoop(() => this.tick());
+  }
+
+  /**
+   * Stops the render loop and releases the WebGL context, resize listener and
+   * label DOM this viewer owns, so a fresh `Viewer` can take its place — e.g.
+   * loading a different ledger without a full page reload.
+   */
+  dispose(): void {
+    this.renderer.setAnimationLoop(null);
+    window.removeEventListener("resize", this.resizeHandler);
+    this.controls.dispose();
+    this.renderer.dispose();
+    this.renderer.domElement.remove();
+    this.labelLayer.innerHTML = "";
   }
 
   /** Poses every entity at `t` (ns since J2000 TAI), re-parenting live. */

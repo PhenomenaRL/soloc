@@ -8,7 +8,8 @@ solar-system map with time playback.
 ## Quick start
 
 ```bash
-# 1. Generate the ledger fixture (gitignored; required once).
+# 1. Generate the demo ledger fixture (gitignored; optional — see
+#    "Supplying your own ledger" below for other ways in).
 #    Downloads DE440s + PCK on first run (~150 MB, cached), or point
 #    SOLOC_KERNEL_PATHS at kernels you already have.
 cargo run -p soloc-ledger --example gen_visualizer_fixture
@@ -21,6 +22,36 @@ npm run dev     # → http://localhost:5173
 # Tests (unit; the integration suites skip when the fixture is absent)
 npm test
 ```
+
+## Supplying your own ledger
+
+The app never requires the demo fixture specifically — anything that
+`loadLedger` can parse (a real `entity_id` + `spacetimestamp` Arrow IPC file,
+the same bytes `soloc-server` streams over Flight) works. Three ways in, all
+wired up in `main.ts`:
+
+- **Drag and drop** a `.arrows` file anywhere on the page. Drop its
+  `<name>.arrows.names.arrow` sibling alongside it (multi-file drop) to get
+  resolved names instead of hyphenated ids.
+- **"⇪ load ledger"** in the toolbar opens a file picker for the same thing.
+- **`?src=<url>`** on the page URL fetches a ledger from anywhere reachable
+  over HTTP(S) — e.g. `http://localhost:5173/?src=https://example.com/my.arrows`.
+  The `<url>.names.arrow` sibling is fetched automatically, best-effort. The
+  URL needs CORS enabled for cross-origin hosts; same-origin (e.g. served
+  alongside the app, or via a dev-server proxy) needs nothing extra.
+
+With none of those, it falls back to `/data/dummy.arrows` — the generated
+fixture from step 1 above.
+
+Loading a new ledger tears down and rebuilds the whole scene in place (no
+page reload), so it also works mid-session — drop a different file to swap
+datasets without losing your window state... other than the playback clock,
+which resets to the new ledger's own time window.
+
+Not yet wired up: a live Arrow Flight (gRPC-web) connection straight to
+`soloc-server`, which would skip the flat-file step entirely for data backed
+by `soloc-server`'s own `file://`/`s3://`/`gs://`/`az://` storage. See
+"v2 candidates" below.
 
 ## What you're looking at
 

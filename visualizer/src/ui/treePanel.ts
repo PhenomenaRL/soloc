@@ -42,6 +42,7 @@ export function buildTreePanel(
   topo: TransformTopology,
   viewer: Viewer,
 ): TreePanel {
+  container.replaceChildren();
   const title = document.createElement("div");
   title.className = "side-title";
   title.textContent = "transform tree";

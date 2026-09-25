@@ -20,6 +20,8 @@ export interface TimeControlsOptions {
 
 export interface TimeControls {
   update(t: bigint, playing: boolean): void;
+  /** Removes the window-level space-bar listener this instance installed. */
+  destroy(): void;
 }
 
 export const SPEEDS: { label: string; nsPerSec: number }[] = [
@@ -31,6 +33,7 @@ export const SPEEDS: { label: string; nsPerSec: number }[] = [
 export const DEFAULT_SPEED = SPEEDS[2]!;
 
 export function buildTimeControls(bar: HTMLElement, opts: TimeControlsOptions): TimeControls {
+  bar.replaceChildren();
   const span = Number(opts.maxNs - opts.minNs);
 
   const playBtn = document.createElement("button");
@@ -79,14 +82,18 @@ export function buildTimeControls(bar: HTMLElement, opts: TimeControlsOptions): 
 
   bar.append(playBtn, speedSel, track, clock);
 
-  window.addEventListener("keydown", (ev) => {
+  const onKeydown = (ev: KeyboardEvent): void => {
     if (ev.code === "Space" && !(ev.target instanceof HTMLInputElement)) {
       ev.preventDefault();
       opts.onPlayToggle();
     }
-  });
+  };
+  window.addEventListener("keydown", onKeydown);
 
   return {
+    destroy() {
+      window.removeEventListener("keydown", onKeydown);
+    },
     update(t, playing) {
       playBtn.textContent = playing ? "⏸" : "▶";
       const frac = span <= 0 ? 0 : Number(t - opts.minNs) / span;
