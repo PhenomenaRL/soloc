@@ -156,7 +156,7 @@ fn new_empty_ledger(schema_path: &Option<PathBuf>, id_column: &str) -> Ledger {
 
 /// Downloads and deserialises a ledger from any object-store URL.
 async fn object_store_download(url_str: &str, id_column: &str) -> Result<Ledger, String> {
-    use object_store::ObjectStore;
+    use object_store::ObjectStoreExt;
 
     let url = url::Url::parse(url_str).map_err(|e| format!("invalid object-store URL: {e}"))?;
     let (store, path) =
@@ -175,7 +175,7 @@ async fn object_store_download(url_str: &str, id_column: &str) -> Result<Ledger,
 
 /// Uploads pre-serialised ledger bytes to any object-store URL.
 async fn object_store_upload(raw: Vec<u8>, url_str: &str) -> Result<(), String> {
-    use object_store::ObjectStore;
+    use object_store::ObjectStoreExt;
 
     let url = url::Url::parse(url_str).map_err(|e| format!("invalid object-store URL: {e}"))?;
     let (store, path) =
