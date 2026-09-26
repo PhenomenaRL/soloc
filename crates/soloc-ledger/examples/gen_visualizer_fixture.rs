@@ -34,8 +34,7 @@
 //!
 //! Kernels resolve from `SOLOC_KERNEL_PATHS` (colon-separated) when set, otherwise
 //! from `MetaAlmanac::latest()`, which downloads DE440s + PCK (~150 MB) on first
-//! run and caches them. Unlike `soloc-server`, this example *requires* an almanac:
-//! there is nothing to generate without one.
+//! run and caches them.
 //!
 //! Run with: `cargo run -p soloc-ledger --example gen_visualizer_fixture`
 

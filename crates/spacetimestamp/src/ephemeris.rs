@@ -48,8 +48,7 @@ pub(crate) const ASTRO_FRAMES: &[(&str, i32, i32)] = &[
     ("GCRF", 399, 1),
     ("EME2000", 399, 1),
     ("EMB", 3, 1),
-    // Inertial `(naif, 1)`: a barycentre is a point, not a body, so it has no body-fixed
-    // orientation to name. The Earth-Moon barycentre is `EMB`, above.
+    // Planetary barycenters.
     ("MERCURY_BARYCENTER", 1, 1),
     ("VENUS_BARYCENTER", 2, 1),
     ("MARS_BARYCENTER", 4, 1),
