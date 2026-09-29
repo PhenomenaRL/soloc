@@ -83,3 +83,19 @@ readers take `--seed` (default 7), which must match between them.
 | ICRF | the same rows in ICRF sit at the body's radius from its snapshot position |
 
 `scenario.py` holds the roster and every schedule; the models live in `models/`.
+
+## Look at the data
+
+`view_sim.py` prints a saved ledger as a table straight from the file (no server). Ids show as
+names, vocabulary codes as tokens and epochs as UTC; columns that are empty in every shown row
+are left out.
+
+```bash
+python view_sim.py out/solar_sim.arrow                          # first 20 rows
+python view_sim.py out/solar_sim.arrow --entity AND-R03 --limit 10
+python view_sim.py out/solar_sim.arrow --entity shackleton --tail --limit 5
+python view_sim.py out/solar_sim.arrow --summary                # one line per entity: rows, time span, frames
+python view_sim.py out/solar_sim.arrow --schema
+```
+
+`--entity` matches any part of a name, case-insensitively, and can be repeated.
