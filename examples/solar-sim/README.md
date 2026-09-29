@@ -99,3 +99,17 @@ python view_sim.py out/solar_sim.arrow --schema
 ```
 
 `--entity` matches any part of a name, case-insensitively, and can be repeated.
+
+`topo_sim.py` summarises the frame topology the same way: the parent/child tree at an instant
+(astro frames as roots, each entity with its row count and cadence), then every parent change
+over the run.
+
+```bash
+python topo_sim.py out/solar_sim.arrow                          # tree at the last epoch + events
+python topo_sim.py out/solar_sim.arrow --at 2026-09-02T12:00:00 # tree at a UTC instant
+python topo_sim.py out/solar_sim.arrow --server grpc://localhost:50051
+```
+
+It derives topology from the rows as the ledger does: an entity's parent is the `frame_id` of
+its latest row at or before t. `--server` also loads the file into a running server and checks
+that its `export_topology` log matches the row-derived events exactly.
