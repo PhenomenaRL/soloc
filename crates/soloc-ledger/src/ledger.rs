@@ -6,7 +6,7 @@
 //! and are distinguished by their `estimate_type` field.
 
 use arrow::array::{Array, BooleanBuilder, FixedSizeBinaryArray};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use hifitime::{Duration, Epoch};
 use nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
@@ -185,6 +185,7 @@ impl Ledger {
     /// Rows in other timescales (UTC, GPS, TDB, …) are converted to TAI-relative
     /// `(duration_centuries, duration_ns)`. After this call all stored data is TAI.
     pub fn append(&mut self, batch: RecordBatch) -> Result<(), String> {
+        let batch = conform_to_schema(batch, &self.schema)?;
         validate_spacetimestamp_batch(&batch)?;
         let normalized = normalize_batch_to_tai(&batch)?;
 
@@ -825,6 +826,64 @@ pub fn names_sibling_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Relabels `batch` with the ledger's `schema` when the two differ only in field metadata,
+/// and rejects any other mismatch.
+///
+/// Every stored batch must carry the ledger schema exactly, or a later concat (`current_state`,
+/// `save_ipc`) fails for the whole ledger. pyarrow, for one, writes `arrow.uuid` fields with an
+/// empty `ARROW:extension:metadata`. The relabel swaps only the type, never the buffers.
+fn conform_to_schema(batch: RecordBatch, schema: &SchemaRef) -> Result<RecordBatch, String> {
+    if batch.schema() == *schema {
+        return Ok(batch);
+    }
+    let found = batch.schema();
+    let fields = schema.fields();
+    if found.fields().len() != fields.len()
+        || !found
+            .fields()
+            .iter()
+            .zip(fields)
+            .all(|(f, g)| same_but_metadata(f, g))
+    {
+        return Err(format!(
+            "batch schema does not match the ledger schema: expected {schema:?}, found {found:?}"
+        ));
+    }
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(fields)
+        .map(|(col, field)| {
+            col.to_data()
+                .into_builder()
+                .data_type(field.data_type().clone())
+                .build()
+                .map(arrow::array::make_array)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("failed to relabel batch with the ledger schema: {e}"))?;
+    RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| format!("failed to relabel batch with the ledger schema: {e}"))
+}
+
+/// `a` and `b` agree in name, nullability and type, recursively, ignoring field metadata.
+///
+/// Unlike `DataType::equals_datatype`, nested names count: two id fields swapped inside a
+/// struct must not pass.
+fn same_but_metadata(a: &Field, b: &Field) -> bool {
+    use arrow::datatypes::DataType::{FixedSizeList, LargeList, List, Struct};
+    a.name() == b.name()
+        && a.is_nullable() == b.is_nullable()
+        && match (a.data_type(), b.data_type()) {
+            (Struct(x), Struct(y)) => {
+                x.len() == y.len() && x.iter().zip(y).all(|(f, g)| same_but_metadata(f, g))
+            }
+            (FixedSizeList(f, n), FixedSizeList(g, m)) => n == m && same_but_metadata(f, g),
+            (List(f), List(g)) | (LargeList(f), LargeList(g)) => same_but_metadata(f, g),
+            (x, y) => x == y,
+        }
+}
+
 /// Type-checks an id column and rejects one carrying nulls, or `None` to skip the batch.
 fn id_column_of<'a>(arr: &'a dyn Array, name: &str) -> Option<&'a FixedSizeBinaryArray> {
     let col = as_id_column(arr, name).ok()?;
@@ -1282,6 +1341,101 @@ mod tests {
             None,
         );
         b.flush()
+    }
+
+    /// `batch` with an empty `ARROW:extension:metadata` added to each spacetimestamp field
+    /// that lacks one, the way pyarrow writes `arrow.uuid` fields.
+    fn with_pyarrow_metadata(batch: RecordBatch) -> RecordBatch {
+        let idx = batch.schema().index_of(STS_COLUMN).unwrap();
+        let sts = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let fields: Fields = sts
+            .fields()
+            .iter()
+            .map(|f| {
+                let mut metadata = f.metadata().clone();
+                if !metadata.contains_key("ARROW:extension:metadata") {
+                    metadata.insert("ARROW:extension:metadata", "");
+                }
+                f.as_ref().clone().with_metadata(metadata)
+            })
+            .collect();
+        let sts =
+            StructArray::try_new(fields, sts.columns().to_vec(), sts.nulls().cloned()).unwrap();
+        let mut schema_fields = batch.schema().fields().to_vec();
+        schema_fields[idx] = Arc::new(
+            schema_fields[idx]
+                .as_ref()
+                .clone()
+                .with_data_type(sts.data_type().clone()),
+        );
+        let mut columns = batch.columns().to_vec();
+        columns[idx] = Arc::new(sts);
+        RecordBatch::try_new(Arc::new(Schema::new(schema_fields)), columns).unwrap()
+    }
+
+    /// A batch differing from the ledger schema only in field metadata is stored under the
+    /// ledger schema, so the concats in `current_state` and `save_ipc` still succeed.
+    #[test]
+    fn test_append_relabels_a_metadata_only_schema_difference() {
+        let mut ledger = make_entity_ledger();
+        let earth = PrescribedId::astronomical_from_name("IAU_EARTH").unwrap();
+        let identity = [1.0, 0.0, 0.0, 0.0];
+        ledger
+            .append(make_entity_batch(
+                demo("a"),
+                earth,
+                [1.0, 0.0, 0.0],
+                identity,
+                0,
+            ))
+            .unwrap();
+        ledger
+            .append(with_pyarrow_metadata(make_entity_batch(
+                demo("b"),
+                earth,
+                [2.0, 0.0, 0.0],
+                identity,
+                0,
+            )))
+            .unwrap();
+
+        assert_eq!(ledger.current_state(None, None).unwrap().num_rows(), 2);
+        ledger.save_ipc_to_bytes().unwrap();
+    }
+
+    /// Any difference beyond metadata is rejected at append, not left to fail a later concat.
+    #[test]
+    fn test_append_rejects_a_batch_of_another_schema() {
+        let mut ledger = make_entity_ledger();
+        let err = ledger.append(make_batch([0.0, 0.0, 0.0], 0)).unwrap_err();
+        assert!(err.contains("does not match the ledger schema"), "{err}");
+        assert!(ledger.is_empty());
+    }
+
+    /// Nested field names count, which `DataType::equals_datatype` alone would ignore.
+    #[test]
+    fn test_same_but_metadata_distinguishes_swapped_nested_names() {
+        let strukt = |a: &str, b: &str| {
+            Field::new(
+                "s",
+                DataType::Struct(
+                    vec![
+                        Field::new(a, DataType::Int8, false),
+                        Field::new(b, DataType::Int8, false),
+                    ]
+                    .into(),
+                ),
+                false,
+            )
+        };
+        let (xy, yx) = (strukt("x", "y"), strukt("y", "x"));
+        assert!(xy.data_type().equals_datatype(yx.data_type()));
+        assert!(!same_but_metadata(&xy, &yx));
+        assert!(same_but_metadata(&xy, &xy));
     }
 
     #[test]

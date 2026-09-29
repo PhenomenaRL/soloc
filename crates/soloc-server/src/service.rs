@@ -259,11 +259,9 @@ impl FlightService for SolocFlightService {
             .schema()
             .clone();
         let ipc_options = IpcWriteOptions::default();
-        let schema_as_ipc = SchemaAsIpc::new(&schema, &ipc_options);
-        let flight_data: FlightData = schema_as_ipc.into();
-        Ok(Response::new(SchemaResult {
-            schema: flight_data.data_header,
-        }))
+        let result = SchemaResult::try_from(SchemaAsIpc::new(&schema, &ipc_options))
+            .map_err(|e| Status::internal(format!("schema encoding failed: {e}")))?;
+        Ok(Response::new(result))
     }
 
     async fn do_get(
@@ -285,12 +283,12 @@ impl FlightService for SolocFlightService {
             filter = filter.with_spatial(origin, radius);
         }
 
-        let batches: Vec<RecordBatch> = {
+        let (schema, batches) = {
             let ledger = state
                 .ledger
                 .read()
                 .map_err(|_| Status::internal("ledger lock poisoned"))?;
-            match ticket.query_type {
+            let batches: Vec<RecordBatch> = match ticket.query_type {
                 QueryType::Filter => ledger
                     .stream_query(&filter)
                     .filter_map(|r| r.ok())
@@ -306,19 +304,28 @@ impl FlightService for SolocFlightService {
                     let not_before = ticket
                         .not_before_tai_s
                         .map(hifitime::Epoch::from_tai_seconds);
-                    let result = ledger
-                        .current_state(entity_ids, not_before)
-                        .map_err(|e| Status::internal(format!("current_state failed: {e}")))?;
-                    if result.num_rows() == 0 {
+                    // An empty ledger has no current state, which is an empty answer, not a
+                    // server error.
+                    if ledger.is_empty() {
                         vec![]
                     } else {
-                        vec![result]
+                        let result = ledger
+                            .current_state(entity_ids, not_before)
+                            .map_err(|e| Status::internal(format!("current_state failed: {e}")))?;
+                        if result.num_rows() == 0 {
+                            vec![]
+                        } else {
+                            vec![result]
+                        }
                     }
                 }
-            }
+            };
+            (ledger.schema().clone(), batches)
         };
 
+        // The schema is sent up front so an empty result is still a readable, empty stream.
         let out_stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
             .build(futures::stream::iter(
                 batches.into_iter().map(Ok::<_, FlightError>),
             ))
@@ -374,9 +381,12 @@ impl FlightService for SolocFlightService {
         let desc: ExchangeDescriptor = serde_json::from_slice(&descriptor.cmd)
             .map_err(|e| Status::invalid_argument(format!("invalid descriptor JSON: {e}")))?;
 
-        // Prepend first message back so FlightRecordBatchStream sees the schema message.
+        // Prepend the first message back when it also carries the schema; a client may send
+        // the descriptor alone (pyarrow does), which the decoder would reject.
         let first_stream =
-            futures::stream::once(futures::future::ready(Ok::<FlightData, FlightError>(first)));
+            futures::stream::iter(
+                (!first.data_header.is_empty()).then_some(Ok::<FlightData, FlightError>(first)),
+            );
         let rest = in_stream.map_err(|e| FlightError::Tonic(Box::new(e)));
         let mut batch_stream =
             FlightRecordBatchStream::new_from_flight_data(first_stream.chain(rest));
@@ -781,6 +791,92 @@ mod tests {
             .export_topology()
             .unwrap();
         assert_eq!(reexported.num_rows(), 2);
+    }
+
+    /// The schema must arrive as the framed IPC message the Flight spec requires, or pyarrow
+    /// and arrow-flight's own decoder reject it.
+    #[tokio::test]
+    async fn test_get_schema_decodes_as_a_flight_schema() {
+        let service = make_service().await;
+        let result = service
+            .get_schema(Request::new(FlightDescriptor::new_path(vec!["x".into()])))
+            .await
+            .unwrap()
+            .into_inner();
+        let schema = arrow::datatypes::Schema::try_from(&result).expect("schema should decode");
+        assert_eq!(
+            &schema,
+            service.state.ledger.read().unwrap().schema().as_ref()
+        );
+    }
+
+    /// An empty result must still carry the schema, and an empty ledger has an empty current
+    /// state rather than an error, or a client cannot tell "nothing yet" from a failure.
+    #[tokio::test]
+    async fn test_do_get_on_an_empty_ledger_returns_an_empty_table() {
+        let service = make_service().await;
+        for ticket in [
+            r#"{"query_type": "filter"}"#,
+            r#"{"query_type": "current_state"}"#,
+        ] {
+            let response = service
+                .do_get(Request::new(Ticket {
+                    ticket: ticket.into(),
+                }))
+                .await
+                .unwrap_or_else(|s| panic!("{ticket}: {s}"));
+            let mut decoded = FlightRecordBatchStream::new_from_flight_data(
+                response
+                    .into_inner()
+                    .map_err(|e| FlightError::Tonic(Box::new(e))),
+            );
+            while let Some(batch) = decoded.next().await {
+                assert_eq!(batch.unwrap().num_rows(), 0, "{ticket}");
+            }
+            assert_eq!(
+                decoded.schema(),
+                Some(service.state.ledger.read().unwrap().schema()),
+                "{ticket}"
+            );
+        }
+    }
+
+    /// A client may send the exchange descriptor in a message of its own, ahead of the schema.
+    #[tokio::test]
+    async fn test_do_exchange_accepts_a_descriptor_only_first_message() {
+        use arrow_flight::flight_service_client::FlightServiceClient;
+        use arrow_flight::flight_service_server::FlightServiceServer;
+
+        let incoming =
+            tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = incoming.local_addr().unwrap();
+        let service = make_service().await;
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(FlightServiceServer::new(service))
+                .serve_with_incoming(incoming),
+        );
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = FlightServiceClient::new(channel);
+        let descriptor = FlightData::new().with_descriptor(FlightDescriptor::new_cmd(
+            br#"{"target_frame": "IAU_EARTH"}"#.to_vec(),
+        ));
+        let schema = soloc_ledger::schemas::entity::entity_schema();
+        let schema_msg: FlightData = SchemaAsIpc::new(&schema, &IpcWriteOptions::default()).into();
+
+        let replies: Vec<_> = client
+            .do_exchange(futures::stream::iter(vec![descriptor, schema_msg]))
+            .await
+            .expect("exchange should be accepted")
+            .into_inner()
+            .collect()
+            .await;
+        assert!(replies.iter().all(Result::is_ok), "{replies:?}");
     }
 
     /// A malformed body must be rejected as a client error, not surface as an internal panic.

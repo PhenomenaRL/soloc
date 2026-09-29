@@ -56,7 +56,7 @@ fn default_bind() -> String {
 /// When omitted the server runs entirely in memory and all data is lost on shutdown.
 ///
 /// `ledger_url` takes priority over `ledger_path` when both are set.
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 struct StorageConfig {
     /// Object-store URL for the ledger, e.g.:
     ///   `s3://my-bucket/soloc/ledger.arrows`
@@ -76,6 +76,19 @@ struct StorageConfig {
     /// Name of the entity-identity column. Default: `"entity_id"`.
     #[serde(default = "default_id_column")]
     id_column: String,
+}
+
+// Written out rather than derived: a derived Default would leave `id_column` empty whenever
+// there is no `[storage]` table, since `default_id_column` only applies when one is parsed.
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            ledger_url: None,
+            ledger_path: None,
+            schema_path: None,
+            id_column: default_id_column(),
+        }
+    }
 }
 
 fn default_id_column() -> String {
@@ -210,4 +223,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("soloc-server: goodbye");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With no config file, or one with no `[storage]` table, the ledger must still be keyed
+    /// by `entity_id`; an empty id column collapses `current_state` and entity frames.
+    #[test]
+    fn test_id_column_defaults_without_a_storage_table() {
+        assert_eq!(Config::default().storage.id_column, "entity_id");
+        let parsed: Config = toml::from_str("[server]\nbind = \"127.0.0.1:1\"").unwrap();
+        assert_eq!(parsed.storage.id_column, "entity_id");
+    }
 }
