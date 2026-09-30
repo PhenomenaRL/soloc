@@ -15,7 +15,8 @@ import numpy as np
 import pyarrow as pa
 
 import scenario as sc
-from geo import EARTH, fixed_to_geodetic, geodetic_to_fixed
+from ephemeris import Ephemeris
+from geo import EARTH, GCRF, ICRF, SUN, fixed_to_geodetic, geodetic_to_fixed
 from land import CANALS, in_canal, on_land
 from models.robot import HULL_REACH_M
 from models.spacecraft import Orbit
@@ -25,7 +26,8 @@ from soloc_client import (CENTURY_NS, SolocClient, id_bytes, matches, positions,
 from topo_sim import events_from_rows
 
 GROUND_TOLERANCE_M = 1.0
-SPOT_CHECK_HOURS = (0, 24, 48, 72)
+SPOT_CHECK_HOURS = tuple(range(0, sc.DURATION_S // 3600 + 1, 24))
+PERIHELION_SOLAR_RADII = (9.8, 9.9)      # Parker's final orbit, from the Sun's centre
 
 results: list[bool] = []
 
@@ -91,11 +93,11 @@ def main():
         check("load_ledger", False, str(e).splitlines()[0])
         sys.exit(1)
 
-    world = roster(args.seed)
+    world = roster(args.seed, client)
     body_by_id = {b.frame_id: b for b in sc.SNAPSHOT_BODIES}
     fleet_models = {"facilities": world.facilities, "spacecraft": world.spacecraft,
-                    "robots": world.robots, "crawlers": world.crawlers,
-                    "aircraft": world.aircraft, "ships": world.ships}
+                    "probes": world.probes, "robots": world.robots, "crawlers": world.crawlers,
+                    "cargo": world.cargo, "aircraft": world.aircraft, "ships": world.ships}
     by_id = {e.id: e for e in world.entities}
 
     d = Data(client)
@@ -163,6 +165,10 @@ def main():
         check_spacecraft(d, world)
     if fleets["crawlers"]:
         check_crawlers(d, world)
+    if fleets["cargo"]:
+        check_cargo(d, world)
+    if fleets["probes"]:
+        check_probes(d, world)
     if fleets["spacecraft"] or fleets["crawlers"]:
         check_topology(d, world)
     if fleets["aircraft"]:
@@ -333,6 +339,10 @@ def check_spacecraft(d: Data, world):
             check_launch(d, craft)
         if "touchdown" in craft.events:
             check_landing(d, craft)
+        if "arrival" in craft.events:
+            check_transfer(d, craft)
+        if "tli" in craft.events:
+            check_moonshot(d, craft)
 
 
 def check_orbit(d: Data, craft, phase: Orbit, end_s: float):
@@ -360,16 +370,19 @@ def check_orbit(d: Data, craft, phase: Orbit, end_s: float):
 
 def check_launch(d: Data, craft):
     t_lift, t_ins = craft.events["liftoff"], craft.events["insertion"]
-    fac, body = craft.facility, craft.facility.spec.body
+    place = craft.launch_spot
+    fac, body = place.facility, place.body
     pad = d.of(craft.id, -math.inf, t_lift)
-    after = d.of(craft.id, t_lift)
-    framed = (matches(d.frames[pad], fac.id).all() and np.all(d.pos[pad] == 0)
+    after = d.of(craft.id, t_lift, t_ins + 1)
+    framed = (matches(d.frames[pad], fac.id).all() and np.all(d.pos[pad] == place.offset_km)
               and matches(d.frames[after], body.frame_id).all())
     spot = [d.at(craft.id, 0), int(pad[np.argmax(d.t_s[pad])])]
-    miss = float(np.linalg.norm(d.resolve(spot, body.frame) - fac.position_km, axis=1).max() * 1e6)
+    miss = float(np.linalg.norm(d.resolve(spot, body.frame) - place.position_km, axis=1).max() * 1e6)
+    east, north = place.offset_km[:2] * 1000
     check(f"{craft.name} on {fac.name} until liftoff {utc(t_lift)}, then on {body.frame}",
           framed and miss <= 1.0,
-          f"{len(pad)} pad rows at the facility origin, resolved within {miss:.3f} mm of the pad")
+          f"{len(pad)} pad rows {east:.0f} m east, {north:.0f} m north of the facility origin, "
+          f"resolved within {miss:.3f} mm of the pad")
 
     ascent = d.of(craft.id, t_lift, t_ins + 1)
     ascent = ascent[np.argsort(d.t_s[ascent])]
@@ -380,19 +393,130 @@ def check_launch(d: Data, craft):
 
 def check_landing(d: Data, craft):
     t_deorbit, t_down = craft.events["deorbit"], craft.events["touchdown"]
-    fac, body = craft.facility, craft.facility.spec.body
+    place = craft.landing_spot
+    fac, body = place.facility, place.body
     descent = d.of(craft.id, t_deorbit, t_down)
-    alt = np.linalg.norm(d.pos[descent], axis=1) - np.linalg.norm(fac.position_km)
+    alt = np.linalg.norm(d.pos[descent], axis=1) - np.linalg.norm(place.position_km)
     check(f"{craft.name} descent stays above {fac.name}'s ground level",
           bool(matches(d.frames[descent], body.frame_id).all()) and alt.min() >= -1e-6,
           f"{len(descent)} rows {utc(t_deorbit)} → {utc(t_down)}, min {alt.min() * 1000:.3f} m")
 
     landed = d.of(craft.id, t_down)
     spot = [d.at(craft.id, t) for t in (t_down, t_down + 3600, sc.DURATION_S)]
-    miss = float(np.linalg.norm(d.resolve(spot, body.frame) - fac.position_km, axis=1).max() * 1000)
+    miss = float(np.linalg.norm(d.resolve(spot, body.frame) - place.position_km, axis=1).max() * 1000)
     check(f"{craft.name} on {fac.name} from touchdown {utc(t_down)}",
-          bool(matches(d.frames[landed], fac.id).all()) and miss <= GROUND_TOLERANCE_M,
-          f"{len(landed):,} rows, resolved within {miss * 1000:.3f} mm of the site at 3 epochs")
+          bool(matches(d.frames[landed], fac.id).all() and np.all(d.pos[landed] == place.offset_km))
+          and miss <= GROUND_TOLERANCE_M,
+          f"{len(landed):,} rows, resolved within {miss * 1000:.3f} mm of the pad at 3 epochs")
+
+
+def check_moonshot(d: Data, craft):
+    ev, design = craft.events, craft.design
+    moon = craft.landing_spot.body
+
+    # Each leg on its frame.
+    legs = [("parking orbit", ev["insertion"], ev["tli"], craft.launch_spot.body.frame_id),
+            ("translunar arc", ev["tli"], ev["soi"], GCRF.frame_id),
+            ("lunar approach and orbit", ev["soi"], ev["deorbit"], moon.frame_id)]
+    wrong = [name for name, t0, t1, frame in legs if not matches(d.frames[d.of(craft.id, t0, t1)], frame).all()]
+    check(f"{craft.name} flies IAU_EARTH → GCRF → IAU_MOON", not wrong,
+          f"TLI {utc(ev['tli'])} (Δv {design['tli_dv_km_s']:.3f} km/s), sphere of influence "
+          f"{utc(ev['soi'])} at {design['patch_radius_km']:,.0f} km" + (f"; off frame: {wrong}" if wrong else ""))
+
+    # The track is one curve in GCRF: at each hand-off, the first row in the new frame sits
+    # where the three rows before it (in the old frame) extrapolate to.
+    gaps = []
+    for t in (ev["tli"], ev["soi"]):
+        step = sc.HOST_CADENCE_S
+        p = d.resolve([d.at(craft.id, t + k * step) for k in (-3, -2, -1, 0)], GCRF.frame)
+        gaps.append(float(np.linalg.norm(p[3] - (3 * p[2] - 3 * p[1] + p[0]))))
+    check(f"{craft.name} track is continuous in GCRF across both hand-offs", max(gaps) <= 1.0,
+          f"first row after TLI {gaps[0] * 1000:.1f} m and after the sphere of influence "
+          f"{gaps[1] * 1000:.1f} m from the quadratic through the 3 rows before; "
+          f"velocity mismatch at the patch {design['patch_mismatch_km_s'] * 1e6:.1e} mm/s")
+
+    approach = d.of(craft.id, ev["soi"], ev["loi"])
+    orbit = d.of(craft.id, ev["loi"], ev["deorbit"])
+    low = float(np.linalg.norm(d.pos[approach], axis=1).min()) - moon.a_km
+    r = np.linalg.norm(d.pos[orbit], axis=1) - moon.a_km
+    alt = craft.spec.lunar_alt_km
+    check(f"{craft.name} is captured into a {alt:.0f} km lunar orbit at {utc(ev['loi'])}",
+          low >= alt - 1e-3 and abs(r - alt).max() <= 1e-3,
+          f"approach bottoms out at {low:.3f} km, then {len(orbit)} rows at {r.min():.3f}–{r.max():.3f} km "
+          f"(LOI Δv {design['loi_dv_km_s']:.3f} km/s, inclination {design['lunar_inc_deg']:.2f}°)")
+
+
+def check_cargo(d: Data, world):
+    for c in world.cargo:
+        if c.id not in d.index:
+            continue
+        ship, pad, site = c.ship, c.ship.launch_spot, c.ship.landing_spot
+        idx = d.of(c.id)
+        wrong = int(sum(d.frames[k] != c.frame_at(int(round(d.t_s[k]))) for k in idx))
+        before, aboard, after = d.of(c.id, -math.inf, c.t_board), d.of(c.id, c.t_board, c.t_off), d.of(c.id, c.t_off)
+        on_ground = lambda rows: (float(np.abs(d.pos[rows, :2]).max()) <= sc.SITE_HALF_WIDTH_M
+                                  and np.all(d.pos[rows, 2] == 0))
+        reach = float(np.linalg.norm(d.pos[aboard], axis=1).max())
+        check(f"{c.name} rides {ship.name} from {pad.facility.name} to {site.facility.name}",
+              wrong == 0 and on_ground(before) and on_ground(after) and reach <= HULL_REACH_M,
+              f"{len(before):,} rows at {pad.facility.name}, boards {utc(c.t_board)}, {len(aboard):,} rows "
+              f"aboard ({reach:.1f} m from the ship's origin), steps off {utc(c.t_off)}, {len(after):,} rows "
+              f"at {site.facility.name}; {wrong} rows off frame")
+
+        # Through the ledger: on each body's ground at both ends, and with the ship in
+        # between, whichever frame the ship is in at the time.
+        ends = [(pad, [d.at(c.id, 0), d.at(c.id, c.t_board - sc.ROBOT_CADENCE_S)]),
+                (site, [d.at(c.id, c.t_off), d.at(c.id, sc.DURATION_S)])]
+        worst_h = 0.0
+        for place, ks in ends:
+            _, _, h = fixed_to_geodetic(place.body, d.resolve(ks, place.body.frame))
+            worst_h = max(worst_h, float(np.abs(h).max()) * 1000)
+        times = [c.t_board, ship.events["liftoff"], ship.events["insertion"] + 600, ship.events["tli"] + 3600,
+                 (ship.events["tli"] + ship.events["soi"]) // 2, ship.events["soi"] + 3600,
+                 ship.events["loi"] + 600, ship.events["touchdown"], c.t_off - sc.ROBOT_CADENCE_S]
+        times = [int(t // sc.ROBOT_CADENCE_S) * sc.ROBOT_CADENCE_S for t in times]
+        apart = (d.resolve([d.at(c.id, t) for t in times], GCRF.frame)
+                 - d.resolve([d.at(ship.id, t) for t in times], GCRF.frame))
+        worst = float(np.linalg.norm(apart, axis=1).max() * 1000)
+        check(f"{c.name} resolves onto the ground at both ends and onto {ship.name} in between",
+              worst_h <= GROUND_TOLERANCE_M and worst <= HULL_REACH_M + 1e-3,
+              f"|h| ≤ {worst_h * 1000:.1f} mm on Earth and the Moon; ≤ {worst:.3f} m from the ship "
+              f"at {len(times)} epochs from the pad to the lunar surface")
+
+
+def check_transfer(d: Data, craft):
+    spec, conic = craft.spec, craft.phases[0].conic
+    eph = Ephemeris(d.client)
+    t_dep, t_arr = craft.events["departure"], craft.events["arrival"]
+
+    # The arc itself, against the kernels: it leaves the origin's centre and, propagated the
+    # whole way, meets the target's.
+    helio = lambda body, t: (lambda p, v, sp, sv: (p[0] - sp[0], v[0] - sv[0]))(
+        *eph.state(body, t), *eph.state(SUN, t))
+    (r_dep, v_dep), (r_arr, v_arr) = helio(spec.origin, t_dep), helio(spec.target, t_arr)
+    start, end = conic.state(t_dep), conic.state(t_arr)
+    miss = max(float(np.linalg.norm(start[0] - r_dep)), float(np.linalg.norm(end[0] - r_arr)))
+    check(f"{craft.name} arc runs from {spec.origin.name} to {spec.target.name}", miss <= 1.0,
+          f"{spec.depart:%Y-%m-%d} → {spec.arrive:%Y-%m-%d}, misses the centres by ≤ {miss * 1000:.1f} m; "
+          f"C3 {np.linalg.norm(start[1] - v_dep) ** 2:.1f} km²/s², "
+          f"arrival v∞ {np.linalg.norm(end[1] - v_arr):.2f} km/s")
+
+    # The stored rows, made heliocentric with the kernels' Sun: a two-body arc keeps its
+    # specific energy and angular momentum.
+    idx = d.of(craft.id)
+    idx = idx[np.argsort(d.t_s[idx])][::120]                      # hourly
+    sun_p, sun_v = eph.state(SUN, d.t_s[idx])
+    v = d.rows.take(pa.array(idx)).column("velocity").combine_chunks()
+    r, v = d.pos[idx] - sun_p, v.flatten().to_numpy().reshape(-1, 3) / 1000 - sun_v
+    energy = (v * v).sum(1) / 2 - SUN.gm / np.linalg.norm(r, axis=1)
+    h = np.linalg.norm(np.cross(r, v), axis=1)
+    spread = max(float(np.ptp(energy) / abs(energy.mean())), float(np.ptp(h) / h.mean()))
+    from_origin = np.linalg.norm(d.pos[idx[[0, -1]]] - eph.centre(spec.origin, d.t_s[idx[[0, -1]]]), axis=1)
+    check(f"{craft.name} rows are one Sun-centred conic, on ICRF",
+          bool(matches(d.frames[d.of(craft.id)], ICRF.frame_id).all()) and spread <= 1e-7,
+          f"{len(idx)} hourly rows, energy and angular momentum constant to {spread:.1e}; "
+          f"{np.linalg.norm(r, axis=1).mean() / 1.495978707e8:.3f} AU from the Sun, "
+          f"{from_origin[0] / 1e6:.2f} → {from_origin[1] / 1e6:.2f} million km from {spec.origin.name}")
 
 
 # -- crawlers ---------------------------------------------------------------------------------
@@ -443,6 +567,45 @@ def check_crawlers(d: Data, world):
               f"|h| ≤ {float(np.abs(h).max()) * 1e6:.1f} mm, ≤ {dist:.1f} m from the site")
 
 
+# -- probes -----------------------------------------------------------------------------------
+
+
+def check_probes(d: Data, world):
+    snap = snapshots(d)
+    estimates = vocabulary(d.client.schema.field("spacetimestamp").type.field("estimate_type"))
+    for probe in world.probes:
+        if probe.id not in d.index:
+            continue
+        idx = d.of(probe.id)
+        idx = idx[np.argsort(d.t_s[idx])]
+        ticks = np.rint(d.t_s[idx]).astype(int)
+        table = np.array([probe.state(t)[0] for t in ticks])
+        worst = float(np.abs(d.pos[idx] - table).max())
+        tagged = bool(np.all(sts_field(d.rows, "estimate_type").to_numpy()[idx] == estimates["ESTIMATED"]))
+        check(f"{probe.name} rows are the Horizons table, on ICRF, tagged ESTIMATED",
+              bool(matches(d.frames[idx], ICRF.frame_id).all()) and worst == 0.0 and tagged,
+              f"{len(idx):,} rows, max difference {worst} km")
+
+        # Heliocentric distance two ways: from the Sun's centre exchanged to ICRF at every
+        # row's epoch, and against the Sun's own snapshot rows on the hours they share.
+        helio = np.linalg.norm(d.pos[idx] - Ephemeris(d.client).centre(SUN, ticks), axis=1)
+        hourly = [(k, snap[(SUN.name, t)]) for k, t in enumerate(ticks) if (SUN.name, t) in snap]
+        if hourly:
+            off = max(abs(np.linalg.norm(d.pos[idx[k]] - sun) - helio[k]) for k, sun in hourly)
+            check(f"{probe.name} distance from the Sun agrees between exchange and snapshots",
+                  off * 1e6 <= GROUND_TOLERANCE_M * 1000, f"{len(hourly)} shared epochs, max {off * 1e6:.1f} mm off")
+
+        if probe.name == "Parker Solar Probe":
+            k = int(np.argmin(helio))
+            radii = helio[k] / SUN.a_km
+            v = d.rows.take(pa.array(idx[k:k + 1])).column("velocity").combine_chunks()
+            speed = float(np.linalg.norm(v.flatten().to_numpy())) / 1000
+            lo, hi = PERIHELION_SOLAR_RADII
+            check(f"{probe.name} passes perihelion inside the window",
+                  0 < k < len(idx) - 1 and lo <= radii <= hi,
+                  f"{utc(int(ticks[k]))}, {helio[k]:,.0f} km = {radii:.2f} solar radii, {speed:.1f} km/s (barycentric)")
+
+
 # -- topology ---------------------------------------------------------------------------------
 
 
@@ -458,17 +621,17 @@ def check_topology(d: Data, world):
     s_ns = lambda t_s: d.t0_ns + int(round(t_s)) * 10**9
     expected = {}   # (child, old parent, new parent, TAI ns) → kind
     for craft in world.spacecraft:
-        fac = craft.facility
-        if "liftoff" in craft.events:
-            expected[(craft.id, fac.id, craft.body.frame_id, s_ns(craft.events["liftoff"]))] = "launch"
-        if "touchdown" in craft.events:
-            expected[(craft.id, craft.body.frame_id, fac.id, s_ns(craft.events["touchdown"]))] = "landing"
+        for old, new, t_s, kind in craft.frame_changes():
+            expected[(craft.id, old, new, s_ns(t_s))] = kind
     for c in world.crawlers:
         if c.disembark:
             expected[(c.id, c.host.id, c.disembark[0].id, s_ns(c.disembark[1]))] = "disembark"
+    for c in world.cargo:
+        expected[(c.id, c.origin.id, c.ship.id, s_ns(c.t_board))] = "board"
+        expected[(c.id, c.ship.id, c.destination.id, s_ns(c.t_off))] = "disembark"
     kinds = Counter(kind for e, kind in expected.items() if e[0] in d.index)
     expected = {e for e in expected if e[0] in d.index}
-    check("parent changes are exactly the launches, landings and disembarks",
+    check("parent changes are exactly the launches, hand-offs, landings, boardings and disembarks",
           changes == expected,
           ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
           + ("" if changes == expected else

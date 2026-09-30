@@ -4,7 +4,8 @@ ephemerides, the coastlines and three.js inlined, so it opens offline by double-
     python export_viewer.py out/solar_sim.arrow             # → out/solar_sim_3d.html
 
 The viewer is one scene, nested the way the ledger's frames are:
-- ICRF holds the Sun and planets on their orbits.
+- ICRF holds the Sun and planets on their orbits. Craft stored in ICRF are drawn about the Sun.
+- GCRF is Earth-centred and does not turn. A craft's translunar leg is in there.
 - Each body's IAU frame turns with the body. Its vehicles are in there, in body-fixed km as stored.
 - Each site's ENU frame sits on its body at the facility's stored pose, with its robots in metres.
 
@@ -13,8 +14,9 @@ facility's stored pose applied, the same composition the ledger does. Body posit
 orientations are not in the ledger at this density, so they come from a running server
 (`serve.sh`): a zero offset in each body's frame is exchanged to ICRF at every epoch needed.
 That gives the body's centre and its IAU → ICRF rotation from the same kernels the ledger
-resolves with. Crawlers on orbit are left out (a 2 m hull is invisible at orbit scale); the
-one that disembarks shows on its site.
+resolves with. Robots riding a craft are left out (a 2 m hull is invisible at orbit scale);
+the ones that step off show on their site. A craft with rows in several frames gets one track
+per frame, under one name.
 """
 
 import argparse
@@ -26,7 +28,8 @@ import numpy as np
 import pyarrow as pa
 
 import scenario as sc
-from geo import EARTH, MARS, MOON, quat_from_matrix
+from ephemeris import Ephemeris
+from geo import EARTH, GCRF, ICRF, MARS, MOON, SUN, quat_from_matrix
 from land import outlines
 from run_sim import roster
 from soloc_client import (CENTURY_NS, SolocClient, astronomical, id_bytes, positions, sts_field,
@@ -49,6 +52,11 @@ BODIES = (
     ("Mars", 499, MARS.a_km, "#b5613f", (687.0, 2.0, None)),
 )
 FLATTENING = {"Earth": EARTH.f}
+ARC_COLOUR = "#d95926"          # the spacecraft category's
+# Timeline ticks, by the key a craft's builder files the instant under.
+EVENT_LABELS = {"liftoff": "liftoff", "tli": "translunar injection",
+                "soi": "enters the Moon's sphere of influence", "loi": "lunar orbit insertion",
+                "deorbit": "deorbit", "touchdown": "touchdown"}
 
 
 def b64(a, dtype=np.float32) -> str:
@@ -123,11 +131,20 @@ def on_site(rows: Rows, entity_id: bytes, facility_id: bytes):
     return rows.t_s[k], rows.pos[k] * rows.km[k][:, None] * 1000, rows.quat[k]
 
 
-def track(name: str, cat: str, t, xyz, quat) -> dict | None:
-    """Quaternions are `[w, x, y, z]`, rotating the entity's body axes into its context frame."""
+def framed(rows: Rows, entity_id: bytes, frame_id: bytes):
+    """`(t_s, xyz km, quaternion)` of the rows stored in one inertial root, as stored."""
+    k = rows.of(entity_id)
+    k = k[np.array([f == frame_id for f in rows.frames[k]], bool)]
+    return rows.t_s[k], rows.pos[k] * rows.km[k][:, None], rows.quat[k]
+
+
+def track(name: str, cat: str, t, xyz, quat, wide: bool = False) -> dict | None:
+    """Quaternions are `[w, x, y, z]`, rotating the entity's body axes into its context frame.
+    `wide` keeps positions as float64, for tracks far from their context's centre."""
     if len(t) == 0:
         return None
-    return {"name": name, "cat": cat, "t": b64(t), "p": b64(np.asarray(xyz).ravel()),
+    return {"name": name, "cat": cat, "t": b64(t), "wide": wide,
+            "p": b64(np.asarray(xyz).ravel(), np.float64 if wide else np.float32),
             "q": b64(np.asarray(quat).ravel())}
 
 
@@ -167,10 +184,10 @@ def main():
 
     table, names = load(args.path)
     rows = Rows(table)
-    world = roster(args.seed)
+    client = SolocClient(args.server)
+    world = roster(args.seed, client)
     name = lambda e: names.get(e.id, e.name)
     poses = {f.id: Pose(rows, f.id) for f in world.facilities if len(rows.of(f.id))}
-    client = SolocClient(args.server)
 
     # -- bodies: the window at EPHEMERIS_STEP_S, and one orbit around the window's middle --------
     grid = np.arange(0, sc.DURATION_S + 1, EPHEMERIS_STEP_S, dtype=float)
@@ -192,15 +209,43 @@ def main():
 
     # -- contexts: each body's fixed frame, and each site -------------------------------------
     contexts = []
+    # A craft has a track in every context it has rows in: SELENE-1 is in Earth's, GCRF's and
+    # the Moon's in turn.
     for body in (EARTH, MOON, MARS):
-        members = [("spacecraft", c) for c in world.spacecraft if c.body is body]
+        on_body = {f.id: poses[f.id] for f in world.facilities if f.spec.body is body and f.id in poses}
+        members = [("spacecraft", c) for c in world.spacecraft]
         if body is EARTH:
             members += [("aircraft", a) for a in world.aircraft] + [("ship", s) for s in world.ships]
-        tracks = [track(name(e), cat, *in_body(rows, e.id, body.frame_id, poses)) for cat, e in members]
+        tracks = [track(name(e), cat, *in_body(rows, e.id, body.frame_id, on_body)) for cat, e in members]
         tracks = [t for t in tracks if t]
         if tracks:
             contexts.append({"id": body.name.lower(), "kind": "body", "body": body.name,
                              "name": body.name, "frame": body.frame, "tracks": tracks})
+
+    # -- inertial roots: GCRF about Earth as stored; ICRF rows shown about the Sun, since the
+    #    barycentre is not a place anything orbits ------------------------------------------
+    eph = Ephemeris(client)
+    deep = [*world.spacecraft, *world.probes]
+    tracks = [track(name(e), "spacecraft", *framed(rows, e.id, GCRF.frame_id), wide=True) for e in deep]
+    if any(tracks):
+        contexts.append({"id": "gcrf", "kind": "inertial", "body": EARTH.name, "name": "GCRF",
+                         "frame": "GCRF", "tracks": [t for t in tracks if t]})
+    tracks = []
+    for e in deep:
+        t, xyz, quat = framed(rows, e.id, ICRF.frame_id)
+        if len(t):
+            tracks.append(track(name(e), "spacecraft", t, xyz - eph.centre(SUN, t), quat, wide=True))
+    if tracks:
+        contexts.append({"id": "icrf", "kind": "inertial", "body": SUN.name, "name": "ICRF",
+                         "frame": "ICRF axes, Sun-centred", "tracks": tracks})
+
+    arcs = []
+    for c in world.spacecraft:
+        if "arrival" in c.events:
+            ts = np.arange(c.events["departure"], c.events["arrival"] + 1, DAY_S, dtype=float)
+            path = eph.centre(SUN, ts) + np.array([c.phases[0].conic.state(t)[0] for t in ts])
+            arcs.append({"name": name(c), "color": ARC_COLOUR, "p": b64(path.ravel())})
+
     for f in world.facilities:
         if f.id not in poses:
             continue
@@ -208,6 +253,8 @@ def main():
                   for r in world.robots if r.host_id == f.id]
         tracks += [track(name(c), "crawler", *on_site(rows, c.id, f.id))
                    for c in world.crawlers if c.disembark and c.disembark[0] is f]
+        tracks += [track(name(c), "logistics", *on_site(rows, c.id, f.id))
+                   for c in world.cargo if f in (c.origin, c.destination)]
         contexts.append({"id": f.spec.code.lower(), "kind": "site", "body": f.spec.body.name,
                          "name": name(f), "frame": f"{name(f)} ENU",
                          "p": poses[f.id].p_km.tolist(), "q": quat_from_matrix(poses[f.id].r),
@@ -216,15 +263,22 @@ def main():
 
     events = []
     for c in world.spacecraft:
-        for key in ("liftoff", "deorbit", "touchdown"):
+        for key, label in EVENT_LABELS.items():
             if key in c.events:
-                events.append({"t": c.events[key], "label": f"{name(c)} {key}"})
+                events.append({"t": c.events[key], "label": f"{name(c)} {label}"})
     for c in world.crawlers:
         if c.disembark:
             events.append({"t": c.disembark[1], "label": f"{name(c)} disembarks"})
+    for c in world.cargo:
+        events.append({"t": c.t_board, "label": f"{name(c)} boards {name(c.ship)}"})
+        events.append({"t": c.t_off, "label": f"{name(c)} disembarks"})
+    for p in world.probes:
+        k = int(np.argmin(np.linalg.norm(p.p - p.sun_p, axis=1)))
+        if 0 < k < len(p.t_s) - 1:
+            events.append({"t": float(p.t_s[k]), "label": f"{name(p)} perihelion"})
 
     data = {"t0": sc.T0.isoformat() + "Z", "duration": sc.DURATION_S, "source": args.path.name,
-            "ephemerisStep": EPHEMERIS_STEP_S, "bodies": bodies, "orbits": orbits,
+            "ephemerisStep": EPHEMERIS_STEP_S, "bodies": bodies, "orbits": orbits, "arcs": arcs,
             "coast": coastlines(), "contexts": contexts,
             "events": sorted(events, key=lambda e: e["t"])}
     html = (TEMPLATE.read_text()

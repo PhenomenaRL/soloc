@@ -21,7 +21,7 @@ from soloc_client import (CENTURY_NS, J2000, KIND_ABSTRACT, KIND_ASTRO, TAI_MINU
 
 # Astro ids embed their (ephemeris_id, orientation_id) pair rather than hashing a name, so they
 # decode without the registry. Bodies read as bare names as entities and IAU_* names as frames.
-ASTRO_NAMES = {(0, 1): ("ICRF", "ICRF")} | {
+ASTRO_NAMES = {(0, 1): ("ICRF", "ICRF"), (399, 1): ("GCRF", "GCRF")} | {
     (b.naif, b.naif): (b.name, b.frame) for b in (SUN, EARTH, MOON, MARS)}
 
 # The server stamps append_snapshot rows with this source (ephemeris.rs `anise_source_id`),

@@ -78,7 +78,7 @@
   <section><h2>Legend (click to hide)</h2><div id="legend"></div></section>
   <section><h2>Body axes</h2>
     <div class="axes"><span><b style="color:#ff5a4f">x</b> red</span><span><b style="color:#4fd16b">y</b> green</span><span><b style="color:#5a8bff">z</b> blue</span></div>
-    <div class="note">Aircraft and ships: x forward, z down. Robots: x forward, z up. Spacecraft: LVLH, z to nadir. Facilities: east, north, up.</div>
+    <div class="note">Aircraft and ships: x forward, z down. Robots: x forward, z up. Spacecraft: LVLH, z to nadir (on a Sun-centred path, z to the Sun). Facilities: east, north, up.</div>
   </section>
   <section><h2>View</h2>
     <div class="row">Camera turns with body <input type="checkbox" id="corotate" checked></div>
@@ -87,10 +87,10 @@
       <option value="past">all past</option><option value="whole">whole track</option><option value="none">none</option></select></div>
     <div class="row">Trail frame <select id="trailFrame"><option value="fixed">body-fixed</option><option value="inertial">non-rotating</option></select></div>
     <div class="row">Model size <select id="size"><option value="0.018">small</option><option value="0.03" selected>medium</option><option value="0.05">large</option></select></div>
-    <div class="row">Planet orbits <input type="checkbox" id="orbits" checked></div>
+    <div class="row">Orbits and cruise arcs <input type="checkbox" id="orbits" checked></div>
     <div class="row">Labels <input type="checkbox" id="labels" checked></div>
     <div id="where"></div>
-    <div class="note">Drag to rotate, right-drag or shift-drag to pan, wheel to zoom. Vehicles appear as you close in on their body; robots on their site.</div>
+    <div class="note">Drag to rotate, right-drag or shift-drag to pan, wheel to zoom. Vehicles appear as you close in on their body; robots on their site. Craft between bodies (GCRF, ICRF) show from any distance.</div>
   </section>
 </div>
 <div id="bottom" class="panel">
@@ -209,6 +209,16 @@ for (const o of DATA.orbits) {
   (bodyByName[o.name].orbitLines ||= []).push(line);
 }
 
+// Cruise arcs: a craft's whole path between two planets, of which the ledger holds a few days.
+const arcLines = (DATA.arcs || []).map(a => {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(f32(a.p), 3));
+  const line = new THREE.Line(g, new THREE.LineDashedMaterial({ color: a.color, transparent: true, opacity: 0.5, dashSize: 2e6, gapSize: 2e6 }));
+  line.computeLineDistances(); line.frustumCulled = false;
+  world.add(line);
+  return line;
+});
+
 function bodyAt(b, T, pos, quat) {
   const n = b.P.length / 3, x = T / STEP;
   const k = Math.max(0, Math.min(n - 2, Math.floor(x))), f = Math.max(0, Math.min(1, x - k));
@@ -278,15 +288,22 @@ for (const c of DATA.contexts) {
     // The facility itself: its ENU axes at the site origin.
     const e = { name: c.name, cat: "facility", ctx, static: true, model: makeModel("facility"), local: V(), active: true };
     ctx.group.add(e.model); ctx.entities.push(e); entities.push(e);
-  } else {
+  } else if (c.kind === "body") {
     ctx.fixedTrails = new THREE.Group(); ctx.inertialTrails = new THREE.Group();
     body.fixed.add(ctx.fixedTrails); body.inertial.add(ctx.inertialTrails);
   }
   for (const tr of c.tracks) {
-    const e = { name: tr.name, cat: tr.cat, ctx, t: f32(tr.t), p: f32(tr.p), q: f32(tr.q),
+    const e = { name: tr.name, cat: tr.cat, ctx, t: f32(tr.t), p: (tr.wide ? f64 : f32)(tr.p), q: f32(tr.q),
                 model: makeModel(tr.cat), local: V(), active: false };
     if (c.kind === "site") {
       e.line = trailLine(e.p, tr.cat); ctx.group.add(e.line, e.model);
+    } else if (c.kind === "inertial") {
+      // Non-rotating axes centred on the body; positions are doubles (float32 is ~16 km at
+      // 1 AU). The trail goes to the GPU as float32 offsets from the track's first point.
+      const rel = new Float32Array(e.p.length);
+      for (let i = 0; i < e.p.length; i++) rel[i] = e.p[i] - e.p[i % 3];
+      e.line = trailLine(rel, tr.cat); e.line.position.set(e.p[0], e.p[1], e.p[2]);
+      body.inertial.add(e.line, e.model);
     } else {
       // Non-rotating trail: each sample turned by the body's orientation at its own time.
       const pin = new Float32Array(e.p.length), bp = V(), bq = Qt(), v = V();
@@ -302,6 +319,11 @@ for (const c of DATA.contexts) {
   }
   contexts.push(ctx);
 }
+// A craft that changes frame has one track per context, under one name. Following it follows
+// whichever track is live.
+const byName = {};
+for (const e of entities) if (!e.static) (byName[e.name] ||= []).push(e);
+function pickEntity(name, prev) { return byName[name].find(e => e.active) || prev || byName[name][0]; }
 
 // ---- state, focus, camera -------------------------------------------------------------------
 const state = { T: 0, playing: false, speed: 600, trail: "3600", trailFrame: "fixed", size: 0.03,
@@ -312,6 +334,7 @@ const target = V(), basis = Qt();
 
 function icrfOf(ctx, local) {          // context-local position → ICRF km (double precision)
   const b = ctx.body, v = local.clone();
+  if (ctx.kind === "inertial") return v.add(b.pos);
   if (ctx.kind === "site") v.multiplyScalar(1e-3).applyQuaternion(ctx.q).add(ctx.p);
   return v.applyQuaternion(b.quat).add(b.pos);
 }
@@ -319,12 +342,14 @@ function focusTarget(f) {
   if (f.kind === "system") return bodyByName.Sun.pos.clone();
   if (f.kind === "body") return f.body.pos.clone();
   if (f.kind === "site") return icrfOf(f.ctx, V());
+  // Between two of its tracks (or aboard a craft, which is not drawn) it holds its last place.
   const e = f.entity;
-  return e.active ? icrfOf(e.ctx, e.local) : (e.ctx.kind === "site" ? icrfOf(e.ctx, V()) : e.ctx.body.pos.clone());
+  return e.active || e.seen ? icrfOf(e.ctx, e.local) : (e.ctx.kind === "site" ? icrfOf(e.ctx, V()) : e.ctx.body.pos.clone());
 }
 function focusBasis(f) {
   const ctx = f.kind === "site" ? f.ctx : f.kind === "entity" ? f.entity.ctx : null;
   const body = f.kind === "body" ? f.body : ctx ? ctx.body : null;
+  if (ctx && ctx.kind === "inertial") return Qt();
   if (ctx && ctx.kind === "site") return body.quat.clone().multiply(ctx.q);   // a site's own up
   return body && state.corotate ? body.quat.clone() : Qt();
 }
@@ -371,6 +396,7 @@ function sample(e, T) {
   e.local.set(P[3 * i] + f * (P[3 * j] - P[3 * i]), P[3 * i + 1] + f * (P[3 * j + 1] - P[3 * i + 1]), P[3 * i + 2] + f * (P[3 * j + 2] - P[3 * i + 2]));
   tq1.set(Q[4 * i + 1], Q[4 * i + 2], Q[4 * i + 3], Q[4 * i]); tq2.set(Q[4 * j + 1], Q[4 * j + 2], Q[4 * j + 3], Q[4 * j]);
   e.model.quaternion.copy(tq1).slerp(tq2, f);
+  e.seen = true;
   return true;
 }
 function trailRange(e, T) {
@@ -382,6 +408,7 @@ function trailRange(e, T) {
 
 const camRel = V(), tmp = V();
 function ctxNear(ctx) {        // camera close enough to show this context's entities
+  if (ctx.kind === "inertial") return true;      // deep-space craft show from any distance
   const centre = ctx.kind === "site" ? icrfOf(ctx, V()) : ctx.body.pos;
   const d = tmp.copy(centre).sub(target).sub(camRel).length();
   return ctx.kind === "site" ? d < SITE_REACH_KM : d < ctx.body.radius * BODY_REACH;
@@ -391,6 +418,13 @@ function update() {
   const T = state.T;
   for (const b of bodies) bodyAt(b, T, b.pos, b.quat);
   for (const e of entities) if (!e.static) e.active = sample(e, T);
+  const followed = state.focus;
+  if (followed.kind === "entity") {
+    const e = pickEntity(followed.name, followed.entity);
+    // Crossing into another frame changes the camera's basis; blend instead of snapping.
+    if (e.ctx !== followed.entity.ctx && !fly) fly = { t0: performance.now(), from: target.clone(), fromDist: ctl.dist, fromBasis: basis.clone(), toDist: ctl.dist };
+    followed.entity = e;
+  }
 
   // Camera target and basis, blended while flying to a new focus.
   const liveT = focusTarget(state.focus), liveB = focusBasis(state.focus);
@@ -419,6 +453,7 @@ function update() {
     b.marker.visible = b.radius / d * pxPerRad < 4;
     for (const l of b.orbitLines || []) l.visible = state.orbits;
   }
+  for (const l of arcLines) l.visible = state.orbits;
   const kSize = state.size * Math.tan(camera.fov * Math.PI / 360) * 2;
   for (const ctx of contexts) {
     const near = ctxNear(ctx);
@@ -536,14 +571,14 @@ function placeButton(label, key, f) {
 placeButton("Solar system", "system", { kind: "system" });
 for (const b of bodies) placeButton(b.name, "b:" + b.name, { kind: "body", body: b });
 for (const ctx of contexts) if (ctx.kind === "site") placeButton(ctx.name, "s:" + ctx.id, { kind: "site", ctx });
-$("follow").innerHTML = `<option value="">none</option>` + entities.filter(e => !e.static)
-  .map((e, i) => [e.name, entities.indexOf(e)]).sort((a, b) => a[0].localeCompare(b[0]))
-  .map(([n, i]) => `<option value="${i}">${n}</option>`).join("");
-$("follow").onchange = e => { if (e.target.value !== "") setFocus({ kind: "entity", entity: entities[Number(e.target.value)] }); };
+$("follow").innerHTML = `<option value="">none</option>` + Object.keys(byName)
+  .sort((a, b) => a.localeCompare(b)).map(n => `<option value="${n}">${n}</option>`).join("");
+$("follow").onchange = e => { const n = e.target.value; if (n !== "") setFocus({ kind: "entity", name: n, entity: pickEntity(n) }); };
 
 function buildLegend() {
-  const counts = {};
-  for (const e of entities) counts[e.cat] = (counts[e.cat] || 0) + 1;
+  const names = {}, counts = {};
+  for (const e of entities) (names[e.cat] ||= new Set()).add(e.name);
+  for (const cat in names) counts[cat] = names[cat].size;
   const box = $("legend"); box.innerHTML = "";
   for (const cat of Object.keys(CATS)) {
     if (!counts[cat]) continue;

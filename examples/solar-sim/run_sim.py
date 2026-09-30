@@ -14,11 +14,13 @@ import numpy as np
 import pyarrow.flight as fl
 
 import scenario as sc
+from ephemeris import Ephemeris
 from models.aircraft import aircraft
 from models.facility import Facility
-from models.robot import Crawler, Robot
+from models.probe import Probe
+from models.robot import CargoRobot, Crawler, Robot
 from models.ship import ship
-from models.spacecraft import Spacecraft, lander, launcher, orbiter
+from models.spacecraft import Spacecraft, lander, launcher, moonshot, orbiter, transfer
 from models.track import Track
 from soloc_client import KIND_ABSTRACT, KIND_SOLOC, SolocClient, registry_ipc, tai_ns_from_utc
 
@@ -27,19 +29,23 @@ from soloc_client import KIND_ABSTRACT, KIND_SOLOC, SolocClient, registry_ipc, t
 class Roster:
     facilities: list[Facility]
     spacecraft: list[Spacecraft]
+    probes: list[Probe]
     robots: list[Robot]
     crawlers: list[Crawler]
+    cargo: list[CargoRobot]
     aircraft: list[Track]
     ships: list[Track]
 
     @property
     def entities(self) -> list:
         """Parents before their children, so a tick's rows are appended in that order."""
-        return [*self.facilities, *self.spacecraft, *self.robots, *self.crawlers,
-                *self.aircraft, *self.ships]
+        return [*self.facilities, *self.spacecraft, *self.probes, *self.robots, *self.crawlers,
+                *self.cargo, *self.aircraft, *self.ships]
 
 
-def roster(seed: int) -> Roster:
+def roster(seed: int, client: SolocClient) -> Roster:
+    """The client is for the kernels only (body ephemerides); the ledger is not read."""
+    ephemeris = Ephemeris(client)
     facilities = [Facility(spec) for spec in sc.FACILITIES]
     site = {f.name: f for f in facilities}
     robots = [Robot(sc.robot_name(f.spec, i), f.id, sc.ROVERS[f.spec.body.name], seed, i)
@@ -65,21 +71,36 @@ def roster(seed: int) -> Roster:
                          sc.ROVERS[host.facility.spec.body.name])
         crawlers.append(Crawler(sc.crawler_name(i), host, seed, disembark))
 
+    # The cruise craft carry their own crawlers, numbered on from the ones drawn above.
+    for spec in sc.TRANSFERS:
+        craft = transfer(spec, ephemeris)
+        spacecraft.append(craft)
+        for _ in range(spec.crawlers):
+            crawlers.append(Crawler(sc.crawler_name(len(crawlers)), craft, seed))
+
     planes = [aircraft(sc.aircraft_name(i), seed) for i in range(sc.AIRCRAFT)]
     ships = [ship(sc.ship_name(i), sc.LANES[i % len(sc.LANES)], seed) for i in range(sc.SHIPS)]
-    return Roster(facilities, spacecraft, robots, crawlers, planes, ships)
+    cargo = []
+    for i, spec in enumerate(sc.MOONSHOTS):
+        craft = moonshot(spec, site[spec.origin], site[spec.destination], ephemeris)
+        spacecraft.append(craft)
+        cargo.append(CargoRobot(sc.cargo_name(i), craft, seed))
+
+    probes = [Probe(s, ephemeris) for s in sc.PROBES]
+    return Roster(facilities, spacecraft, probes, robots, crawlers, cargo, planes, ships)
 
 
 class Sim:
     def __init__(self, client: SolocClient, seed: int):
         self.client = client
-        self.entities = roster(seed).entities
+        self.entities = roster(seed, client).entities
         self.t0_ns = tai_ns_from_utc(sc.T0)
         self.buffer = client.buffer()
         self.batches = self.rows = self.snapshots = 0
 
     def register_names(self):
-        bindings = [(KIND_ABSTRACT, sc.AUTHORITY, "kinematic_sim_v1")]
+        bindings = [(KIND_ABSTRACT, sc.AUTHORITY, "kinematic_sim_v1"),
+                    (KIND_ABSTRACT, sc.HORIZONS_AUTHORITY, sc.HORIZONS_SOURCE)]
         bindings += [(KIND_SOLOC, sc.AUTHORITY, e.name) for e in self.entities]
         print(self.client.action("import_names", registry_ipc(bindings)))
 
@@ -92,7 +113,8 @@ class Sim:
             row = e.sample(t_s)
             if row is not None:
                 self.buffer.append(e.id, row.frame_id, row.position, row.quaternion, tai_ns,
-                                   units=row.units, timescale=row.timescale, **row.optional)
+                                   units=row.units, timescale=row.timescale,
+                                   source_id=row.source_id, estimate=row.estimate, **row.optional)
 
     def flush(self, t_s: int):
         n = len(self.buffer)

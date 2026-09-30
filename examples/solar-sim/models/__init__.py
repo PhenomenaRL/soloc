@@ -4,6 +4,8 @@ entity is not due at that tick."""
 
 from dataclasses import dataclass, field
 
+from soloc_client import SIM_SOURCE
+
 
 @dataclass
 class Row:
@@ -12,4 +14,6 @@ class Row:
     quaternion: list[float]
     units: str = "km"
     timescale: str = "TAI"
+    source_id: bytes = SIM_SOURCE
+    estimate: str = "SIMULATED"
     optional: dict = field(default_factory=dict)   # velocity, mass_kg, dimensions, ...

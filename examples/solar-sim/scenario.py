@@ -9,7 +9,7 @@ AUTHORITY = "sim.soloc"
 SEED = 7
 
 T0 = datetime(2026, 9, 1)            # UTC
-T_END = datetime(2026, 9, 4)
+T_END = datetime(2026, 9, 6)
 DURATION_S = int((T_END - T0).total_seconds())
 
 BASE_TICK_S = 5                      # the driver's grid; every cadence is a multiple of it
@@ -158,6 +158,100 @@ LAUNCHES = (
     LaunchSpec("LAUNCH-A", "KSC LC-39A", datetime(2026, 9, 1, 14), 400, 51.6, 4000.0),
     LaunchSpec("LAUNCH-B", "Andøya Spaceport", datetime(2026, 9, 2, 18), 550, 97.6, 800.0),
 )
+
+@dataclass(frozen=True)
+class MoonshotSpec:
+    """Pad to lunar surface as a patched conic: a parking orbit, a translunar arc about the
+    Earth (stored in GCRF) up to the Moon's sphere of influence, a hyperbola about the Moon
+    down to a circular orbit, then a landing like a `LanderSpec`'s. Every time after
+    `liftoff_after` is derived: liftoff waits for the parking plane to hold the translunar
+    target, and the burn is wherever on the parking orbit it is cheapest."""
+    name: str
+    origin: str                      # facility, and the pad on it (east, north) metres off its origin
+    pad_m: tuple[float, float]
+    destination: str
+    landing_m: tuple[float, float]
+    liftoff_after: datetime
+    inc_deg: float                   # parking orbit; must exceed the Moon's declination at arrival
+    parking_alt_km: float
+    transfer_s: float                # translunar injection → perilune
+    lunar_alt_km: float
+    lunar_revs: int                  # whole revolutions between capture and the deorbit burn
+    perilune_alt_km: float
+    braking_arc_deg: float
+    powered_s: float
+    mass_kg: float
+    ascent_s: int = 540
+    downrange_deg: float = 18.0
+
+
+MOON_SOI_KM = 66183.0                # where the translunar arc hands over to the Moon's gravity
+
+# The pads sit in the strip between the road grid (±100 m) and the patrol laps (135 m out), so
+# they are clear of LAUNCH-A's pad, LUNA-1 and every robot's route.
+MOONSHOTS = (
+    MoonshotSpec("SELENE-1", "KSC LC-39A", (120.0, 0.0), "Shackleton Base", (0.0, 120.0),
+                 liftoff_after=datetime(2026, 9, 1, 6), inc_deg=30.0, parking_alt_km=200,
+                 transfer_s=3 * 86400, lunar_alt_km=100, lunar_revs=2, perilune_alt_km=15,
+                 braking_arc_deg=16, powered_s=600, mass_kg=15000.0),
+)
+
+# -- the cargo robot each moonshot carries: a ground rover at both ends ------------------------
+
+CARGO_BOARDS_BEFORE_LIFTOFF_S = 1800
+CARGO_STOP_SHORT_M = 3.0             # it parks this far from the ship's centre, and steps off there
+CARGO_STOWED_M = (0.0, 0.0, -1.0)    # in the ship's body frame: on the face away from nadir
+
+
+def cargo_name(i: int) -> str:
+    return f"CARGO-{i + 1:02d}"
+
+
+@dataclass(frozen=True)
+class TransferSpec:
+    """An interplanetary cruise: the Sun-centred conic from `origin`'s centre at `depart` to
+    `target`'s centre at `arrive` (real positions, from the kernels), stored in ICRF. The
+    planets' own gravity is left out, so the arc starts and ends at their centres."""
+    name: str
+    origin: Body
+    target: Body
+    depart: datetime
+    arrive: datetime
+    mass_kg: float
+    crawlers: int                    # hull robots aboard, named after the CRAWLERS above them
+
+
+# The low-energy window to Mars opens in October 2026; leaving this early costs C3 ≈ 40 km²/s².
+TRANSFERS = (
+    TransferSpec("MARS-TRANSFER-1", EARTH, MARS, datetime(2026, 8, 24), datetime(2027, 7, 20),
+                 mass_kg=6000.0, crawlers=4),
+)
+
+
+# -- probes: real ephemerides from JPL Horizons, ICRF (centred on the solar-system barycentre), km
+
+
+@dataclass(frozen=True)
+class ProbeSpec:
+    name: str
+    horizons_id: str                 # the Horizons COMMAND; spacecraft ids are negative
+    mass_kg: float
+    dimensions_m: tuple[float, float, float]
+
+
+PROBES = (
+    ProbeSpec("Parker Solar Probe", "-96", 555.0, (3.0, 2.3, 2.3)),
+)
+PROBE_CADENCE_S = 60                 # whole minutes: rows are taken straight from the Horizons table
+PROBE_TIMESCALE = "UTC"
+HORIZONS_AUTHORITY = "jpl.nasa.gov"  # the probes' source_id, in place of the sim's own
+HORIZONS_SOURCE = "horizons"
+
+
+def horizons_file(spec: ProbeSpec) -> str:
+    """Where fetch_horizons.py saves the probe's table, under kernels/."""
+    return f"horizons_{spec.horizons_id.lstrip('-')}.txt"
+
 
 # -- crawlers: hull robots on the orbiters and landers ----------------------------------------
 

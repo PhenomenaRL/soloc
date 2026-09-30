@@ -44,7 +44,26 @@ EARTH = Body("Earth", "IAU_EARTH", 399, 6378.137, 1 / 298.257223563,  # WGS84
              gm=398600.435436, spin_deg_day=360.9856235)
 MOON = Body("Moon", "IAU_MOON", 301, 1737.4, gm=4902.800066, spin_deg_day=13.17635815)
 MARS = Body("Mars", "IAU_MARS", 499, 3396.19, gm=42828.375214, spin_deg_day=350.891982443)
-SUN = Body("Sun", "IAU_SUN", 10, 695700.0)
+SUN = Body("Sun", "IAU_SUN", 10, 695700.0, gm=132712440041.93938)
+
+
+@dataclass(frozen=True)
+class Frame:
+    """An inertial root: J2000 axes centred on `naif`. `name` is what do_exchange accepts."""
+    name: str
+    naif: int
+
+    @property
+    def frame(self) -> str:
+        return self.name
+
+    @property
+    def frame_id(self) -> bytes:
+        return astronomical(self.naif, 1)
+
+
+ICRF = Frame("ICRF", 0)     # centred on the solar-system barycentre
+GCRF = Frame("GCRF", 399)
 
 
 def geodetic_to_fixed(body: Body, lat_deg: float, lon_deg: float, h_km: float = 0.0) -> np.ndarray:
@@ -108,6 +127,16 @@ def quat_from_matrix(r: np.ndarray) -> list[float]:
     if q[0] < 0:
         q = [-c for c in q]
     return [float(c) for c in q]
+
+
+def matrix_from_quat(q) -> np.ndarray:
+    """The rotation matrix of `[w, x, y, z]`: maps child-frame vectors into the parent frame."""
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
 
 
 def quat_yaw(yaw_rad: float) -> list[float]:
@@ -193,6 +222,89 @@ class Kepler:
 
     def fixed(self, t_s: float) -> tuple[np.ndarray, np.ndarray]:
         return fixed_state(self.body, t_s, *self.inertial(t_s))
+
+
+def _stumpff(z: float) -> tuple[float, float]:
+    """The Stumpff functions `(C(z), S(z))` of the universal-variable formulation."""
+    if z > 1e-8:
+        s = math.sqrt(z)
+        return (1 - math.cos(s)) / z, (s - math.sin(s)) / s ** 3
+    if z < -1e-8:
+        s = math.sqrt(-z)
+        return (math.cosh(s) - 1) / -z, (math.sinh(s) - s) / s ** 3
+    return 0.5 - z / 24, 1 / 6 - z / 120
+
+
+class Conic:
+    """Two-body motion through the state `(r0 km, v0 km/s)` at `epoch_s`, about a centre of
+    gravitational parameter `gm`, in whatever inertial axes the state is given in. Propagated
+    with universal variables, so ellipses and hyperbolas are one code path.
+
+    Given a `body`, the axes are that body's inertial frame and `fixed` gives the state in its
+    live IAU frame, as `Kepler.fixed` does."""
+
+    def __init__(self, gm: float, r0, v0, epoch_s: float, body: Body | None = None):
+        self.gm, self.epoch_s, self.body = gm, epoch_s, body
+        self.r0, self.v0 = np.asarray(r0, dtype=float), np.asarray(v0, dtype=float)
+        self.r0_norm = float(np.linalg.norm(self.r0))
+        self.vr0 = float(self.r0 @ self.v0) / self.r0_norm
+        self.alpha = 2 / self.r0_norm - float(self.v0 @ self.v0) / gm     # 1/a; negative on a hyperbola
+        h = np.cross(self.r0, self.v0)
+        self.normal = h / np.linalg.norm(h)
+
+    def state(self, t_s: float) -> tuple[np.ndarray, np.ndarray]:
+        dt = t_s - self.epoch_s
+        root, r0, vr0, alpha = math.sqrt(self.gm), self.r0_norm, self.vr0, self.alpha
+        chi = root * abs(alpha) * dt
+        for _ in range(60):
+            z = alpha * chi * chi
+            c, s = _stumpff(z)
+            f = r0 * vr0 / root * chi * chi * c + (1 - alpha * r0) * chi ** 3 * s + r0 * chi - root * dt
+            df = r0 * vr0 / root * chi * (1 - z * s) + (1 - alpha * r0) * chi * chi * c + r0
+            step = f / df
+            chi -= step
+            if abs(step) < 1e-12 * max(1.0, abs(chi)):
+                break
+        z = alpha * chi * chi
+        c, s = _stumpff(z)
+        f, g = 1 - chi * chi / r0 * c, dt - chi ** 3 / root * s
+        r = f * self.r0 + g * self.v0
+        r_norm = float(np.linalg.norm(r))
+        df, dg = root / (r_norm * r0) * (z * s - 1) * chi, 1 - chi * chi / r_norm * c
+        return r, df * self.r0 + dg * self.v0
+
+    def fixed(self, t_s: float) -> tuple[np.ndarray, np.ndarray]:
+        return fixed_state(self.body, t_s, *self.state(t_s))
+
+
+def lambert(r1: np.ndarray, r2: np.ndarray, tof_s: float, gm: float,
+            normal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The velocities `(v1, v2)` of the conic from `r1` to `r2` in `tof_s`, less than one
+    revolution, going round on the side where its angular momentum is along `normal`."""
+    n1, n2 = float(np.linalg.norm(r1)), float(np.linalg.norm(r2))
+    sweep = math.acos(float(np.clip(r1 @ r2 / (n1 * n2), -1, 1)))
+    if np.cross(r1, r2) @ normal < 0:
+        sweep = 2 * math.pi - sweep
+    a = math.sin(sweep) * math.sqrt(n1 * n2 / (1 - math.cos(sweep)))
+
+    def y(z):
+        c, s = _stumpff(z)
+        return n1 + n2 + a * (z * s - 1) / math.sqrt(c)
+
+    def excess(z):
+        """Time of flight at `z`, less the one wanted (scaled by √gm); it rises with z."""
+        if y(z) < 0:
+            return -math.inf
+        c, s = _stumpff(z)
+        return (y(z) / c) ** 1.5 * s + a * math.sqrt(y(z)) - math.sqrt(gm) * tof_s
+
+    lo, hi = -16 * math.pi ** 2, 4 * math.pi ** 2 - 1e-9
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if excess(mid) < 0 else (lo, mid)
+    yz = y((lo + hi) / 2)
+    f, g, dg = 1 - yz / n1, a * math.sqrt(yz / gm), 1 - yz / n2
+    return (r2 - f * r1) / g, (dg * r2 - r1) / g
 
 
 def plane_through(direction: np.ndarray, i_deg: float, ascending: bool) -> tuple[float, float]:

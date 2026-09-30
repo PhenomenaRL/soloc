@@ -19,11 +19,12 @@ import numpy as np
 
 from geo import quat_from_matrix, quat_yaw
 from models import Row
-from scenario import (AUTHORITY, CRAWLER_CADENCE_S, CRAWLER_DIMENSIONS_M, CRAWLER_MASS_KG,
-                      CRAWLER_SPEED_M_S, CRAWLER_TIMESCALE, DEPOT_M, DISEMBARK_OFFSET_M,
-                      DURATION_S, LOGISTICS_STATIONS, PATROL_CORNER_PAUSE_S, PATROL_FENCE_M,
+from scenario import (AUTHORITY, CARGO_BOARDS_BEFORE_LIFTOFF_S, CARGO_STOP_SHORT_M, CARGO_STOWED_M,
+                      CRAWLER_CADENCE_S, CRAWLER_DIMENSIONS_M, CRAWLER_MASS_KG,
+                      CRAWLER_SPEED_M_S, CRAWLER_TIMESCALE, DEPOT_M, DISEMBARK_AFTER_S,
+                      DISEMBARK_OFFSET_M, DURATION_S, LOGISTICS_STATIONS, PATROL_CORNER_PAUSE_S, PATROL_FENCE_M,
                       PATTERN_UNDER_WAY_S, ROBOT_CADENCE_S, ROBOT_DIMENSIONS_M, ROBOT_ROLES,
-                      ROBOT_TIMESCALE, SITE_ROADS_M, SPACECRAFT_DIMENSIONS_M, SURVEY_INSET_M,
+                      ROBOT_TIMESCALE, ROVERS, SITE_ROADS_M, SPACECRAFT_DIMENSIONS_M, SURVEY_INSET_M,
                       SURVEY_ROW_SPACING_M, SURVEY_TURN_PAUSE_S, RoverSpec)
 from soloc_client import KIND_SOLOC, mint
 
@@ -116,6 +117,14 @@ class Itinerary:
                 t += dwell
         self.starts = [leg.t0 for leg in self.legs]
 
+    @classmethod
+    def through(cls, legs: list[Leg]) -> "Itinerary":
+        """An itinerary of exactly these legs, which must cover every time it is asked about."""
+        self = cls.__new__(cls)
+        self.legs = legs
+        self.starts = [leg.t0 for leg in legs]
+        return self
+
     def row(self, frame_id: bytes, t_s: int, rover: RoverSpec, dimensions, timescale) -> Row:
         leg = self.legs[bisect.bisect_right(self.starts, t_s) - 1]
         frac = (t_s - leg.t0) / (leg.t1 - leg.t0)
@@ -154,6 +163,84 @@ class Robot:
         if not self.due(t_s):
             return None
         return self.itinerary.row(self.host_id, t_s, self.rover, ROBOT_DIMENSIONS_M, ROBOT_TIMESCALE)
+
+
+def drive(waypoints: list[np.ndarray], speed: float, t: float) -> list[Leg]:
+    """Straight legs through `waypoints` at `speed`, leaving the first at time `t`."""
+    legs = []
+    for p, q in zip(waypoints, waypoints[1:]):
+        dt = float(np.linalg.norm(q - p)) / speed
+        legs.append(Leg(t, t + dt, p, q, math.atan2(q[1] - p[1], q[0] - p[0]), speed))
+        t += dt
+    return legs
+
+
+class CargoRobot:
+    """A ground rover that a ship carries from one facility to another.
+
+    It waits at the origin's depot, drives the roads to the pad and boards: from then it is
+    framed on the ship, stowed at a fixed point on the hull. `DISEMBARK_AFTER_S` after
+    touchdown it is framed on the destination, drives to that depot and runs logistics tours.
+    Both pads lie on the line of a road, just outside the grid, so the way in and out is along
+    that road."""
+
+    PAUSE_S = 120.0          # beside the pad before boarding
+
+    def __init__(self, name: str, ship, seed: int):
+        self.name = name
+        self.id = mint(KIND_SOLOC, AUTHORITY, name)
+        self.ship = ship
+        self.role = "cargo"
+        rng = own_rng(seed, name)
+        self.origin, self.destination = ship.launch_spot.facility, ship.landing_spot.facility
+        self.rover = ROVERS[ship.launch_spot.body.name]
+        self.t_board = ship.events["liftoff"] - CARGO_BOARDS_BEFORE_LIFTOFF_S
+        self.t_off = ship.events["touchdown"] + DISEMBARK_AFTER_S
+
+        def beside(spot):
+            """Where it parks by the pad, and where the pad's road meets the grid."""
+            pad = spot.offset_km[:2] * 1000
+            return (pad * (1 - CARGO_STOP_SHORT_M / float(np.linalg.norm(pad))),
+                    np.clip(pad, SITE_ROADS_M[0], SITE_ROADS_M[-1]))
+
+        depot = _xy(*DEPOT_M)
+        parked, gate = beside(ship.launch_spot)
+        speed = rng.uniform(*self.rover.speed_m_s)
+        way_in = drive([depot, _xy(gate[0], depot[1]), gate, parked], speed, 0.0)
+        leave = self.t_board - self.PAUSE_S - way_in[-1].t1
+        assert leave >= 0, f"{name} cannot reach the pad before it boards"
+        for leg in way_in:
+            leg.t0, leg.t1 = leg.t0 + leave, leg.t1 + leave
+        self.before = Itinerary.through([
+            Leg(-1.0, leave, depot, depot, way_in[0].yaw, 0.0), *way_in,
+            Leg(way_in[-1].t1, self.t_board, parked, parked, way_in[-1].yaw, 0.0)])
+
+        parked, gate = beside(ship.landing_spot)
+        rover = ROVERS[ship.landing_spot.body.name]
+        speed = rng.uniform(*rover.speed_m_s)
+        way_out = drive([parked, gate, _xy(depot[0], gate[1]), depot], speed, self.t_off)
+        tours = Itinerary(rng, logistics(rng, rover), speed, depot, way_out[-1].t1)
+        self.after = Itinerary.through(way_out + tours.legs)
+
+    def due(self, t_s: int) -> bool:
+        return t_s % ROBOT_CADENCE_S == 0
+
+    def frame_at(self, t_s: int) -> bytes:
+        return (self.origin.id if t_s < self.t_board else
+                self.ship.id if t_s < self.t_off else self.destination.id)
+
+    def sample(self, t_s: int) -> Row | None:
+        if not self.due(t_s):
+            return None
+        if t_s < self.t_board:
+            return self.before.row(self.origin.id, t_s, self.rover, ROBOT_DIMENSIONS_M, ROBOT_TIMESCALE)
+        if t_s >= self.t_off:
+            return self.after.row(self.destination.id, t_s, self.rover, ROBOT_DIMENSIONS_M, ROBOT_TIMESCALE)
+        # Stowed wheels-down on the face away from nadir: half a turn about the ship's x.
+        return Row(self.ship.id, list(CARGO_STOWED_M), [0.0, 1.0, 0.0, 0.0],
+                   units="m", timescale=ROBOT_TIMESCALE,
+                   optional={"velocity": [0.0, 0.0, 0.0], "mass_kg": self.rover.mass_kg,
+                             "dimensions": list(ROBOT_DIMENSIONS_M)})
 
 
 # The hull band: the loop around the box in the host's body x–z plane, as

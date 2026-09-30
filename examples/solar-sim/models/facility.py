@@ -1,6 +1,8 @@
 """A fixed site on a body's surface. Its pose is the local ENU frame at the site, so children
 (robots) report positions in site-local metres: x east, y north, z up."""
 
+import numpy as np
+
 from geo import enu_basis, geodetic_to_fixed, quat_from_matrix
 from models import Row
 from scenario import AUTHORITY, FACILITY_CADENCE_S, FACILITY_TIMESCALE, FacilitySpec
@@ -24,3 +26,14 @@ class Facility:
             return None
         return Row(self.spec.body.frame_id, self.position_km.tolist(), self.quaternion,
                    timescale=FACILITY_TIMESCALE, optional={"velocity": [0.0, 0.0, 0.0]})
+
+
+class Spot:
+    """A pad or landing point on a facility: `(east, north)` metres from its origin, on the
+    facility's ENU plane."""
+
+    def __init__(self, facility: Facility, offset_m: tuple[float, float] = (0.0, 0.0)):
+        self.facility = facility
+        self.body = facility.spec.body
+        self.offset_km = np.array([*offset_m, 0.0]) / 1000          # in the facility's ENU frame
+        self.position_km = facility.position_km + facility.basis @ self.offset_km   # body-fixed
