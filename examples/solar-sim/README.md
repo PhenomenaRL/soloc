@@ -17,7 +17,7 @@ Python has no soloc bindings, so everything goes through the server: `do_put` is
 From `examples/solar-sim/`:
 
 ```bash
-./fetch_kernels.sh                  # de440s, mar099s, pck11 + Natural Earth land into kernels/ (~98 MB)
+./fetch_kernels.sh                  # de440s, mar099s, pck11, Natural Earth land, three.js into kernels/ (~99 MB)
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
@@ -144,6 +144,49 @@ run on the stored values.
 | `flight_altitudes.png` | each aircraft's altitude over the 3 days |
 | `ships.png` | ship tracks over the land polygons, with every full lane dotted and the canal boxes outlined |
 
+## 3D viewer
+
+`export_viewer.py` turns a saved ledger into one standalone HTML file. The tracks, the body
+ephemerides, the Earth coastlines and three.js are inlined, so the page opens offline by
+double-click in any WebGL browser. Building it needs a running server:
+
+```bash
+python export_viewer.py out/solar_sim.arrow                     # → out/solar_sim_3d.html (~25 MB)
+```
+
+It is one scene, nested the way the ledger's frames are:
+- **ICRF:** the Sun, Mercury, Venus, Earth, the Moon and Mars, at their true positions, with a
+  full orbit drawn for each (the Moon's around Earth). Lighting comes from the Sun.
+- **Each body's IAU frame:** turns with the body. Its spacecraft, aircraft and ships are in there,
+  in body-fixed km as stored.
+- **Each site's ENU frame:** sits on its body at the facility's stored pose, with its robots in
+  metres over the road grid.
+
+Body positions and orientations come from the server: a zero offset in each body frame is
+exchanged to ICRF, at 5 min steps over the window and along each orbit. That is the same
+resolution the ledger does. Rows framed on a facility (a craft on its pad or landed) are composed
+through the facility's stored pose.
+
+**Navigating:**
+- "Go to" flies the camera to the solar system, a body or a site; "Follow" tracks any vehicle or
+  robot.
+- Vehicles, trails and labels appear as you close in on their body, and robots on their site.
+- The camera can turn with the body or stay fixed in ICRF. Trails can be drawn body-fixed or
+  non-rotating.
+- Floating-origin rendering keeps it precise from 4 AU down to a metre.
+
+Every entity is a small model with its body axes (x red, y green, z blue) at its interpolated
+pose; models keep a constant size on screen. The controls:
+- a time slider with ticks at the launches, deorbit, touchdown and disembark
+- play at 1 min/s up to 3 h/s
+- trails from 15 min to the whole track
+- labels, a hover readout (position in the entity's own frame), and a clickable legend that
+  hides a category
+
+Crawlers on orbit are left out, since a 2 m hull is invisible at orbit scale. On Earth sites
+the survey tracks look jagged: a robot moves up to 45 m between its 30 s rows, and the survey
+rows are 10 m apart, so straight lines between samples cut the corners.
+
 ## Look at the data
 
 `view_sim.py` prints a saved ledger as a table straight from the file (no server). Ids show as
@@ -211,7 +254,8 @@ python smoke_test.py
 
 | File | Role |
 |---|---|
-| `fetch_kernels.sh`, `serve.sh` | fetch kernels and land polygons; run `soloc-server` with them |
+| `fetch_kernels.sh`, `serve.sh` | fetch kernels, land polygons and three.js; run `soloc-server` with the kernels |
+| `export_viewer.py`, `viewer_template.html` | the standalone 3D viewer: data export and the page it is inlined into |
 | `soloc_client.py` | id minting, epoch encoding, batches built against the server schema, Flight calls |
 | `geo.py` | body shapes, geodetic ↔ body-fixed, ENU, quaternions, Kepler, body spin, LVLH, splines, great circles |
 | `land.py` | Natural Earth land: point-in-land test and outlines |
