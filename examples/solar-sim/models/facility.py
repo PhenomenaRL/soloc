@@ -13,10 +13,14 @@ class Facility:
         self.name = spec.name
         self.id = mint(KIND_SOLOC, AUTHORITY, spec.name)
         self.position_km = geodetic_to_fixed(spec.body, spec.lat_deg, spec.lon_deg, spec.h_km)
-        self.quaternion = quat_from_matrix(enu_basis(spec.lat_deg, spec.lon_deg))
+        self.basis = enu_basis(spec.lat_deg, spec.lon_deg)
+        self.quaternion = quat_from_matrix(self.basis)
+
+    def due(self, t_s: int) -> bool:
+        return t_s % FACILITY_CADENCE_S == 0
 
     def sample(self, t_s: int) -> Row | None:
-        if t_s % FACILITY_CADENCE_S:
+        if not self.due(t_s):
             return None
         return Row(self.spec.body.frame_id, self.position_km.tolist(), self.quaternion,
                    timescale=FACILITY_TIMESCALE, optional={"velocity": [0.0, 0.0, 0.0]})

@@ -14,12 +14,22 @@ import numpy as np
 import pyarrow as pa
 
 import scenario as sc
+from geo import EARTH, MARS, MOON, fixed_to_geodetic
 from run_sim import roster
-from soloc_client import SolocClient, id_bytes, positions
+from soloc_client import (CENTURY_NS, SolocClient, id_bytes, matches, positions, sts_field,
+                          tai_ns_from_utc)
 
 TRACK = "#2a78d6"
 MARK = "#eb6834"
 INK_MUTED = "#6b6a63"
+GRID = "#e6e5df"
+BODY_FILL = "#d9d8d2"
+SERIES = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4")   # categorical slots 1-5
+
+
+def style(ax):
+    ax.grid(color=GRID, linewidth=0.5)
+    ax.tick_params(labelsize=7, colors=INK_MUTED)
 
 
 def plot_site_robots(facility, robots, rows, ids, out_dir: Path) -> Path:
@@ -29,7 +39,7 @@ def plot_site_robots(facility, robots, rows, ids, out_dir: Path) -> Path:
                              layout="constrained")
     w = sc.SITE_HALF_WIDTH_M
     for ax, robot in zip(axes.flat, robots):
-        xyz = positions(rows.filter(pa.array(ids == robot.id)))
+        xyz = positions(rows.filter(pa.array(matches(ids, robot.id))))
         ax.plot(xyz[:, 0], xyz[:, 1], color=TRACK, linewidth=0.8)
         ax.plot(*xyz[0, :2], "o", color=MARK, markersize=5)
         ax.add_patch(plt.Rectangle((-w, -w), 2 * w, 2 * w, fill=False, linestyle="--",
@@ -38,8 +48,7 @@ def plot_site_robots(facility, robots, rows, ids, out_dir: Path) -> Path:
         ax.set_aspect("equal")
         ax.set_xlim(-1.1 * w, 1.1 * w)
         ax.set_ylim(-1.1 * w, 1.1 * w)
-        ax.grid(color="#e6e5df", linewidth=0.5)
-        ax.tick_params(labelsize=7, colors=INK_MUTED)
+        style(ax)
     for ax in axes[-1]:
         ax.set_xlabel("east (m)", fontsize=8)
     for ax in axes[:, 0]:
@@ -47,6 +56,100 @@ def plot_site_robots(facility, robots, rows, ids, out_dir: Path) -> Path:
     fig.suptitle(f"{facility.name}: robot tracks over 3 days, site ENU "
                  f"(dot = t0, dashed = site area)", fontsize=11)
     path = out_dir / f"robots_{facility.spec.code.lower()}.png"
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path
+
+
+def epochs_ns(table: pa.Table) -> np.ndarray:
+    c = sts_field(table, "duration_centuries").to_numpy().astype(np.int64)
+    return c * CENTURY_NS + sts_field(table, "duration_ns").to_numpy().astype(np.int64)
+
+
+def body_centred_icrf(client: SolocClient, rows: pa.Table, body) -> np.ndarray:
+    """Positions (km) of rows framed on `body`'s IAU frame, relative to the body's centre with
+    ICRF axes. The centre comes from exchanging a zero offset in the body frame at each row's
+    epoch, so it is exact at every epoch rather than interpolated from the hourly snapshots."""
+    centre = client.buffer()
+    for t in epochs_ns(rows).tolist():
+        centre.append(body.frame_id, body.frame_id, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], t)
+    centre = pa.Table.from_batches([centre.flush()])
+    return positions(client.exchange(rows, "ICRF")) - positions(client.exchange(centre, "ICRF"))
+
+
+def plot_orbits(client, rows, ids, frames, spacecraft, out_dir: Path) -> Path:
+    """Every spacecraft row framed on a body's IAU frame, body-centred with ICRF axes, projected
+    onto the ICRF x–y and x–z planes. Pad and landed rows are framed on facilities and left out."""
+    bodies = (EARTH, MOON, MARS)
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10), layout="constrained")
+    for col, body in enumerate(bodies):
+        crafts = [c for c in spacecraft if c.body is body and c.id in set(ids)]
+        extent = body.a_km
+        for slot, craft in enumerate(crafts):
+            mask = matches(ids, craft.id) & matches(frames, body.frame_id)
+            xyz = body_centred_icrf(client, rows.filter(pa.array(mask)), body)
+            extent = max(extent, float(np.abs(xyz).max()))
+            for row, (a, b) in enumerate(((0, 1), (0, 2))):
+                axes[row, col].plot(xyz[:, a], xyz[:, b], color=SERIES[slot], linewidth=0.6,
+                                    label=craft.name)
+        for row, label in enumerate(("y", "z")):
+            ax = axes[row, col]
+            ax.add_patch(plt.Circle((0, 0), body.a_km, color=BODY_FILL, zorder=0))
+            lim = 1.08 * extent
+            ax.set_xlim(-lim, lim)
+            ax.set_ylim(-lim, lim)
+            ax.set_aspect("equal")
+            ax.set_xlabel("ICRF x (km)", fontsize=8)
+            ax.set_ylabel(f"ICRF {label} (km)", fontsize=8)
+            style(ax)
+        axes[0, col].set_title(f"{body.name}-centred", fontsize=10)
+        legend = axes[0, col].legend(fontsize=8, frameon=False, loc="upper right")
+        for line in legend.get_lines():
+            line.set_linewidth(2)
+    fig.suptitle("Spacecraft over 3 days, body-centred with ICRF axes "
+                 "(top: x–y, bottom: x–z; grey disc = body)", fontsize=11)
+    path = out_dir / "orbits.png"
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path
+
+
+def plot_altitudes(client, rows, ids, t_s, spacecraft, out_dir: Path) -> Path | None:
+    """Altitude against time around each launch and landing, resolved to the body frame through
+    the ledger (pad and landed rows resolve through their facility)."""
+    shows = []
+    for c in spacecraft:
+        if "liftoff" in c.events:
+            shows.append((c, c.events["liftoff"], "liftoff", [("insertion", c.events["insertion"])]))
+        if "touchdown" in c.events:
+            shows.append((c, c.events["deorbit"], "deorbit",
+                          [("perilune", c.events["perilune"]), ("touchdown", c.events["touchdown"])]))
+    shows = [s for s in shows if s[0].id in set(ids)]
+    if not shows:
+        return None
+    fig, axes = plt.subplots(1, len(shows), figsize=(5 * len(shows), 4), layout="constrained")
+    for ax, (craft, t_ref, ref_name, marks) in zip(np.atleast_1d(axes), shows):
+        t_end = marks[-1][1]
+        mask = matches(ids, craft.id) & (t_s >= t_ref - 600) & (t_s <= t_end + 1200)
+        window = rows.filter(pa.array(mask))
+        fixed = positions(client.exchange(window, craft.body.frame))
+        _, _, h = fixed_to_geodetic(craft.body, fixed)
+        minutes = (t_s[mask] - t_ref) / 60
+        order = np.argsort(minutes)
+        ax.plot(minutes[order], h[order], color=TRACK, linewidth=1.2)
+        ax.set_ylim(top=1.3 * float(h.max()))   # headroom for the event labels
+        # Event labels step down the axis so close events (perilune, touchdown) don't collide.
+        for j, (name, t) in enumerate([(ref_name, t_ref), *marks]):
+            m = (t - t_ref) / 60
+            ax.axvline(m, color=INK_MUTED, linestyle="--", linewidth=0.8)
+            ax.text(m, 0.97 - 0.07 * j, f" {name}", fontsize=8, color=INK_MUTED, va="top",
+                    transform=ax.get_xaxis_transform())
+        ax.set_title(f"{craft.name} ({craft.facility.name})", fontsize=10)
+        ax.set_xlabel(f"minutes from {ref_name}", fontsize=8)
+        ax.set_ylabel(f"altitude above {craft.body.name} (km)", fontsize=8)
+        style(ax)
+    fig.suptitle("Launches and landing: altitude resolved to the body frame", fontsize=11)
+    path = out_dir / "altitudes.png"
     fig.savefig(path, dpi=120)
     plt.close(fig)
     return path
@@ -64,15 +167,20 @@ def main():
     print(client.action("load_ledger", {"path": str(path)}))
     rows = client.query_all()
     ids = np.array(id_bytes(rows.column("entity_id")), dtype=object)
+    frames = np.array(id_bytes(sts_field(rows, "frame_id")), dtype=object)
+    t_s = (epochs_ns(rows) - tai_ns_from_utc(sc.T0)) / 1e9
     present = set(ids)
 
     out_dir = path.parent / "plots"
     out_dir.mkdir(exist_ok=True)
-    facilities, robots = roster(args.seed)
-    for f in facilities:
-        mine = [r for r in robots if r.host_id == f.id and r.id in present]
+    world = roster(args.seed)
+    for f in world.facilities:
+        mine = [r for r in world.robots if r.host_id == f.id and r.id in present]
         if mine:
             print(plot_site_robots(f, mine, rows, ids, out_dir))
+    if present & {c.id for c in world.spacecraft}:
+        print(plot_orbits(client, rows, ids, frames, world.spacecraft, out_dir))
+        print(plot_altitudes(client, rows, ids, t_s, world.spacecraft, out_dir))
 
 
 if __name__ == "__main__":

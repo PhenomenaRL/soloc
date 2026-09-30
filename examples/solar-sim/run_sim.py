@@ -7,29 +7,64 @@ Run against a freshly started serve.sh (empty ledger). Stops on the first append
 import argparse
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pyarrow.flight as fl
 
 import scenario as sc
 from models.facility import Facility
-from models.robot import Robot
+from models.robot import Crawler, Robot
+from models.spacecraft import Spacecraft, lander, launcher, orbiter
 from soloc_client import KIND_ABSTRACT, KIND_SOLOC, SolocClient, registry_ipc, tai_ns_from_utc
 
 
-def roster(seed: int) -> tuple[list[Facility], list[Robot]]:
+@dataclass
+class Roster:
+    facilities: list[Facility]
+    spacecraft: list[Spacecraft]
+    robots: list[Robot]
+    crawlers: list[Crawler]
+
+    @property
+    def entities(self) -> list:
+        """Parents before their children, so a tick's rows are appended in that order."""
+        return [*self.facilities, *self.spacecraft, *self.robots, *self.crawlers]
+
+
+def roster(seed: int) -> Roster:
     facilities = [Facility(spec) for spec in sc.FACILITIES]
+    site = {f.name: f for f in facilities}
     robots = [Robot(sc.robot_name(f.spec, i), f.id, sc.ROVERS[f.spec.body.name], seed)
               for f in facilities for i in range(sc.ROBOTS_PER_FACILITY)]
-    return facilities, robots
+
+    landers = [lander(s, site[s.facility]) for s in sc.LANDERS]
+    hosts = [*(orbiter(s) for s in sc.ORBITERS), *landers]
+    spacecraft = [*hosts, *(launcher(s, site[s.facility]) for s in sc.LAUNCHES)]
+
+    # Crawlers go to random hosts (stream 0; robots use their name hashes), with every lander
+    # carrying at least one: its first crawler is the one that disembarks.
+    picks = np.random.default_rng([seed, 0]).integers(len(hosts), size=sc.CRAWLERS)
+    for k, craft in enumerate(landers):
+        if hosts.index(craft) not in picks:
+            picks[k] = hosts.index(craft)
+    crawlers = []
+    for i, pick in enumerate(picks):
+        host = hosts[pick]
+        host.cadence_s = sc.HOST_CADENCE_S
+        disembark = None
+        if host in landers and not any(c.host is host for c in crawlers):
+            disembark = (host.facility, host.events["touchdown"] + sc.DISEMBARK_AFTER_S,
+                         sc.ROVERS[host.facility.spec.body.name])
+        crawlers.append(Crawler(sc.crawler_name(i), host, seed, disembark))
+    return Roster(facilities, spacecraft, robots, crawlers)
 
 
 class Sim:
     def __init__(self, client: SolocClient, seed: int):
         self.client = client
-        facilities, robots = roster(seed)
-        # Parents come before their children, so a tick's rows are appended in that order.
-        self.entities = [*facilities, *robots]
+        self.entities = roster(seed).entities
         self.t0_ns = tai_ns_from_utc(sc.T0)
         self.buffer = client.buffer()
         self.batches = self.rows = self.snapshots = 0

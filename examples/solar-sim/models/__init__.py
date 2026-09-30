@@ -1,5 +1,6 @@
-"""Entity models. Each exposes `id`, `name`, and `sample(t_s) -> Row | None`, where `t_s` is
-integer seconds since `scenario.T0`; `None` means the entity reports nothing at that tick."""
+"""Entity models. Each exposes `id`, `name`, `due(t_s) -> bool` and `sample(t_s) -> Row | None`,
+where `t_s` is integer seconds since `scenario.T0`; `sample` returns `None` exactly when the
+entity is not due at that tick."""
 
 from dataclasses import dataclass, field
 

@@ -153,6 +153,12 @@ def id_bytes(column) -> list[bytes]:
     return arr.to_pylist()
 
 
+def matches(ids, value: bytes) -> np.ndarray:
+    """Boolean mask of `ids == value`. Not numpy's `==`: that goes through `np.bytes_`, which
+    drops trailing NULs, and astro ids end in zero bytes."""
+    return np.fromiter((i == value for i in ids), bool, len(ids))
+
+
 def sts_field(table: pa.Table, name: str) -> pa.Array:
     return table.column("spacetimestamp").combine_chunks().field(name)
 
@@ -182,6 +188,9 @@ def registry_ipc(bindings: list[tuple[int, str, str]]) -> bytes:
     with pa.ipc.new_file(sink, table.schema) as w:
         w.write_table(table)
     return sink.getvalue().to_pybytes()
+
+
+EXCHANGE_CHUNK_ROWS = 2048
 
 
 class SolocClient:
@@ -234,7 +243,8 @@ class SolocClient:
         cmd = json.dumps({"target_frame": target_frame, "target_units": units_code}).encode()
         writer, reader = self.flight.do_exchange(fl.FlightDescriptor.for_command(cmd))
         writer.begin(data.schema)
-        writer.write_table(data)
+        # The server decodes at most 4 MiB per message (tonic's default), ~8k entity rows.
+        writer.write_table(data, max_chunksize=EXCHANGE_CHUNK_ROWS)
         writer.done_writing()
         table = reader.read_all()
         writer.close()
