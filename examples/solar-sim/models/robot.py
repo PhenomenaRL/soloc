@@ -1,8 +1,11 @@
 """Robots, in metres relative to their host's frame.
 
-- `Robot`: a ground rover doing random-waypoint roving in its host site's ENU frame.
+- `Robot`: a ground rover working a patterned job in its host site's ENU frame, by its index at
+  the site (`scenario.ROBOT_ROLES`): patrolling the fence, surveying a cell of the road grid,
+  or running logistics tours from the depot along the roads.
 - `Crawler`: a hull robot looping around its host spacecraft in the host's body frame. The first
-  crawler on a lander disembarks onto the lander's facility and roves there like a `Robot`.
+  crawler on a lander disembarks onto the lander's facility and surveys the one grid cell the
+  site's own surveyors leave free.
 
 Each robot draws its whole itinerary up front from its own RNG stream, so its track depends only
 on the seed and its name, not on the rest of the roster.
@@ -17,10 +20,11 @@ import numpy as np
 from geo import quat_from_matrix, quat_yaw
 from models import Row
 from scenario import (AUTHORITY, CRAWLER_CADENCE_S, CRAWLER_DIMENSIONS_M, CRAWLER_MASS_KG,
-                      CRAWLER_SPEED_M_S, CRAWLER_TIMESCALE, DISEMBARK_OFFSET_M, DURATION_S,
-                      ROBOT_CADENCE_S,
-                      ROBOT_DIMENSIONS_M, ROBOT_TIMESCALE, SITE_HALF_WIDTH_M,
-                      SPACECRAFT_DIMENSIONS_M, RoverSpec)
+                      CRAWLER_SPEED_M_S, CRAWLER_TIMESCALE, DEPOT_M, DISEMBARK_OFFSET_M,
+                      DURATION_S, LOGISTICS_STATIONS, PATROL_CORNER_PAUSE_S, PATROL_FENCE_M,
+                      PATTERN_UNDER_WAY_S, ROBOT_CADENCE_S, ROBOT_DIMENSIONS_M, ROBOT_ROLES,
+                      ROBOT_TIMESCALE, SITE_ROADS_M, SPACECRAFT_DIMENSIONS_M, SURVEY_INSET_M,
+                      SURVEY_ROW_SPACING_M, SURVEY_TURN_PAUSE_S, RoverSpec)
 from soloc_client import KIND_SOLOC, mint
 
 
@@ -38,26 +42,78 @@ class Leg:
         self.t0, self.t1, self.p0, self.p1, self.yaw, self.speed = t0, t1, p0, p1, yaw, speed
 
 
-def _waypoint(rng) -> np.ndarray:
-    return rng.uniform(-SITE_HALF_WIDTH_M, SITE_HALF_WIDTH_M, 2)
+Stop = tuple[np.ndarray, tuple[float, float]]   # (site ENU xy, pause range; (0, 0) = drive through)
+NO_PAUSE = (0.0, 0.0)
+
+
+def _xy(x: float, y: float) -> np.ndarray:
+    return np.array([x, y], dtype=float)
+
+
+def survey_cells() -> list[tuple[float, float, float, float]]:
+    """The road-grid cells as `(x0, x1, y0, y1)`. The last one (NE of the origin) is left to a
+    disembarked crawler, next to where the lander sits."""
+    spans = list(zip(SITE_ROADS_M, SITE_ROADS_M[1:]))
+    return [(x0, x1, y0, y1) for x0, x1 in spans for y0, y1 in spans]
+
+
+def patrol(rng, lap: int) -> list[Stop]:
+    """Laps of a square `5 m × lap` inside the fence, odd laps clockwise, from a random corner."""
+    w = PATROL_FENCE_M - 5.0 * lap
+    corners = [_xy(w, w), _xy(-w, w), _xy(-w, -w), _xy(w, -w)]
+    if lap % 2:
+        corners.reverse()
+    k = int(rng.integers(4))
+    return [(c, PATROL_CORNER_PAUSE_S) for c in corners[k:] + corners[:k]]
+
+
+def survey(rng, cell) -> list[Stop]:
+    """Back-and-forth rows across the cell, alternately along x or y by a coin toss, then the
+    same rows swept back in reverse, so the loop never cuts across the cell."""
+    x0, x1, y0, y1 = (v + s * SURVEY_INSET_M for v, s in zip(cell, (1, -1, 1, -1)))
+    along_x = bool(rng.integers(2))
+    lo, hi = (y0, y1) if along_x else (x0, x1)
+    a, b = (x0, x1) if along_x else (y0, y1)
+    stops = []
+    for i, c in enumerate(np.arange(lo, hi + 1e-9, SURVEY_ROW_SPACING_M)):
+        ends = (a, b) if i % 2 == 0 else (b, a)
+        for e in ends:
+            stops.append((_xy(e, c) if along_x else _xy(c, e), SURVEY_TURN_PAUSE_S))
+    return stops + stops[-2:0:-1]
+
+
+def logistics(rng, rover: RoverSpec) -> list[Stop]:
+    """A tour from the depot to a few road intersections and back, loading at every stop.
+    Each hop goes along x then along y, so it stays on the roads."""
+    crossings = [_xy(x, y) for x in SITE_ROADS_M for y in SITE_ROADS_M if (x, y) != DEPOT_M]
+    n = int(rng.integers(LOGISTICS_STATIONS[0], LOGISTICS_STATIONS[1] + 1))
+    tour = [_xy(*DEPOT_M)] + [crossings[i] for i in rng.permutation(len(crossings))[:n]]
+    stops = []
+    for p, q in zip(tour, tour[1:] + tour[:1]):
+        stops.append((_xy(q[0], p[1]), NO_PAUSE))
+        stops.append((q, rover.pause_s))
+    return stops
 
 
 class Itinerary:
-    """Random-waypoint roving from `p` (site ENU, m) facing `yaw`, starting with a pause at `t`."""
+    """Drives the `stops` loop from `start` (site ENU, m) at `speed`, beginning at time `t`:
+    straight legs between stops, pausing at each for a time drawn from its range."""
 
-    def __init__(self, rng, rover: RoverSpec, p: np.ndarray, yaw: float, t: float):
+    def __init__(self, rng, stops: list[Stop], speed: float, start: np.ndarray, t: float):
         self.legs = []
+        p, yaw, k = start, 0.0, 0
         while t <= DURATION_S:
-            pause = rng.uniform(*rover.pause_s)
-            self.legs.append(Leg(t, t + pause, p, p, yaw, 0.0))
-            t += pause
-            q = _waypoint(rng)
-            d = q - p
-            speed = rng.uniform(*rover.speed_m_s)
-            yaw = math.atan2(d[1], d[0])
-            dt = float(np.linalg.norm(d)) / speed
-            self.legs.append(Leg(t, t + dt, p, q, yaw, speed))
-            t, p = t + dt, q
+            q, pause = stops[k % len(stops)]
+            k += 1
+            dist = float(np.linalg.norm(q - p))
+            if dist > 1e-9:
+                yaw = math.atan2(q[1] - p[1], q[0] - p[0])
+                self.legs.append(Leg(t, t + dist / speed, p, q, yaw, speed))
+                t, p = t + dist / speed, q
+            if pause[1] > 0:
+                dwell = rng.uniform(*pause)
+                self.legs.append(Leg(t, t + dwell, p, p, yaw, 0.0))
+                t += dwell
         self.starts = [leg.t0 for leg in self.legs]
 
     def row(self, frame_id: bytes, t_s: int, rover: RoverSpec, dimensions, timescale) -> Row:
@@ -73,16 +129,23 @@ class Itinerary:
 
 
 class Robot:
-    def __init__(self, name: str, host_id: bytes, rover: RoverSpec, seed: int):
+    def __init__(self, name: str, host_id: bytes, rover: RoverSpec, seed: int, index: int):
         self.name = name
         self.id = mint(KIND_SOLOC, AUTHORITY, name)
         self.host_id = host_id
         self.rover = rover
+        self.role = ROBOT_ROLES[index]
+        slot = index - ROBOT_ROLES.index(self.role)     # which patroller, surveyor, ...
         rng = own_rng(seed, name)
-        # Start mid-pause at a random spot, facing a random way.
-        p = _waypoint(rng)
-        yaw = rng.uniform(-math.pi, math.pi)
-        self.itinerary = Itinerary(rng, rover, p, yaw, -rng.uniform(*rover.pause_s))
+        if self.role == "patrol":
+            stops = patrol(rng, slot)
+        elif self.role == "survey":
+            stops = survey(rng, survey_cells()[slot])
+        else:
+            stops = logistics(rng, rover)
+        # Started some time before T0, from its last stop, so it is mid-pattern at T0.
+        speed = rng.uniform(*rover.speed_m_s)
+        self.itinerary = Itinerary(rng, stops, speed, stops[-1][0], -rng.uniform(*PATTERN_UNDER_WAY_S))
 
     def due(self, t_s: int) -> bool:
         return t_s % ROBOT_CADENCE_S == 0
@@ -111,7 +174,7 @@ class Crawler:
     body z along the face normal and body x along the direction of travel.
 
     `disembark` is `(facility, t_s, rover)`: from `t_s` on, the crawler is framed on the
-    facility and roves its site from `DISEMBARK_OFFSET_M`."""
+    facility, drives from `DISEMBARK_OFFSET_M` to the site's free survey cell and surveys it."""
 
     def __init__(self, name: str, host, seed: int, disembark=None):
         self.name = name
@@ -124,7 +187,8 @@ class Crawler:
         self.disembark = disembark
         if disembark:
             _, t_s, rover = disembark
-            self.itinerary = Itinerary(rng, rover, np.array(DISEMBARK_OFFSET_M), 0.0, t_s)
+            self.itinerary = Itinerary(rng, survey(rng, survey_cells()[-1]),
+                                       rng.uniform(*rover.speed_m_s), _xy(*DISEMBARK_OFFSET_M), t_s)
 
     def due(self, t_s: int) -> bool:
         return t_s % CRAWLER_CADENCE_S == 0

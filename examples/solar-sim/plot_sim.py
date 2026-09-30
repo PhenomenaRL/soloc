@@ -33,19 +33,31 @@ def style(ax):
     ax.tick_params(labelsize=7, colors=INK_MUTED)
 
 
-def plot_site_robots(facility, robots, rows, ids, out_dir: Path) -> Path:
-    """Robot tracks in the site's ENU frame (the frame they are stored in), one panel each."""
-    cols = 5
+def plot_site_robots(facility, robots, rows, ids, frames, out_dir: Path) -> Path:
+    """Robot tracks in the site's ENU frame (the frame they are stored in), one panel each, over
+    the site layout. `robots` may include a disembarked crawler; only its rows framed on this
+    facility are drawn."""
+    cols = 5 if len(robots) <= 10 else 6
     fig, axes = plt.subplots(2, cols, figsize=(3.2 * cols, 6.8), sharex=True, sharey=True,
                              layout="constrained")
     w = sc.SITE_HALF_WIDTH_M
+    r0, r1 = sc.SITE_ROADS_M[0], sc.SITE_ROADS_M[-1]
+    for ax in axes.flat[len(robots):]:
+        ax.set_visible(False)
     for ax, robot in zip(axes.flat, robots):
-        xyz = positions(rows.filter(pa.array(matches(ids, robot.id))))
-        ax.plot(xyz[:, 0], xyz[:, 1], color=TRACK, linewidth=0.8)
+        for c in sc.SITE_ROADS_M:
+            ax.plot([r0, r1], [c, c], color=GRID, linewidth=2.5, zorder=0)
+            ax.plot([c, c], [r0, r1], color=GRID, linewidth=2.5, zorder=0)
+        mask = matches(ids, robot.id) & matches(frames, facility.id)
+        xyz = positions(rows.filter(pa.array(mask)))
+        # Dots, not a line: at 30 s rows an Earth robot moves up to 45 m between samples, and
+        # joining them would cut every corner differently on every lap.
+        ax.plot(xyz[:, 0], xyz[:, 1], ".", color=TRACK, markersize=1.2)
         ax.plot(*xyz[0, :2], "o", color=MARK, markersize=5)
         ax.add_patch(plt.Rectangle((-w, -w), 2 * w, 2 * w, fill=False, linestyle="--",
                                    edgecolor=INK_MUTED, linewidth=0.8))
-        ax.set_title(robot.name, fontsize=9)
+        role = getattr(robot, "role", None) or f"survey, off {robot.host.name}"
+        ax.set_title(f"{robot.name} ({role})", fontsize=9)
         ax.set_aspect("equal")
         ax.set_xlim(-1.1 * w, 1.1 * w)
         ax.set_ylim(-1.1 * w, 1.1 * w)
@@ -54,8 +66,8 @@ def plot_site_robots(facility, robots, rows, ids, out_dir: Path) -> Path:
         ax.set_xlabel("east (m)", fontsize=8)
     for ax in axes[:, 0]:
         ax.set_ylabel("north (m)", fontsize=8)
-    fig.suptitle(f"{facility.name}: robot tracks over 3 days, site ENU "
-                 f"(dot = t0, dashed = site area)", fontsize=11)
+    fig.suptitle(f"{facility.name}: robot rows over 3 days, site ENU (small dots = 30 s rows, "
+                 f"large dot = first row on the site, dashed = site area, grey = roads)", fontsize=11)
     path = out_dir / f"robots_{facility.spec.code.lower()}.png"
     fig.savefig(path, dpi=120)
     plt.close(fig)
@@ -246,8 +258,9 @@ def main():
     world = roster(args.seed)
     for f in world.facilities:
         mine = [r for r in world.robots if r.host_id == f.id and r.id in present]
+        mine += [c for c in world.crawlers if c.disembark and c.disembark[0] is f and c.id in present]
         if mine:
-            print(plot_site_robots(f, mine, rows, ids, out_dir))
+            print(plot_site_robots(f, mine, rows, ids, frames, out_dir))
     if present & {c.id for c in world.spacecraft}:
         print(plot_orbits(client, rows, ids, frames, world.spacecraft, out_dir))
         print(plot_altitudes(client, rows, ids, t_s, world.spacecraft, out_dir))

@@ -42,7 +42,7 @@ class Roster:
 def roster(seed: int) -> Roster:
     facilities = [Facility(spec) for spec in sc.FACILITIES]
     site = {f.name: f for f in facilities}
-    robots = [Robot(sc.robot_name(f.spec, i), f.id, sc.ROVERS[f.spec.body.name], seed)
+    robots = [Robot(sc.robot_name(f.spec, i), f.id, sc.ROVERS[f.spec.body.name], seed, i)
               for f in facilities for i in range(sc.ROBOTS_PER_FACILITY)]
 
     landers = [lander(s, site[s.facility]) for s in sc.LANDERS]

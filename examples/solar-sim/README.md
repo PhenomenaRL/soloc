@@ -60,11 +60,11 @@ entity whether it is due, and appends one batch per 10 min of sim time (433 appe
 | Entities | Frame (parent) | Units | Timescale | Rows every | What they do |
 |---|---|---|---|---|---|
 | 4 facilities | IAU_EARTH / IAU_MOON | km | TAI | 1 h | KSC LC-39A, Andøya Spaceport, JSC Houston, Shackleton Base; pose is the site's ENU frame |
-| 40 robots | their facility | m | TAI | 30 s | 10 per facility, random-waypoint roving in a 300 m × 300 m site area |
+| 40 robots | their facility | m | TAI | 30 s | 10 per facility on a shared site layout (300 m × 300 m, a 3 × 3 road grid, a depot): 3 patrol the fence, 3 sweep back and forth over a cell of the road grid, 4 run tours from the depot along the roads |
 | 7 orbiters | IAU_MOON / IAU_MARS / IAU_EARTH | km | TT | 30 or 60 s | LUNA-2/3 (100 km polar), MARS-1 (300 km, 93°), MARS-2 (3,200 × 8,800 km, 75°), LEO-1 (420 km, 51.6°), SSO-1 (700 km, 98.2°), GEO-1 (75° W) |
 | LUNA-1 | IAU_MOON, then Shackleton Base | km | TT | 30 s; 5 s in descent | 100 km polar orbit; deorbits 09-02 12:00, coasts half an ellipse to a 15 km perilune, then a 10 min powered descent onto Shackleton Base, where it reparents at touchdown (13:07) |
 | 2 launches | their pad's facility, then IAU_EARTH | km | TT | 60 s; 5 s in ascent | LAUNCH-A from KSC LC-39A (09-01 14:00, 400 km, 51.6°), LAUNCH-B from Andøya (09-02 18:00, 550 km, 97.6°); a 9 min ascent into an orbit whose plane passes over the pad |
-| 10 crawlers | their host spacecraft | m | TAI | 30 s | hull robots looping a band around the host's 4 × 2 × 2 m hull; CRAWLER-01 steps off LUNA-1 onto Shackleton Base 1 h after touchdown and roves there |
+| 10 crawlers | their host spacecraft | m | TAI | 30 s | hull robots looping a band around the host's 4 × 2 × 2 m hull; CRAWLER-01 steps off LUNA-1 onto Shackleton Base 1 h after touchdown and surveys the grid cell the base's own surveyors leave free |
 | 10 aircraft | IAU_EARTH | km | UTC | 60 s | 2-4 great-circle legs among 15 real airports: climb to 11 km, cruise at 900 km/h, descend, 1.5-3 h turnarounds |
 | 20 ships | IAU_EARTH | km | GPST | 60 s | 8 hand-placed sea lanes (Malacca/Suez, Panama, Cape route, transpacific, transatlantic, …) at 22-40 km/h, docking 8-24 h at each end |
 | 4 bodies | ICRF | km | TAI | 1 h | `append_snapshot` of Sun, Earth, Moon, Mars |
@@ -137,7 +137,7 @@ run on the stored values.
 
 | File | Shows |
 |---|---|
-| `robots_{ksc,and,jsc,shk}.png` | each site's robot tracks in site ENU |
+| `robots_{ksc,and,jsc,shk}.png` | each site's robot rows in site ENU over the road grid, one panel per robot titled with its role; Shackleton's includes CRAWLER-01 after it disembarks |
 | `orbits.png` | every spacecraft body-centred with ICRF axes (x–y and x–z) around Earth, Moon and Mars |
 | `altitudes.png` | altitude around each launch and the landing, resolved through the ledger |
 | `aircraft.png` | aircraft tracks over the land polygons |

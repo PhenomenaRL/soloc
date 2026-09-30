@@ -40,13 +40,28 @@ FACILITY_TIMESCALE = "TAI"
 
 @dataclass(frozen=True)
 class RoverSpec:
-    speed_m_s: tuple[float, float]   # drawn once per leg
-    pause_s: tuple[float, float]     # dwell at each waypoint
+    speed_m_s: tuple[float, float]   # drawn once per robot
+    pause_s: tuple[float, float]     # loading stops (logistics)
     mass_kg: float
 
 
 ROBOTS_PER_FACILITY = 10
-SITE_HALF_WIDTH_M = 150.0            # waypoints lie in a 300 m × 300 m square about the site origin
+SITE_HALF_WIDTH_M = 150.0            # the site is a 300 m × 300 m square about the facility origin
+
+# Site layout, in facility ENU metres. Every site uses the same one.
+# - patrol: laps of the fence, stopping briefly at the corners
+# - survey: back-and-forth sweeps over one cell of the road grid
+# - logistics: tours from the depot to a few road intersections, driving only on the roads
+ROBOT_ROLES = ("patrol",) * 3 + ("survey",) * 3 + ("logistics",) * 4   # by index at the site
+PATROL_FENCE_M = 145.0               # half-width of the outermost patrol lap; each next one is 5 m in
+PATROL_CORNER_PAUSE_S = (5.0, 20.0)
+SITE_ROADS_M = (-100.0, 0.0, 100.0)  # roads run along x and y at these coordinates
+DEPOT_M = (-100.0, -100.0)
+LOGISTICS_STATIONS = (3, 4)          # intersections per tour, inclusive
+SURVEY_INSET_M = 10.0                # sweep area = the road-grid cell inset by this
+SURVEY_ROW_SPACING_M = 10.0
+SURVEY_TURN_PAUSE_S = (3.0, 8.0)
+PATTERN_UNDER_WAY_S = (1800.0, 7200.0)   # how long each robot has been at it by T0
 ROBOT_CADENCE_S = 30
 ROBOT_TIMESCALE = "TAI"
 ROBOT_DIMENSIONS_M = (0.9, 0.6, 0.5)
