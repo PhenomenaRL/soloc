@@ -14,9 +14,12 @@ import numpy as np
 import pyarrow.flight as fl
 
 import scenario as sc
+from models.aircraft import aircraft
 from models.facility import Facility
 from models.robot import Crawler, Robot
+from models.ship import ship
 from models.spacecraft import Spacecraft, lander, launcher, orbiter
+from models.track import Track
 from soloc_client import KIND_ABSTRACT, KIND_SOLOC, SolocClient, registry_ipc, tai_ns_from_utc
 
 
@@ -26,11 +29,14 @@ class Roster:
     spacecraft: list[Spacecraft]
     robots: list[Robot]
     crawlers: list[Crawler]
+    aircraft: list[Track]
+    ships: list[Track]
 
     @property
     def entities(self) -> list:
         """Parents before their children, so a tick's rows are appended in that order."""
-        return [*self.facilities, *self.spacecraft, *self.robots, *self.crawlers]
+        return [*self.facilities, *self.spacecraft, *self.robots, *self.crawlers,
+                *self.aircraft, *self.ships]
 
 
 def roster(seed: int) -> Roster:
@@ -58,7 +64,10 @@ def roster(seed: int) -> Roster:
             disembark = (host.facility, host.events["touchdown"] + sc.DISEMBARK_AFTER_S,
                          sc.ROVERS[host.facility.spec.body.name])
         crawlers.append(Crawler(sc.crawler_name(i), host, seed, disembark))
-    return Roster(facilities, spacecraft, robots, crawlers)
+
+    planes = [aircraft(sc.aircraft_name(i), seed) for i in range(sc.AIRCRAFT)]
+    ships = [ship(sc.ship_name(i), sc.LANES[i % len(sc.LANES)], seed) for i in range(sc.SHIPS)]
+    return Roster(facilities, spacecraft, robots, crawlers, planes, ships)
 
 
 class Sim:

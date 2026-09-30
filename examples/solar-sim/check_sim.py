@@ -15,7 +15,8 @@ import numpy as np
 import pyarrow as pa
 
 import scenario as sc
-from geo import fixed_to_geodetic
+from geo import EARTH, fixed_to_geodetic, geodetic_to_fixed
+from land import CANALS, in_canal, on_land
 from models.robot import HULL_REACH_M
 from models.spacecraft import Orbit
 from run_sim import roster
@@ -93,7 +94,8 @@ def main():
     world = roster(args.seed)
     body_by_id = {b.frame_id: b for b in sc.SNAPSHOT_BODIES}
     fleet_models = {"facilities": world.facilities, "spacecraft": world.spacecraft,
-                    "robots": world.robots, "crawlers": world.crawlers}
+                    "robots": world.robots, "crawlers": world.crawlers,
+                    "aircraft": world.aircraft, "ships": world.ships}
     by_id = {e.id: e for e in world.entities}
 
     d = Data(client)
@@ -163,9 +165,87 @@ def main():
         check_crawlers(d, world)
     if fleets["spacecraft"] or fleets["crawlers"]:
         check_topology(d, world)
+    if fleets["aircraft"]:
+        check_aircraft(d, fleets["aircraft"])
+    if fleets["ships"]:
+        check_ships(d, fleets["ships"])
 
     print(f"\n{results.count(True)}/{len(results)} passed")
     sys.exit(0 if all(results) else 1)
+
+
+# -- aircraft and ships -----------------------------------------------------------------------
+
+
+class Surface:
+    """The stored rows of a set of IAU_EARTH vehicles: geodetic position and ground speed."""
+
+    def __init__(self, d: Data, ids: set[bytes]):
+        self.idx = np.sort(np.concatenate([d.index[i] for i in ids]))
+        self.framed = bool(matches(d.frames[self.idx], EARTH.frame_id).all())
+        self.fixed = d.pos[self.idx]
+        self.lat, self.lon, self.h_km = fixed_to_geodetic(EARTH, self.fixed)
+        v = d.rows.take(pa.array(self.idx)).column("velocity").combine_chunks()
+        v = v.flatten().to_numpy().reshape(-1, 3) / 1000                    # km/s
+        lat, lon = np.radians(self.lat), np.radians(self.lon)
+        up = np.column_stack([np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)])
+        self.speed_km_h = np.linalg.norm(v, axis=1) * 3600
+        self.ground_km_h = np.linalg.norm(v - (v * up).sum(1)[:, None] * up, axis=1) * 3600
+
+    def at_rest(self) -> np.ndarray:
+        return self.speed_km_h < 1e-3 * 3.6          # below 1 mm/s
+
+    def miss_m(self, mask: np.ndarray, places: np.ndarray) -> float:
+        """The farthest the masked rows sit from their nearest place (body-fixed km)."""
+        if not mask.any():
+            return 0.0
+        d = np.linalg.norm(self.fixed[mask][:, None, :] - places[None, :, :], axis=2)
+        return float(d.min(axis=1).max() * 1000)
+
+
+def check_aircraft(d: Data, ids: set[bytes]):
+    s = Surface(d, ids)
+    ground = min(a.h_km for a in sc.AIRPORTS)
+    check("aircraft between the ground and cruise altitude, on IAU_EARTH",
+          s.framed and s.h_km.min() >= ground - 1e-6 and s.h_km.max() <= sc.CRUISE_ALT_KM + 1e-6,
+          f"{len(s.idx):,} rows, h {s.h_km.min() * 1000:.1f} m – {s.h_km.max():.3f} km")
+
+    rest = s.at_rest()
+    fields = np.array([geodetic_to_fixed(EARTH, a.lat_deg, a.lon_deg, a.h_km) for a in sc.AIRPORTS])
+    miss = s.miss_m(rest, fields)
+    check("aircraft at rest only on an airfield", miss <= GROUND_TOLERANCE_M,
+          f"{int(rest.sum()):,} parked rows, max {miss * 1000:.3f} mm from an airport")
+
+    cruise = s.h_km >= sc.CRUISE_ALT_KM - 1e-6
+    g = s.ground_km_h[cruise]
+    check(f"aircraft cruise at {sc.CRUISE_KM_H:.0f} km/h (±1%)",
+          bool(np.all(np.abs(g / sc.CRUISE_KM_H - 1) <= 0.01)),
+          f"{int(cruise.sum()):,} cruise rows, ground speed {g.min():.1f}–{g.max():.1f} km/h")
+
+
+def check_ships(d: Data, ids: set[bytes]):
+    s = Surface(d, ids)
+    worst_h = float(np.abs(s.h_km).max() * 1000)
+    check("ships at sea level on IAU_EARTH", s.framed and worst_h <= 1e-3,
+          f"{len(s.idx):,} rows, max |h| {worst_h * 1000:.3f} mm")
+
+    rest = s.at_rest()
+    lo, hi = sc.SHIP_KM_H
+    g = s.ground_km_h[~rest]
+    check(f"ships under way at {lo:.0f}–{hi:.0f} km/h (±1%)",
+          bool(np.all((g >= lo * 0.99) & (g <= hi * 1.01))),
+          f"{int((~rest).sum()):,} rows, {g.min():.1f}–{g.max():.1f} km/h")
+
+    berths = np.array([geodetic_to_fixed(EARTH, *w, 0.0)
+                       for lane in sc.LANES for w in (lane.waypoints[0], lane.waypoints[-1])])
+    miss = s.miss_m(rest, berths)
+    check("ships at rest only at a berth", miss <= GROUND_TOLERANCE_M,
+          f"{int(rest.sum()):,} docked rows, max {miss * 1000:.3f} mm from a berth")
+
+    wet = ~on_land(s.lat, s.lon)
+    canal = int(in_canal(s.lat, s.lon).sum())
+    check("every ship row is on water (Natural Earth 1:50m land)", bool(wet.all()),
+          f"{int((~wet).sum())} on land; {canal} rows inside the {'/'.join(CANALS)} canal boxes")
 
 
 # -- robots -----------------------------------------------------------------------------------

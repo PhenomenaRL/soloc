@@ -158,3 +158,118 @@ DISEMBARK_OFFSET_M = (3.0, 0.0)      # where it starts roving, in the facility's
 
 def crawler_name(i: int) -> str:
     return f"CRAWLER-{i + 1:02d}"
+
+
+# -- aircraft: IAU_EARTH, km -------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Airport:
+    code: str
+    lat_deg: float
+    lon_deg: float
+    h_km: float                      # field elevation, taken as height above the ellipsoid
+
+
+AIRPORTS = (
+    Airport("JFK", 40.6413, -73.7781, 0.004),
+    Airport("LHR", 51.4700, -0.4543, 0.025),
+    Airport("CDG", 49.0097, 2.5479, 0.119),
+    Airport("FRA", 50.0379, 8.5622, 0.111),
+    Airport("DXB", 25.2532, 55.3657, 0.019),
+    Airport("DEL", 28.5562, 77.1000, 0.237),
+    Airport("SIN", 1.3644, 103.9915, 0.007),
+    Airport("HKG", 22.3080, 113.9185, 0.009),
+    Airport("ICN", 37.4602, 126.4407, 0.007),
+    Airport("HND", 35.5494, 139.7798, 0.006),
+    Airport("SYD", -33.9399, 151.1753, 0.006),
+    Airport("LAX", 33.9416, -118.4085, 0.038),
+    Airport("ORD", 41.9742, -87.9073, 0.205),
+    Airport("GRU", -23.4356, -46.4731, 0.750),
+    Airport("JNB", -26.1367, 28.2411, 1.694),
+)
+
+AIRCRAFT = 10
+AIRCRAFT_CADENCE_S = 60
+AIRCRAFT_TIMESCALE = "UTC"
+AIRCRAFT_MASS_KG = 250_000.0
+AIRCRAFT_DIMENSIONS_M = (64.0, 60.0, 17.0)
+CRUISE_ALT_KM = 11.0
+CRUISE_KM_H = 900.0
+CLIMB_S = 25 * 60                    # speed ramps 0 → cruise while climbing to cruise altitude
+DESCENT_S = 40 * 60                  # and back down to 0 at the destination's elevation
+LEGS_PER_AIRCRAFT = (2, 4)           # inclusive; parked at the last airport after them
+LEG_KM = (1500.0, 14000.0)           # great-circle length of an eligible leg
+TURNAROUND_S = (1.5 * 3600, 3 * 3600)
+FIRST_DEPARTURE_S = (-8 * 3600, 12 * 3600)   # before 0: airborne (or already turned round) at T0
+
+
+def aircraft_name(i: int) -> str:
+    return f"AIR-{i + 1:02d}"
+
+
+# -- ships: IAU_EARTH, km, at sea level ---------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Lane:
+    """A sea lane between two ports: great-circle arcs through the waypoints, which are hand
+    placed to keep every arc on water (check_sim tests this against the land polygons). The
+    first and last waypoints are the ports' berths."""
+    name: str
+    ports: tuple[str, str]
+    waypoints: tuple[tuple[float, float], ...]
+
+
+LANES = (
+    Lane("transpacific", ("Shanghai", "Los Angeles"), (
+        (30.90, 122.60), (30.20, 128.50), (30.00, 130.30), (30.20, 131.50), (32.30, 140.50), (34.20, 145.00),
+        (33.20, -121.00), (33.70, -118.25))),
+    Lane("Asia-Europe via Suez", ("Singapore", "Rotterdam"), (
+        (1.20, 103.85), (1.25, 103.50), (2.20, 101.80), (3.30, 100.60), (5.50, 97.90),
+        (6.20, 95.00), (5.60, 80.60), (12.00, 52.50), (12.60, 43.40), (15.00, 41.80),
+        (20.00, 38.50), (27.35, 34.00), (27.90, 33.60), (28.60, 33.05), (29.30, 32.72),
+        (29.95, 32.57), (31.30, 32.35), (31.80, 32.30), (33.00, 28.00), (36.10, 15.00), (37.35, 11.70), (37.60, 9.50), (37.00, 2.00),
+        (35.95, -5.60), (36.20, -9.50), (43.50, -9.80), (48.50, -5.60), (50.00, -2.00),
+        (51.00, 1.55), (51.98, 4.05))),
+    Lane("transatlantic", ("New York", "Le Havre"), (
+        (40.45, -73.90), (40.40, -73.30), (40.50, -69.00), (49.30, -6.00),
+        (50.00, -1.50), (49.50, 0.00))),
+    Lane("via Panama", ("Los Angeles", "New York"), (
+        (33.70, -118.25), (32.50, -118.00), (28.00, -116.50), (22.00, -110.00),
+        (18.00, -106.00), (15.50, -100.00), (13.50, -94.00), (11.00, -88.00), (8.50, -86.00),
+        (7.00, -82.00), (7.00, -79.80), (8.30, -79.50), (8.88, -79.55),
+        (9.40, -79.92), (10.50, -79.50), (17.50, -75.50), (18.50, -75.00), (19.90, -73.90),
+        (20.20, -73.60), (21.20, -72.70), (22.30, -72.50), (23.00, -72.00), (32.00, -74.00), (37.00, -74.50), (40.40, -73.30), (40.45, -73.90))),
+    Lane("Cape route", ("Santos", "Singapore"), (
+        (-24.05, -46.30), (-35.50, 18.00), (-36.00, 22.00), (-25.00, 58.00),
+        (5.80, 94.50), (6.20, 95.00), (5.50, 97.90), (3.30, 100.60), (2.20, 101.80),
+        (1.25, 103.50), (1.20, 103.85))),
+    Lane("Gulf-Asia tankers", ("Ras Tanura", "Ningbo"), (
+        (26.70, 50.30), (26.90, 51.60), (26.20, 53.50), (26.05, 55.60), (26.55, 56.45),
+        (24.50, 58.80), (22.50, 60.00), (6.50, 76.50),
+        (5.60, 80.60), (6.20, 95.00), (5.50, 97.90), (3.30, 100.60), (2.20, 101.80),
+        (1.25, 103.50), (1.20, 103.85), (1.22, 104.20), (1.45, 104.65), (5.00, 106.00),
+        (12.00, 111.00), (22.00, 117.00), (24.50, 119.50), (28.00, 122.50), (29.75, 122.75))),
+    Lane("transpacific north", ("Busan", "San Francisco"), (
+        (35.00, 129.10), (34.30, 128.80), (32.00, 128.30), (30.00, 130.30), (30.20, 131.50),
+        (32.80, 136.00), (34.50, 141.50), (50.00, -175.00), (37.75, -122.75))),
+    Lane("South America-Europe", ("Santos", "Rotterdam"), (
+        (-24.05, -46.30), (-24.50, -44.00), (-23.50, -41.50), (-20.50, -39.00),
+        (-18.00, -37.50), (-13.00, -37.50), (-8.00, -34.00), (-5.00, -33.50), (0.00, -30.00),
+        (13.00, -26.50), (18.00, -27.00), (29.00, -19.50), (33.50, -18.50), (43.50, -10.00), (48.50, -5.60), (50.00, -2.00), (51.00, 1.55), (51.98, 4.05))),
+)
+
+SHIPS = 20
+SHIP_CADENCE_S = 60
+SHIP_TIMESCALE = "GPST"
+SHIP_MASS_KG = 1.5e8
+SHIP_DIMENSIONS_M = (300.0, 48.0, 30.0)
+SHIP_KM_H = (22.0, 40.0)             # drawn once per ship
+DOCK_S = (8 * 3600, 24 * 3600)
+DOCKED_AT_T0 = 0.3                   # the share of ships that start the window at a berth
+DOCKED_AT_T0_S = (2 * 3600, 20 * 3600)   # how long those still stay
+
+
+def ship_name(i: int) -> str:
+    return f"SHIP-{i + 1:02d}"

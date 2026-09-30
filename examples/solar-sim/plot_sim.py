@@ -14,7 +14,8 @@ import numpy as np
 import pyarrow as pa
 
 import scenario as sc
-from geo import EARTH, MARS, MOON, fixed_to_geodetic
+from geo import EARTH, MARS, MOON, GreatCircle, fixed_to_geodetic
+from land import CANALS, outlines
 from run_sim import roster
 from soloc_client import (CENTURY_NS, SolocClient, id_bytes, matches, positions, sts_field,
                           tai_ns_from_utc)
@@ -155,6 +156,75 @@ def plot_altitudes(client, rows, ids, t_s, spacecraft, out_dir: Path) -> Path | 
     return path
 
 
+def _geodetic(rows: pa.Table) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return fixed_to_geodetic(EARTH, positions(rows))
+
+
+def _unwrapped(lon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Breaks a track where it crosses the antimeridian, so it isn't drawn across the map."""
+    jump = np.flatnonzero(np.abs(np.diff(lon)) > 180) + 1
+    return np.insert(lon, jump, np.nan), np.insert(lat, jump, np.nan)
+
+
+def plot_tracks(rows, ids, t_s, fleet, title: str, out_dir: Path, filename: str,
+                routes=(), canals: bool = False) -> Path:
+    """Stored tracks over 3 days on a lon/lat map with the land polygons: one hue for every
+    track (there are more vehicles than categorical slots), a dot and name at each T0 position.
+    `routes` (GreatCircles) are drawn faintly underneath, and `canals` outlines the canal boxes."""
+    fig, ax = plt.subplots(figsize=(16, 6.8), layout="constrained")
+    for ring in outlines():
+        ax.fill(ring[:, 0], ring[:, 1], color=BODY_FILL, linewidth=0)
+    for route in routes:
+        lat, lon = np.array([route.at(s) for s in np.arange(0, route.length_km, 20.0)]).T
+        ax.plot(*_unwrapped(lon, lat), color=INK_MUTED, linewidth=0.6, linestyle=":")
+    for la0, la1, lo0, lo1 in CANALS.values() if canals else ():
+        ax.add_patch(plt.Rectangle((lo0, la0), lo1 - lo0, la1 - la0, fill=False,
+                                   edgecolor=INK_MUTED, linewidth=0.6))
+    for v in fleet:
+        mask = matches(ids, v.id)
+        lat, lon, _ = _geodetic(rows.filter(pa.array(mask)))
+        order = np.argsort(t_s[mask])
+        lat, lon = lat[order], lon[order]
+        ax.plot(*_unwrapped(lon, lat), color=TRACK, linewidth=0.9)
+        ax.plot(lon[0], lat[0], "o", color=MARK, markersize=4)
+        ax.annotate(v.name, (lon[0], lat[0]), xytext=(4, 3), textcoords="offset points",
+                    fontsize=7, color="#3d3c37")
+    ax.set_xlim(-180, 180)
+    ax.set_ylim(-60, 75)
+    ax.set_aspect("equal")
+    ax.set_xlabel("longitude (°)", fontsize=8)
+    ax.set_ylabel("latitude (°)", fontsize=8)
+    style(ax)
+    ax.set_title(title, fontsize=11)
+    path = out_dir / filename
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path
+
+
+def plot_flight_altitudes(rows, ids, t_s, fleet, out_dir: Path) -> Path:
+    """Stored altitude over the 3 days, one panel per aircraft."""
+    cols = 5
+    fig, axes = plt.subplots(2, cols, figsize=(3.2 * cols, 5.6), sharex=True, sharey=True,
+                             layout="constrained")
+    for ax, v in zip(axes.flat, fleet):
+        mask = matches(ids, v.id)
+        _, _, h = _geodetic(rows.filter(pa.array(mask)))
+        order = np.argsort(t_s[mask])
+        ax.plot(t_s[mask][order] / 3600, h[order], color=TRACK, linewidth=1.0)
+        ax.set_title(v.name, fontsize=9)
+        style(ax)
+    for ax in axes[-1]:
+        ax.set_xlabel("hours from T0", fontsize=8)
+    for ax in axes[:, 0]:
+        ax.set_ylabel("altitude (km)", fontsize=8)
+    fig.suptitle("Aircraft altitude over 3 days (flat at field elevation = parked)", fontsize=11)
+    path = out_dir / "flight_altitudes.png"
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("path")
@@ -181,6 +251,16 @@ def main():
     if present & {c.id for c in world.spacecraft}:
         print(plot_orbits(client, rows, ids, frames, world.spacecraft, out_dir))
         print(plot_altitudes(client, rows, ids, t_s, world.spacecraft, out_dir))
+    planes = [v for v in world.aircraft if v.id in present]
+    if planes:
+        print(plot_tracks(rows, ids, t_s, planes, "Aircraft tracks over 3 days (dot = position at T0)",
+                          out_dir, "aircraft.png"))
+        print(plot_flight_altitudes(rows, ids, t_s, planes, out_dir))
+    ships = [v for v in world.ships if v.id in present]
+    if ships:
+        print(plot_tracks(rows, ids, t_s, ships, "Ship tracks over 3 days (dot = position at T0; "
+                          "dotted = full lanes; boxes = canal exemptions)", out_dir, "ships.png",
+                          routes=[GreatCircle(lane.waypoints) for lane in sc.LANES], canals=True))
 
 
 if __name__ == "__main__":

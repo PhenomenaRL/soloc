@@ -1,15 +1,15 @@
 # solar-sim
 
 A Python-driven, 3-day solar-system simulation that writes a soloc ledger through
-`soloc-server` over Arrow Flight. Work in progress: steps 1-2 (facilities, facility robots,
-spacecraft with their hull crawlers, the driver and its checks) exist so far.
+`soloc-server` over Arrow Flight. Work in progress: steps 1-3 (facilities, facility robots,
+spacecraft with their hull crawlers, aircraft, ships, the driver and its checks) exist so far.
 
 ## Setup (once)
 
 From `examples/solar-sim/`:
 
 ```bash
-./fetch_kernels.sh                  # de440s, mar099s, pck11 into kernels/ (~96 MB)
+./fetch_kernels.sh                  # de440s, mar099s, pck11 + Natural Earth land into kernels/ (~98 MB)
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
@@ -71,16 +71,23 @@ readers take `--seed` (default 7), which must match between them.
 | LUNA-1 | 100 km polar lunar orbit; deorbits 09-02 12:00, coasts half an ellipse to a 15 km perilune, then a 10 min powered descent onto Shackleton Base, where it reparents at touchdown (13:07) |
 | 2 launches | LAUNCH-A from KSC LC-39A (09-01 14:00, 400 km, 51.6°) and LAUNCH-B from Andøya (09-02 18:00, 550 km, 97.6°): framed on the pad's facility until liftoff, then a 9 min ascent on IAU_EARTH into an orbit whose plane passes over the pad |
 | 10 crawlers | hull robots looping a band around their host's 4 × 2 × 2 m hull, in the host's body frame (m); every lander carries at least one, and its first steps off onto the site 1 h after touchdown and roves there |
+| 10 aircraft | 2-4 great-circle legs each among 15 real airports: speed ramps to 900 km/h while climbing to 11 km, then back to 0 on the descent; 1.5-3 h turnarounds parked at the field; IAU_EARTH, km, UTC, 60 s rows |
+| 20 ships | 8 hand-placed sea lanes (transpacific ×2, Asia-Europe via Malacca/Suez, transatlantic, via Panama, Cape route, Gulf-Asia tankers, South America-Europe) at 22-40 km/h, docking 8-24 h at each end port; IAU_EARTH at sea level, km, GPST, 60 s rows |
 | 4 bodies | hourly `append_snapshot` of Sun, Earth, Moon, Mars |
 
 Spacecraft report every 60 s, or every 30 s when they carry crawlers (a crawler's epochs must
 be a subset of its moving host's), and every 5 s during an ascent or from deorbit to touchdown.
+At T0 some aircraft are airborne and some parked, and some ships are under way and some berthed.
+
+Aircraft and ship attitudes are forward-right-down along the direction of travel. The lanes are
+checked against Natural Earth 1:50m land (`land.py`); at that scale the Suez and Panama canals
+are land, so rows inside the canal boxes in `land.CANALS` are exempt.
 
 `check_sim.py` checks only the fleets present in the file:
 
 | Check | What it confirms |
 |---|---|
-| roster | `current_state` holds every facility, spacecraft, robot, crawler and body, and nothing else |
+| roster | `current_state` holds every facility, spacecraft, robot, crawler, aircraft, ship and body, and nothing else |
 | names | the `.names.arrow` sibling reloaded a name for every sim entity |
 | units / timescale | only `km`/`m` stored, every row normalised to TAI |
 | schedule | each entity's stored epochs are exactly its model's schedule |
@@ -95,9 +102,13 @@ be a subset of its moving host's), and every 5 s during an ascent or from deorbi
 | crawlers | on the hull in the stored frame, and within hull reach of the host once both are resolved to the body frame |
 | disembark | the crawler is framed on the facility afterwards, at ground level inside the site |
 | topology | the parent changes are exactly the 2 launches, the landing and the disembark |
+| aircraft | every row between the lowest field and cruise altitude; at rest only on an airfield; 900 km/h (±1%) ground speed at cruise altitude |
+| ships | at sea level; 22-40 km/h (±1%) under way; at rest only at a berth; every row on water |
 
 `plot_sim.py` draws robot tracks per site, the spacecraft body-centred with ICRF axes
-(`orbits.png`), and altitude around each launch and the landing (`altitudes.png`).
+(`orbits.png`), altitude around each launch and the landing (`altitudes.png`), aircraft and
+ship tracks over the land polygons (`aircraft.png`, `ships.png`, the latter with every full lane
+dotted), and each aircraft's altitude over the 3 days (`flight_altitudes.png`).
 
 `scenario.py` holds the roster and every schedule; the models live in `models/`.
 

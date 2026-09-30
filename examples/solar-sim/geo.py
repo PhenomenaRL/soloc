@@ -218,6 +218,53 @@ def lvlh(normal: np.ndarray, r: np.ndarray) -> np.ndarray:
     return np.column_stack([np.cross(y, z), y, z])
 
 
+def frd(lat_deg: float, lon_deg: float, heading_rad: float, pitch_rad: float = 0.0) -> np.ndarray:
+    """Vehicle axes as columns in body-fixed axes: x forward along `heading` (clockwise from
+    north) climbing at `pitch`, y to the right, z down (forward-right-down, as aircraft and
+    ships use)."""
+    sh, ch, sp, cp = math.sin(heading_rad), math.cos(heading_rad), math.sin(pitch_rad), math.cos(pitch_rad)
+    fwd = np.array([sh * cp, ch * cp, sp])
+    right = np.array([ch, -sh, 0.0])
+    return enu_basis(lat_deg, lon_deg) @ np.column_stack([fwd, right, np.cross(fwd, right)])
+
+
+TRACK_RADIUS_KM = 6371.0   # the sphere great-circle track lengths are measured on
+
+
+def _unit(lat_deg: float, lon_deg: float) -> np.ndarray:
+    lat, lon = math.radians(lat_deg), math.radians(lon_deg)
+    return np.array([math.cos(lat) * math.cos(lon), math.cos(lat) * math.sin(lon), math.sin(lat)])
+
+
+class GreatCircle:
+    """A polyline of great-circle arcs through `(lat, lon)` waypoints (degrees), measured on a
+    sphere of `TRACK_RADIUS_KM`. The latitudes it returns are placed on the WGS84 ellipsoid as
+    geodetic ones, which is how the waypoints were read off a map in the first place."""
+
+    def __init__(self, waypoints):
+        self.waypoints = tuple(waypoints)
+        self.u = [_unit(*w) for w in self.waypoints]
+        arcs = [math.acos(float(np.clip(a @ b, -1, 1))) for a, b in zip(self.u, self.u[1:])]
+        self.cum_km = np.concatenate([[0.0], np.cumsum(arcs)]) * TRACK_RADIUS_KM
+
+    @property
+    def length_km(self) -> float:
+        return float(self.cum_km[-1])
+
+    def reversed(self) -> "GreatCircle":
+        return GreatCircle(self.waypoints[::-1])
+
+    def at(self, s_km: float) -> tuple[float, float]:
+        """`(lat, lon)` at `s_km` along the track, clamped to its ends."""
+        s = min(max(s_km, 0.0), self.length_km)
+        k = min(int(np.searchsorted(self.cum_km, s, side="right")) - 1, len(self.u) - 2)
+        a, b = self.u[k], self.u[k + 1]
+        omega = (self.cum_km[k + 1] - self.cum_km[k]) / TRACK_RADIUS_KM
+        f = (s - self.cum_km[k]) / (self.cum_km[k + 1] - self.cum_km[k])
+        u = (math.sin((1 - f) * omega) * a + math.sin(f * omega) * b) / math.sin(omega)
+        return math.degrees(math.asin(u[2])), math.degrees(math.atan2(u[1], u[0]))
+
+
 def _hermite(s: float) -> tuple[np.ndarray, np.ndarray]:
     """Cubic Hermite basis `(h00, h10, h01, h11)` and its derivative in `s`."""
     s2, s3 = s * s, s * s * s
