@@ -317,7 +317,7 @@ export class Viewer {
           node.group.add(new PointLight(0xfff2d5, 2.5, 0, 0));
           own.add(makeSunGlow(r));
         }
-        if (key === "SATURN_BARYCENTER") {
+        if (key === "SATURN_BARYCENTER" || key === "Saturn") {
           void makeSaturnRings(r).then((rings) => rings && own.add(rings));
         }
         if (key === "Earth") {

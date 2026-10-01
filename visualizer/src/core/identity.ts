@@ -83,6 +83,107 @@ export function kindOfIdString(id: string): number {
 }
 
 /**
+ * Mirrors `spacetimestamp::ephemeris::ASTRO_FRAMES` (Rust) — the canonical
+ * `(ephemeris_id, orientation_id)` → name table for astronomical ids.
+ *
+ * Used only as a *fallback* when an astronomical id has no registry entry: the
+ * pair is baked straight into the id's own bytes (see {@link astroFrameOf}),
+ * so a name can still be recovered even when whatever wrote the ledger forgot
+ * to call the equivalent of `register_name` for it. First match wins, same as
+ * the Rust `frame_name()` this is a reading of — that is what makes a
+ * body-fixed pair like `(399, 399)` resolve to the bare `"Earth"` rather than
+ * `"IAU_EARTH"`.
+ */
+const ASTRO_FRAMES: ReadonlyArray<readonly [string, number, number]> = [
+  ["ICRF", 0, 1],
+  ["J2000", 0, 1],
+  ["SSB", 0, 1],
+  ["GCRF", 399, 1],
+  ["EME2000", 399, 1],
+  ["EMB", 3, 1],
+  ["MERCURY_BARYCENTER", 1, 1],
+  ["VENUS_BARYCENTER", 2, 1],
+  ["MARS_BARYCENTER", 4, 1],
+  ["JUPITER_BARYCENTER", 5, 1],
+  ["SATURN_BARYCENTER", 6, 1],
+  ["URANUS_BARYCENTER", 7, 1],
+  ["NEPTUNE_BARYCENTER", 8, 1],
+  ["PLUTO_BARYCENTER", 9, 1],
+  ["Sun", 10, 10],
+  ["Mercury", 199, 199],
+  ["Venus", 299, 299],
+  ["Earth", 399, 399],
+  ["Moon", 301, 301],
+  ["Mars", 499, 499],
+  ["Jupiter", 599, 599],
+  ["Saturn", 699, 699],
+  ["Uranus", 799, 799],
+  ["Neptune", 899, 899],
+  ["Pluto", 999, 1],
+  ["Phobos", 401, 1],
+  ["Deimos", 402, 1],
+  ["Io", 501, 1],
+  ["Europa", 502, 1],
+  ["Ganymede", 503, 1],
+  ["Callisto", 504, 1],
+  ["Titan", 606, 1],
+  ["Enceladus", 602, 1],
+  ["IAU_SUN", 10, 10],
+  ["IAU_MERCURY", 199, 199],
+  ["IAU_VENUS", 299, 299],
+  ["IAU_EARTH", 399, 399],
+  ["IAU_MOON", 301, 301],
+  ["IAU_MARS", 499, 499],
+  ["IAU_JUPITER", 599, 599],
+  ["IAU_SATURN", 699, 699],
+  ["IAU_NEPTUNE", 899, 899],
+  ["IAU_URANUS", 799, 799],
+  ["IAU_PLUTO", 999, 999],
+  ["IAU_CHARON", 901, 901],
+  ["IAU_PHOBOS", 401, 401],
+  ["IAU_DEIMOS", 402, 402],
+  ["IAU_IO", 501, 501],
+  ["IAU_EUROPA", 502, 502],
+  ["IAU_GANYMEDE", 503, 503],
+  ["IAU_CALLISTO", 504, 504],
+  ["IAU_MIMAS", 601, 601],
+  ["IAU_ENCELADUS", 602, 602],
+  ["IAU_TETHYS", 603, 603],
+  ["IAU_DIONE", 604, 604],
+  ["IAU_RHEA", 605, 605],
+  ["IAU_TITAN", 606, 606],
+  ["IAU_IAPETUS", 608, 608],
+  ["IAU_ARIEL", 701, 701],
+  ["IAU_UMBRIEL", 702, 702],
+  ["IAU_TITANIA", 703, 703],
+  ["IAU_OBERON", 704, 704],
+  ["IAU_MIRANDA", 705, 705],
+  ["IAU_TRITON", 801, 801],
+];
+
+/**
+ * Reverse of `PrescribedId::astronomical` — recovers `(ephemeris_id,
+ * orientation_id)` straight from an id's own bytes, no registry lookup
+ * needed. `null` if `id` isn't a well-formed 16-byte id.
+ */
+export function astroFrameOf(id: string): { ephemerisId: number; orientationId: number } | null {
+  const hex = id.replace(/-/g, "");
+  if (hex.length !== ID_BYTES * 2) return null;
+  // bytes[0..4] and bytes[9..13], big-endian i32 — see `PrescribedId::astronomical`.
+  const ephemerisId = Number.parseInt(hex.slice(0, 8), 16) | 0;
+  const orientationId = Number.parseInt(hex.slice(18, 26), 16) | 0;
+  return { ephemerisId, orientationId };
+}
+
+/** The canonical frame name for `(ephemerisId, orientationId)`, or `undefined` if unrecognised. */
+export function astroFrameName(ephemerisId: number, orientationId: number): string | undefined {
+  for (const [name, e, o] of ASTRO_FRAMES) {
+    if (e === ephemerisId && o === orientationId) return name;
+  }
+  return undefined;
+}
+
+/**
  * Display names for prescribed ids — the browser half of
  * `spacetimestamp::identity::NameRegistry`.
  *
@@ -135,9 +236,28 @@ export class NameBook {
     return this.entries.get(id);
   }
 
-  /** What a human should read: the registered common name, else the id itself. */
+  /**
+   * Recovers a display name straight from an unregistered astronomical id's
+   * own bytes — the `(ephemeris_id, orientation_id)` pair baked in by
+   * `PrescribedId::astronomical`, decoded the same way
+   * `spacetimestamp::ephemeris::frame_name` would. Only consulted when
+   * nothing was registered for `id`; a real registry entry always wins.
+   */
+  private fallbackAstroName(id: string): string | undefined {
+    if (kindOfIdString(id) !== KIND_ASTRO) return undefined;
+    const frame = astroFrameOf(id);
+    return frame ? astroFrameName(frame.ephemerisId, frame.orientationId) : undefined;
+  }
+
+  /**
+   * What a human should read: the registered common name, else a name
+   * recovered straight from the id's own bytes for an unregistered
+   * astronomical body, else the id itself.
+   */
   label(id: string): string {
-    return this.entries.get(id)?.commonName ?? id;
+    const e = this.entries.get(id);
+    if (e) return e.commonName;
+    return this.fallbackAstroName(id) ?? id;
   }
 
   /**
@@ -150,7 +270,7 @@ export class NameBook {
    */
   key(id: string): string {
     const e = this.entries.get(id);
-    if (!e) return id;
+    if (!e) return this.fallbackAstroName(id) ?? id;
     return e.kind === KIND_ASTRO ? e.commonName : `${e.authority}:${e.commonName}`;
   }
 

@@ -32,11 +32,21 @@ const KNOWN: Record<string, DisplayInfo> = {
   Mercury: { label: "Mercury", color: "#b5a79b", bodyRadiusKm: 2_440, kind: "planet" },
   Venus: { label: "Venus", color: "#e6c98f", bodyRadiusKm: 6_052, kind: "planet" },
   Earth: { label: "Earth", color: "#5aa9ff", bodyRadiusKm: 6_371, kind: "planet" },
+  // Barycenter entries are what the base DE440s kernels carry for these five
+  // (see gen_visualizer_fixture); the bare names below are the same body
+  // *centre*, for a ledger built against a satellite SPK that actually has one
+  // (`mar097.bsp` and friends) — same radius and color, real position instead
+  // of the barycentre offset.
   MARS_BARYCENTER: { label: "Mars", color: "#e07b5a", bodyRadiusKm: 3_390, kind: "planet" },
+  Mars: { label: "Mars", color: "#e07b5a", bodyRadiusKm: 3_390, kind: "planet" },
   JUPITER_BARYCENTER: { label: "Jupiter", color: "#d9a87c", bodyRadiusKm: 69_911, kind: "planet" },
+  Jupiter: { label: "Jupiter", color: "#d9a87c", bodyRadiusKm: 69_911, kind: "planet" },
   SATURN_BARYCENTER: { label: "Saturn", color: "#e3cf9e", bodyRadiusKm: 58_232, kind: "planet" },
+  Saturn: { label: "Saturn", color: "#e3cf9e", bodyRadiusKm: 58_232, kind: "planet" },
   URANUS_BARYCENTER: { label: "Uranus", color: "#9fd8e0", bodyRadiusKm: 25_362, kind: "planet" },
+  Uranus: { label: "Uranus", color: "#9fd8e0", bodyRadiusKm: 25_362, kind: "planet" },
   NEPTUNE_BARYCENTER: { label: "Neptune", color: "#6f8fe8", bodyRadiusKm: 24_622, kind: "planet" },
+  Neptune: { label: "Neptune", color: "#6f8fe8", bodyRadiusKm: 24_622, kind: "planet" },
   Moon: { label: "Moon", color: "#c8c8c8", bodyRadiusKm: 1_737, kind: "moon" },
   "demo:asteroid-1": {
     label: "Asteroid 1", color: "#b48ead", bodyRadiusKm: 0.04, focusDistKm: 3, kind: "asset",
