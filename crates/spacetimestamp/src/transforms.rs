@@ -258,8 +258,23 @@ pub fn transform_batch(
 
     // Only the spacetimestamp struct column is replaced; every other column passes through,
     // and the caller reprojects those if needed.
+    // The field takes the type of the struct actually built, which can differ from the
+    // input's in field metadata alone (pyarrow adds an empty `ARROW:extension:metadata`).
+    let sts = sts_builder.finish_as_struct();
+    let mut fields = schema.fields().to_vec();
+    fields[col_idx] = Arc::new(
+        fields[col_idx]
+            .as_ref()
+            .clone()
+            .with_data_type(sts.data_type().clone()),
+    );
+    let schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ));
+
     let mut final_columns = batch.columns().to_vec();
-    final_columns[col_idx] = Arc::new(sts_builder.finish_as_struct());
+    final_columns[col_idx] = Arc::new(sts);
 
     RecordBatch::try_new(schema, final_columns).map_err(|e| format!("Batch rebuild error: {e}"))
 }
@@ -652,6 +667,49 @@ mod tests {
             "expected 1.0 km, got {}",
             pos[0]
         );
+    }
+
+    /// A batch whose struct fields differ from the canonical ones only in metadata, as pyarrow
+    /// writes `arrow.uuid` fields, must still transform.
+    #[test]
+    fn test_transform_accepts_struct_fields_with_extra_metadata() {
+        let mut builder = SpaceTimestampBuilder::new(1);
+        builder.append_spacetimestamp(
+            PrescribedId::astronomical_from_name("Earth").unwrap(),
+            LengthUnit::km,
+            TimeScaleCode::TAI,
+            source(),
+            EstimateType::MEASURED,
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            0,
+            0,
+            None,
+            None,
+        );
+        let canonical = builder.finish_as_struct();
+        let fields: Vec<Field> = canonical
+            .fields()
+            .iter()
+            .map(|f| {
+                let mut metadata = f.metadata().clone();
+                if !metadata.contains_key("ARROW:extension:metadata") {
+                    metadata.insert("ARROW:extension:metadata", "");
+                }
+                f.as_ref().clone().with_metadata(metadata)
+            })
+            .collect();
+        let sts = StructArray::try_new(fields.into(), canonical.columns().to_vec(), None).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "spacetimestamp",
+            sts.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(sts)]).unwrap();
+
+        let result = transform_batch(&batch, "Earth", &Almanac::default(), LengthUnit::km, None)
+            .expect("metadata alone must not fail the rebuild");
+        assert_eq!(read_output_pos(&result, 0), [1.0, 0.0, 0.0]);
     }
 
     // -----------------------------------------------------------------------
