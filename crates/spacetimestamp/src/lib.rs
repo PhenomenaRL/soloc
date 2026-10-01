@@ -28,6 +28,8 @@
 //! `tests/standalone_workflow.rs` demonstrates the same pipeline without it.
 
 pub mod ephemeris;
+pub mod geodesy;
+pub mod gps;
 pub mod identity;
 pub mod ipc;
 pub mod query;
