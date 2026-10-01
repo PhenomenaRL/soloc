@@ -7,11 +7,11 @@ the lane (as if it had departed earlier).
 
 import math
 
-from geo import GreatCircle
-from models.robot import own_rng
-from models.track import Stay, Track, course_rad
-from scenario import (DOCK_S, DOCKED_AT_T0, DOCKED_AT_T0_S, DURATION_S, SHIP_CADENCE_S,
-                      SHIP_DIMENSIONS_M, SHIP_KM_H, SHIP_MASS_KG, SHIP_TIMESCALE, Lane)
+from sim.geo import GreatCircle
+from sim.models.robot import own_rng
+from sim.models.track import Stay, Track, course_rad
+from sim.scenario import (DOCK_S, DOCKED_AT_T0, DOCKED_AT_T0_S, DURATION_S, SHIP_CADENCE_S,
+                          SHIP_DIMENSIONS_M, SHIP_KM_H, SHIP_MASS_KG, SHIP_TIMESCALE, Lane)
 
 
 class Sail:

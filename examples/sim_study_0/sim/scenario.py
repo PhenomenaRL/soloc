@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 
-from geo import EARTH, MARS, MOON, SUN, Body
+from sim.geo import EARTH, MARS, MOON, SUN, Body
 
 AUTHORITY = "sim.soloc"
 SEED = 7
@@ -249,7 +249,7 @@ HORIZONS_SOURCE = "horizons"
 
 
 def horizons_file(spec: ProbeSpec) -> str:
-    """Where fetch_horizons.py saves the probe's table, under kernels/."""
+    """Where fetch_horizons.py saves the probe's table, under data/."""
     return f"horizons_{spec.horizons_id.lstrip('-')}.txt"
 
 

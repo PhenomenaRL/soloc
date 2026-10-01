@@ -7,9 +7,9 @@ parent. Astronomical frames are roots; the ledger hands them to anise rather tha
 into their own rows, so the snapshot bodies show up twice: as entities under ICRF, and as
 the IAU_* root that surface sites hang from.
 
-    python topo_sim.py out/solar_sim.arrow                    # tree at the last epoch + events
-    python topo_sim.py out/solar_sim.arrow --at 2026-09-02T12:00:00
-    python topo_sim.py out/solar_sim.arrow --server grpc://localhost:50051   # also cross-check export_topology
+    python -m tools.topo_sim out/sim_study_0.arrow            # tree at the last epoch + events
+    python -m tools.topo_sim out/sim_study_0.arrow --at 2026-09-02T12:00:00
+    python -m tools.topo_sim out/sim_study_0.arrow --server grpc://localhost:50051   # also cross-check export_topology
 """
 
 import argparse
@@ -22,7 +22,7 @@ import pyarrow as pa
 import pyarrow.flight as fl
 
 from soloc_client import CENTURY_NS, SolocClient, id_bytes, sts_field, tai_ns_from_utc
-from view_sim import astro_pair, label, load, utc
+from tools.view_sim import astro_pair, label, load, utc
 
 
 def events_from_rows(table: pa.Table) -> tuple[list[tuple[bytes, bytes, int]], dict]:

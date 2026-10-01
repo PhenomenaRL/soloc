@@ -1,0 +1,6 @@
+.venv/
+data/
+out/
+__pycache__/
+*.pyc
+quickstart.arrow*

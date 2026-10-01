@@ -14,16 +14,16 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 
-import scenario as sc
-from ephemeris import Ephemeris
-from geo import EARTH, GCRF, ICRF, SUN, fixed_to_geodetic, geodetic_to_fixed
-from land import CANALS, in_canal, on_land
-from models.robot import HULL_REACH_M
-from models.spacecraft import Orbit
-from run_sim import roster
+from sim import scenario as sc
+from sim.ephemeris import Ephemeris
+from sim.geo import EARTH, GCRF, ICRF, SUN, fixed_to_geodetic, geodetic_to_fixed
+from sim.land import CANALS, in_canal, on_land
+from sim.models.robot import HULL_REACH_M
+from sim.models.spacecraft import Orbit
+from sim.roster import roster
 from soloc_client import (CENTURY_NS, SolocClient, id_bytes, matches, positions, sts_field,
                           tai_ns_from_utc, vocabulary)
-from topo_sim import events_from_rows
+from tools.topo_sim import events_from_rows
 
 GROUND_TOLERANCE_M = 1.0
 SPOT_CHECK_HOURS = tuple(range(0, sc.DURATION_S // 3600 + 1, 24))

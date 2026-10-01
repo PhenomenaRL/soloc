@@ -8,13 +8,13 @@ ramps are smoothsteps, so the climb and descent angles fall to zero at the top a
 
 import math
 
-from geo import GreatCircle
-from models.robot import own_rng
-from models.track import Stay, Track, course_rad
-from scenario import (AIRCRAFT_CADENCE_S, AIRCRAFT_DIMENSIONS_M, AIRCRAFT_MASS_KG,
-                      AIRCRAFT_TIMESCALE, AIRPORTS, CLIMB_S, CRUISE_ALT_KM, CRUISE_KM_H,
-                      DESCENT_S, FIRST_DEPARTURE_S, LEG_KM, LEGS_PER_AIRCRAFT, TURNAROUND_S,
-                      Airport)
+from sim.geo import GreatCircle
+from sim.models.robot import own_rng
+from sim.models.track import Stay, Track, course_rad
+from sim.scenario import (AIRCRAFT_CADENCE_S, AIRCRAFT_DIMENSIONS_M, AIRCRAFT_MASS_KG,
+                          AIRCRAFT_TIMESCALE, AIRPORTS, CLIMB_S, CRUISE_ALT_KM, CRUISE_KM_H,
+                          DESCENT_S, FIRST_DEPARTURE_S, LEG_KM, LEGS_PER_AIRCRAFT, TURNAROUND_S,
+                          Airport)
 
 CRUISE_KM_S = CRUISE_KM_H / 3600
 

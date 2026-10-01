@@ -14,13 +14,13 @@ import math
 
 import numpy as np
 
-from geo import (GCRF, ICRF, SUN, Conic, Frame, Kepler, RadialHermite, lambert, lvlh,
-                 matrix_from_quat, plane_through, quat_from_matrix, spin)
-from models import Row
-from models.facility import Spot
-from scenario import (AUTHORITY, DURATION_S, HOST_CADENCE_S, MANOEUVRE_CADENCE_S, MOON_SOI_KM,
-                      SPACECRAFT_CADENCE_S, SPACECRAFT_DIMENSIONS_M, SPACECRAFT_TIMESCALE,
-                      LanderSpec, LaunchSpec, MoonshotSpec, OrbiterSpec, TransferSpec, seconds)
+from sim.geo import (GCRF, ICRF, SUN, Conic, Frame, Kepler, RadialHermite, lambert, lvlh,
+                     matrix_from_quat, plane_through, quat_from_matrix, spin)
+from sim.models import Row
+from sim.models.facility import Spot
+from sim.scenario import (AUTHORITY, DURATION_S, HOST_CADENCE_S, MANOEUVRE_CADENCE_S, MOON_SOI_KM,
+                          SPACECRAFT_CADENCE_S, SPACECRAFT_DIMENSIONS_M, SPACECRAFT_TIMESCALE,
+                          LanderSpec, LaunchSpec, MoonshotSpec, OrbiterSpec, TransferSpec, seconds)
 from soloc_client import KIND_SOLOC, mint
 
 ZERO = np.zeros(3)

@@ -11,13 +11,13 @@ from pathlib import Path
 
 import numpy as np
 
-from geo import ICRF, SUN, lvlh, quat_from_matrix
-from models import Row
-from scenario import (AUTHORITY, DURATION_S, HORIZONS_AUTHORITY, HORIZONS_SOURCE, PROBE_CADENCE_S,
-                      PROBE_TIMESCALE, T0, ProbeSpec, horizons_file)
+from sim import DATA
+from sim.geo import ICRF, SUN, lvlh, quat_from_matrix
+from sim.models import Row
+from sim.scenario import (AUTHORITY, DURATION_S, HORIZONS_AUTHORITY, HORIZONS_SOURCE,
+                          PROBE_CADENCE_S, PROBE_TIMESCALE, T0, ProbeSpec, horizons_file)
 from soloc_client import KIND_ABSTRACT, KIND_SOLOC, mint
 
-KERNELS = Path(__file__).parent.parent / "kernels"
 HORIZONS_ID = mint(KIND_ABSTRACT, HORIZONS_AUTHORITY, HORIZONS_SOURCE)
 
 
@@ -54,7 +54,7 @@ class Probe:
         self.name = spec.name
         self.id = mint(KIND_SOLOC, AUTHORITY, spec.name)
         self.spec = spec
-        path = KERNELS / horizons_file(spec)
+        path = DATA / horizons_file(spec)
         if not path.exists() or not covers(load_horizons(path)[0]):
             raise SystemExit(f"{path} is missing or does not cover the window; "
                              "run `python fetch_horizons.py`")

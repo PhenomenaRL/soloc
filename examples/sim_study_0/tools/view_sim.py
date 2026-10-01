@@ -1,11 +1,11 @@
 """Prints a saved sim ledger as a readable table, decoded: ids as names, vocabulary codes as
 tokens, epochs as UTC. Reads the file directly; no server needed.
 
-    python view_sim.py out/solar_sim.arrow                        # first 20 rows
-    python view_sim.py out/solar_sim.arrow --entity AND-R03 --limit 10
-    python view_sim.py out/solar_sim.arrow --entity shackleton --tail 5
-    python view_sim.py out/solar_sim.arrow --summary              # one line per entity
-    python view_sim.py out/solar_sim.arrow --schema
+    python -m tools.view_sim out/sim_study_0.arrow                # first 20 rows
+    python -m tools.view_sim out/sim_study_0.arrow --entity AND-R03 --limit 10
+    python -m tools.view_sim out/sim_study_0.arrow --entity shackleton --tail --limit 5
+    python -m tools.view_sim out/sim_study_0.arrow --summary      # one line per entity
+    python -m tools.view_sim out/sim_study_0.arrow --schema
 """
 
 import argparse
@@ -15,7 +15,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from geo import EARTH, MARS, MOON, SUN
+from sim.geo import EARTH, MARS, MOON, SUN
 from soloc_client import (CENTURY_NS, J2000, KIND_ABSTRACT, KIND_ASTRO, TAI_MINUS_UTC_S, id_bytes,
                           mint, sts_field, vocabulary)
 

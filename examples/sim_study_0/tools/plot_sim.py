@@ -14,11 +14,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pyarrow as pa
 
-import scenario as sc
-from ephemeris import Ephemeris
-from geo import EARTH, GCRF, MARS, MOON, SUN, GreatCircle, fixed_to_geodetic
-from land import CANALS, outlines
-from run_sim import roster
+from sim import scenario as sc
+from sim.ephemeris import Ephemeris
+from sim.geo import EARTH, GCRF, MARS, MOON, SUN, GreatCircle, fixed_to_geodetic
+from sim.land import CANALS, outlines
+from sim.roster import roster
 from soloc_client import (CENTURY_NS, SolocClient, id_bytes, matches, positions, sts_field,
                           tai_ns_from_utc)
 

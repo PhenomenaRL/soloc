@@ -1,6 +1,6 @@
-"""Downloads each probe's state vectors for the sim window from JPL Horizons into kernels/.
+"""Downloads each probe's state vectors for the sim window from JPL Horizons into data/.
 
-    python fetch_horizons.py            # skips tables already there; --force refetches
+    python -m sim.fetch_horizons        # skips tables already there; --force refetches
 
 Barycentric ICRF position and velocity (km, km/s), one row per `PROBE_CADENCE_S` on the UTC
 minute. Run it again after changing the window in scenario.py.
@@ -9,13 +9,12 @@ minute. Run it again after changing the window in scenario.py.
 import argparse
 import urllib.parse
 import urllib.request
-from pathlib import Path
 
-import scenario as sc
-from models.probe import covers, load_horizons
+from sim import DATA
+from sim import scenario as sc
+from sim.models.probe import covers, load_horizons
 
 API = "https://ssd.jpl.nasa.gov/api/horizons.api"
-KERNELS = Path(__file__).parent / "kernels"
 
 
 def fetch(spec: sc.ProbeSpec) -> str:
@@ -43,9 +42,9 @@ def main():
     p.add_argument("--force", action="store_true", help="refetch tables that already cover the window")
     args = p.parse_args()
 
-    KERNELS.mkdir(exist_ok=True)
+    DATA.mkdir(exist_ok=True)
     for spec in sc.PROBES:
-        path = KERNELS / sc.horizons_file(spec)
+        path = DATA / sc.horizons_file(spec)
         if path.exists() and not args.force and covers(load_horizons(path)[0]):
             print(f"{path.name}: already covers the window")
             continue

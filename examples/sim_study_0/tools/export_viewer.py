@@ -1,7 +1,7 @@
 """Writes a standalone 3D viewer of a saved sim ledger: one HTML file with the tracks, the body
 ephemerides, the coastlines and three.js inlined, so it opens offline by double-click.
 
-    python export_viewer.py out/solar_sim.arrow             # → out/solar_sim_3d.html
+    python -m tools.export_viewer out/sim_study_0.arrow     # → out/sim_study_0_3d.html
 
 The viewer is one scene, nested the way the ledger's frames are:
 - ICRF holds the Sun and planets on their orbits. Craft stored in ICRF are drawn about the Sun.
@@ -27,18 +27,18 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 
-import scenario as sc
-from ephemeris import Ephemeris
-from geo import EARTH, GCRF, ICRF, MARS, MOON, SUN, quat_from_matrix
-from land import outlines
-from run_sim import roster
+from sim import DATA
+from sim import scenario as sc
+from sim.ephemeris import Ephemeris
+from sim.geo import EARTH, GCRF, ICRF, MARS, MOON, SUN, quat_from_matrix
+from sim.land import outlines
+from sim.roster import roster
 from soloc_client import (CENTURY_NS, SolocClient, astronomical, id_bytes, positions, sts_field,
                           tai_ns_from_utc)
-from view_sim import load
+from tools.view_sim import load
 
-HERE = Path(__file__).parent
-THREE_JS = HERE / "kernels" / "three.min.js"
-TEMPLATE = HERE / "viewer_template.html"
+THREE_JS = DATA / "three.min.js"
+TEMPLATE = Path(__file__).parent / "viewer_template.html"
 EPHEMERIS_STEP_S = 300
 DAY_S = 86400
 

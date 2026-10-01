@@ -13,7 +13,7 @@ from pathlib import Path
 from soloc_client import (KIND_ABSTRACT, KIND_SOLOC, SolocClient, astronomical, entity_ids,
                           from_parts, mint, tai_ns_from_utc, wire)
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent
 J1900_TO_J2000_NS = 3_155_716_800 * 10**9
 EARTH, MARS = astronomical(399, 399), astronomical(499, 499)
 
@@ -114,7 +114,7 @@ def main():
         finding(f"epoch_tai_s is TAI seconds since {base}; send t_J2000_s + {snap_offset_s}")
 
     # -- (b) Mars 499 --------------------------------------------------------------------
-    for bsp in sorted((HERE / "kernels").glob("*.bsp")):
+    for bsp in sorted((HERE / "data").glob("*.bsp")):
         mars = sorted(s for s in spk_segments(bsp) if 499 in s)
         finding(f"{bsp.name} Mars 499 segments (target, center): {mars or 'none'}")
     try:

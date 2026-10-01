@@ -12,9 +12,9 @@ import math
 
 import numpy as np
 
-from geo import EARTH, enu_basis, frd, geodetic_to_fixed, quat_from_matrix
-from models import Row
-from scenario import AUTHORITY
+from sim.geo import EARTH, enu_basis, frd, geodetic_to_fixed, quat_from_matrix
+from sim.models import Row
+from sim.scenario import AUTHORITY
 from soloc_client import KIND_SOLOC, mint
 
 AT_REST_KM_S = 1e-6   # below this (1 mm/s) a vehicle is parked and keeps its segment's heading

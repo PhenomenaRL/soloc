@@ -9,8 +9,8 @@ carries any number of epochs.
 import numpy as np
 import pyarrow as pa
 
-import scenario as sc
-from geo import ICRF, Body, Frame
+from sim import scenario as sc
+from sim.geo import ICRF, Body, Frame
 from soloc_client import SolocClient, positions, sts_field, tai_ns_from_utc
 
 DIFFERENCE_S = 30.0          # half-width of the central difference behind `state`'s velocity

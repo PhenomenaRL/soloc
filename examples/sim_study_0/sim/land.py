@@ -1,4 +1,4 @@
-"""Natural Earth 1:50m land polygons (kernels/ne_50m_land.geojson, from fetch_kernels.sh):
+"""Natural Earth 1:50m land polygons (data/ne_50m_land.geojson, from fetch_data.sh):
 a point-in-land test for the ship checks and outlines for the plots.
 
 At this scale the Suez and Panama canals are land, so `CANALS` names the boxes a lane may cross
@@ -7,12 +7,13 @@ them in; `on_land` ignores points inside those boxes.
 
 from functools import cache
 import json
-from pathlib import Path
 
 import numpy as np
 from matplotlib.path import Path as MplPath
 
-LAND = Path(__file__).parent / "kernels" / "ne_50m_land.geojson"
+from sim import DATA
+
+LAND = DATA / "ne_50m_land.geojson"
 
 # (lat_min, lat_max, lon_min, lon_max)
 CANALS = {

@@ -17,15 +17,16 @@ import math
 
 import numpy as np
 
-from geo import quat_from_matrix, quat_yaw
-from models import Row
-from scenario import (AUTHORITY, CARGO_BOARDS_BEFORE_LIFTOFF_S, CARGO_STOP_SHORT_M, CARGO_STOWED_M,
-                      CRAWLER_CADENCE_S, CRAWLER_DIMENSIONS_M, CRAWLER_MASS_KG,
-                      CRAWLER_SPEED_M_S, CRAWLER_TIMESCALE, DEPOT_M, DISEMBARK_AFTER_S,
-                      DISEMBARK_OFFSET_M, DURATION_S, LOGISTICS_STATIONS, PATROL_CORNER_PAUSE_S, PATROL_FENCE_M,
-                      PATTERN_UNDER_WAY_S, ROBOT_CADENCE_S, ROBOT_DIMENSIONS_M, ROBOT_ROLES,
-                      ROBOT_TIMESCALE, ROVERS, SITE_ROADS_M, SPACECRAFT_DIMENSIONS_M, SURVEY_INSET_M,
-                      SURVEY_ROW_SPACING_M, SURVEY_TURN_PAUSE_S, RoverSpec)
+from sim.geo import quat_from_matrix, quat_yaw
+from sim.models import Row
+from sim.scenario import (AUTHORITY, CARGO_BOARDS_BEFORE_LIFTOFF_S, CARGO_STOP_SHORT_M,
+                          CARGO_STOWED_M, CRAWLER_CADENCE_S, CRAWLER_DIMENSIONS_M, CRAWLER_MASS_KG,
+                          CRAWLER_SPEED_M_S, CRAWLER_TIMESCALE, DEPOT_M, DISEMBARK_AFTER_S,
+                          DISEMBARK_OFFSET_M, DURATION_S, LOGISTICS_STATIONS,
+                          PATROL_CORNER_PAUSE_S, PATROL_FENCE_M, PATTERN_UNDER_WAY_S,
+                          ROBOT_CADENCE_S, ROBOT_DIMENSIONS_M, ROBOT_ROLES, ROBOT_TIMESCALE,
+                          ROVERS, SITE_ROADS_M, SPACECRAFT_DIMENSIONS_M, SURVEY_INSET_M,
+                          SURVEY_ROW_SPACING_M, SURVEY_TURN_PAUSE_S, RoverSpec)
 from soloc_client import KIND_SOLOC, mint
 
 
