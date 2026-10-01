@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { KIND_ABSTRACT, KIND_ASTRO, KIND_SOLOC, NameBook, idToString, kindOfIdString } from "./identity";
+import {
+  KIND_ABSTRACT,
+  KIND_ASTRO,
+  KIND_SOLOC,
+  NameBook,
+  astroFrameName,
+  astroFrameOf,
+  idToString,
+  kindOfIdString,
+} from "./identity";
 
 /** The bytes `PrescribedId::astronomical(ephemeris, orientation)` writes. */
 function astroBytes(ephemeris: number, orientation: number): Uint8Array {
@@ -64,5 +73,44 @@ describe("NameBook", () => {
     expect(book.isAstronomical(earth)).toBe(true);
     expect(book.isAstronomical(unknown)).toBe(false);
     expect(book.isAstronomical(idToString(astroBytes(0, 1)))).toBe(true); // ICRF
+  });
+
+  it("recovers an unregistered astronomical body's name from its own bytes", () => {
+    // Mars body-fixed (499, 499) — never added to `book`, unlike earth above.
+    const mars = idToString(astroBytes(499, 499));
+    expect(book.label(mars)).toBe("Mars");
+    expect(book.key(mars)).toBe("Mars");
+    expect(book.isAstronomical(mars)).toBe(true);
+  });
+
+  it("does not guess a name for a non-astronomical unregistered id", () => {
+    // `unknown` is kind SOLOC, so the astro-bytes fallback must not apply.
+    expect(book.label(unknown)).toBe(unknown);
+  });
+});
+
+describe("astroFrameOf / astroFrameName", () => {
+  it("round-trips the (ephemeris, orientation) pair embedded by PrescribedId::astronomical", () => {
+    const id = idToString(astroBytes(399, 399));
+    expect(astroFrameOf(id)).toEqual({ ephemerisId: 399, orientationId: 399 });
+    expect(astroFrameName(399, 399)).toBe("Earth");
+  });
+
+  it("prefers the bare body name over its IAU_ alias (first match, like Rust's frame_name)", () => {
+    expect(astroFrameName(10, 10)).toBe("Sun"); // not "IAU_SUN"
+    expect(astroFrameName(301, 301)).toBe("Moon"); // not "IAU_MOON"
+  });
+
+  it("resolves inertial anchors and barycenters too", () => {
+    expect(astroFrameName(0, 1)).toBe("ICRF");
+    expect(astroFrameName(4, 1)).toBe("MARS_BARYCENTER");
+  });
+
+  it("returns undefined for a pair with no canonical name", () => {
+    expect(astroFrameName(123456, 1)).toBeUndefined();
+  });
+
+  it("returns null for a malformed id", () => {
+    expect(astroFrameOf("not-an-id")).toBeNull();
   });
 });

@@ -96,14 +96,26 @@ export const BODY_TEXTURES: Readonly<
   },
   Venus: { map: ladder("venusmap", "venusmap.jpg"), bump: ladder("venusbump", "venusbump.jpg") },
   Earth: { map: ladder("earthmap", "earthmap1k.jpg"), bump: ladder("earthbump", "earthbump1k.jpg") },
+  // Barycenter keys are what the base DE440s kernels carry for these five
+  // (see gen_visualizer_fixture); the bare names are the same body *centre*,
+  // for a ledger with real ephemeris for one (a satellite SPK) rather than
+  // just its barycentre.
   MARS_BARYCENTER: {
     map: ladder("marsmap", "marsmap1k.jpg"),
     bump: ladder("marsbump", "marsbump1k.jpg"),
   },
+  Mars: {
+    map: ladder("marsmap", "marsmap1k.jpg"),
+    bump: ladder("marsbump", "marsbump1k.jpg"),
+  },
   JUPITER_BARYCENTER: { map: ladder("jupitermap", "jupitermap.jpg") },
+  Jupiter: { map: ladder("jupitermap", "jupitermap.jpg") },
   SATURN_BARYCENTER: { map: ladder("saturnmap", "saturnmap.jpg") },
+  Saturn: { map: ladder("saturnmap", "saturnmap.jpg") },
   URANUS_BARYCENTER: { map: ladder("uranusmap", "uranusmap.jpg") },
+  Uranus: { map: ladder("uranusmap", "uranusmap.jpg") },
   NEPTUNE_BARYCENTER: { map: ladder("neptunemap", "neptunemap.jpg") },
+  Neptune: { map: ladder("neptunemap", "neptunemap.jpg") },
   Moon: { map: ladder("moonmap", "moonmap1k.jpg"), bump: ladder("moonbump", "moonbump1k.jpg") },
 };
 
