@@ -68,6 +68,7 @@ schema library, the tooling, and the integrations around it.
 
 - [x] Core `spacetimestamp` schema, identity, and derived topology
 - [x] Append-only ledger with Arrow-IPC persistence and object-store backends (S3 / GCS / Azure)
+- [x] Bounded ledger memory: a rolling-window memory limit that keeps each entity's latest state
 - [x] Arrow Flight server (proof-of-concept)
 - [ ] Debugging / visualizer tool for inspecting frames, chains, and poses
 - [ ] Ledger performance benchmarks and storage-organization optimizations

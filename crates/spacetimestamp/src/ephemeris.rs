@@ -10,18 +10,29 @@
 //! - [`celestial_state`]: a raw [`CelestialState`] for one KIND_ASTRO body id, not Arrow.
 //! - [`celestial_snapshot`]: a full entity batch for a list of body ids, carrying `entity_id`,
 //!   velocity, and mass, ready for [`crate::topology::TransformTree`] or a `soloc` ledger.
+//!
+//! Orbits follow the same pair: [`celestial_orbit`] returns a raw [`CelestialOrbit`] and
+//! [`celestial_orbits`] a batch following [`orbit_schema`].
 
 use anise::constants::celestial_objects::{
     EARTH, JUPITER, MARS, MERCURY, MOON, NEPTUNE, SATURN, SUN, URANUS, VENUS,
 };
 use anise::constants::frames::SSB_J2000;
+use anise::constants::orientations::J2000;
+use anise::errors::PhysicsError;
 use anise::prelude::{Almanac, Frame};
+use arrow::array::{
+    ArrayRef, FixedSizeListBuilder, Float64Builder, Int16Builder, ListBuilder, UInt64Builder,
+};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use hifitime::{Duration, Epoch, TimeScale};
 use nalgebra::{Rotation3, UnitQuaternion};
+use std::fmt::Display;
 use std::str::FromStr;
+use std::sync::Arc;
 
-use crate::identity::PrescribedId;
+use crate::identity::{PrescribedId, id_builder, id_field};
 
 use crate::schemas::entity::EntityBuilder;
 use crate::vocabulary::{EstimateType, LengthUnit, TimeScaleCode};
@@ -167,7 +178,7 @@ pub fn frame_pair(name: &str) -> Option<(i32, i32)> {
 
 /// Returns `true` if `(ephemeris_id, orientation_id)` is a recognised astronomical frame.
 ///
-/// The KIND_ASTRO mint gate: it accepts exactly the pairs in [`ASTRO_FRAMES`], rejecting
+/// The KIND_ASTRO mint gate: it accepts exactly the pairs in `ASTRO_FRAMES`, rejecting
 /// nonsense combinations like `(399, 499)` that a component-wise check would pass.
 pub fn recognised(ephemeris_id: i32, orientation_id: i32) -> bool {
     ASTRO_FRAMES
@@ -303,6 +314,35 @@ fn velocity_to_m_s(km_s: [f64; 3]) -> [f64; 3] {
 }
 
 // ---------------------------------------------------------------------------
+// Almanac lookups shared by the query functions
+// ---------------------------------------------------------------------------
+
+/// The anise frame `id` embeds and its `"(e, o)"` label for errors, or an error naming `caller`.
+fn astro_frame(id: PrescribedId, caller: &str) -> Result<(Frame, String), String> {
+    let (e, o) = id.astro_frame().ok_or_else(|| {
+        format!("{id} is not an astronomical id; {caller} needs a KIND_ASTRO body")
+    })?;
+    Ok((Frame::new(e, o), format!("({e}, {o})")))
+}
+
+/// The error for a position the loaded kernels cannot supply.
+fn no_position(what: &str, epoch: Epoch, e: impl Display) -> String {
+    format!(
+        "no position for {what} at {epoch}: {e}. Inner planets require DE440; outer \
+     planets additionally need a satellite SPK (e.g. jup365.bsp for Jupiter)."
+    )
+}
+
+/// GM of `frame` from the loaded planetary data ([`Almanac::frame_info`]). No fallback.
+fn gm_km3_s2(almanac: &Almanac, frame: Frame, uid: &str) -> Result<f64, String> {
+    almanac
+        .frame_info(frame)
+        .map_err(|e| format!("no GM for {uid}: {e}. Ensure a PCK (e.g. pck11.pca) is loaded."))?
+        .mu_km3_s2()
+        .map_err(|e| format!("no GM for {uid}: {e}"))
+}
+
+// ---------------------------------------------------------------------------
 // Query function
 // ---------------------------------------------------------------------------
 
@@ -329,20 +369,11 @@ pub fn celestial_state(
     id: PrescribedId,
     epoch: Epoch,
 ) -> Result<CelestialState, String> {
-    let (ephemeris_id, orientation_id) = id.astro_frame().ok_or_else(|| {
-        format!("{id} is not an astronomical id; celestial_state needs a KIND_ASTRO body")
-    })?;
-    let frame = Frame::new(ephemeris_id, orientation_id);
-    let uid = format!("({ephemeris_id}, {orientation_id})");
+    let (frame, uid) = astro_frame(id, "celestial_state")?;
 
     let state = almanac
         .translate(frame, SSB_J2000, epoch, None)
-        .map_err(|e| {
-            format!(
-                "no position for {uid} at {epoch}: {e}. Inner planets require DE440; outer \
-             planets additionally need a satellite SPK (e.g. jup365.bsp for Jupiter)."
-            )
-        })?;
+        .map_err(|e| no_position(&uid, epoch, e))?;
 
     let dcm = almanac.rotate(frame, SSB_J2000, epoch).map_err(|e| {
         format!(
@@ -356,11 +387,7 @@ pub fn celestial_state(
         [omega[(2, 1)], omega[(0, 2)], omega[(1, 0)]]
     });
 
-    let gm_km3_s2 = almanac
-        .frame_info(frame)
-        .map_err(|e| format!("no GM for {uid}: {e}. Ensure a PCK (e.g. pck11.pca) is loaded."))?
-        .mu_km3_s2()
-        .map_err(|e| format!("no GM for {uid}: {e}"))?;
+    let gm_km3_s2 = gm_km3_s2(almanac, frame, &uid)?;
 
     let (duration_centuries, duration_ns) = epoch_to_parts(epoch);
 
@@ -462,6 +489,239 @@ pub fn celestial_snapshot(
     }
 
     Ok(builder.flush())
+}
+
+// ---------------------------------------------------------------------------
+// Orbits
+// ---------------------------------------------------------------------------
+
+/// A body's osculating orbit about `centre`, plus a kernel-sampled path over one period.
+///
+/// Angles and `path_km` are ICRF axes, centred on `centre`. `path_km[i]` is at `path_dt_s[i]`
+/// seconds from the epoch. No Arrow dependency.
+#[derive(Debug)]
+pub struct CelestialOrbit {
+    pub body: PrescribedId,
+    pub centre: PrescribedId,
+    pub sma_km: f64,
+    pub ecc: f64,
+    pub inc_deg: f64,
+    pub raan_deg: f64,
+    pub aop_deg: f64,
+    pub ta_deg: f64,
+    pub period_s: f64,
+    pub path_dt_s: Vec<f64>,
+    pub path_km: Vec<[f64; 3]>,
+    pub duration_centuries: i16,
+    pub duration_ns: u64,
+}
+
+/// The body `id` orbits by NAIF numbering: planets and barycentres → Sun, satellites `x01..x98`
+/// → planet `(x99, x99)` (else `(x99, 1)`), Sun and SSB → `None`.
+pub fn default_centre(id: PrescribedId) -> Option<PrescribedId> {
+    let (naif, _) = id.astro_frame()?;
+    match naif {
+        1..=9 => Some(CelestialBody::Sun.entity_id()),
+        100..=999 if naif % 100 == 99 => Some(CelestialBody::Sun.entity_id()),
+        100..=999 if naif % 100 != 0 => {
+            let planet = naif / 100 * 100 + 99;
+            PrescribedId::astronomical(planet, planet)
+                .or_else(|_| PrescribedId::astronomical(planet, 1))
+                .ok()
+        }
+        _ => None,
+    }
+}
+
+/// The orbit of `body` about `centre` (default [`default_centre`]) at `epoch`.
+///
+/// Elements use μ = GM_centre + GM_body; the path is `samples` translates evenly spaced over
+/// `[epoch − P/2, epoch + P/2]`. No fallback: a missing position or GM is an error.
+///
+/// # Errors
+///
+/// `samples < 2`, a non-astro id, no default centre, body and centre sharing an ephemeris id,
+/// a missing kernel or PCK, or an unbound orbit (`ecc >= 1`).
+pub fn celestial_orbit(
+    almanac: &Almanac,
+    body: PrescribedId,
+    centre: Option<PrescribedId>,
+    epoch: Epoch,
+    samples: usize,
+) -> Result<CelestialOrbit, String> {
+    if samples < 2 {
+        return Err(format!("samples is {samples}; a path needs at least 2"));
+    }
+    let (body_frame, body_uid) = astro_frame(body, "celestial_orbit")?;
+    let centre = match centre {
+        Some(centre) => centre,
+        None => default_centre(body)
+            .ok_or_else(|| format!("{body} has no default centre; name one explicitly"))?,
+    };
+    let (centre_frame, centre_uid) = astro_frame(centre, "celestial_orbit")?;
+    if body_frame.ephemeris_id == centre_frame.ephemeris_id {
+        return Err(format!(
+            "{body} and its centre {centre} are one body (NAIF {})",
+            body_frame.ephemeris_id
+        ));
+    }
+
+    let what = format!("{body_uid} relative to {centre_uid}");
+    let (target, observer) = (
+        body_frame.with_orient(J2000),
+        centre_frame.with_orient(J2000),
+    );
+    let relative = |at: Epoch| {
+        almanac
+            .translate(target, observer, at, None)
+            .map_err(|e| no_position(&what, at, e))
+    };
+
+    let mu_km3_s2 =
+        gm_km3_s2(almanac, centre_frame, &centre_uid)? + gm_km3_s2(almanac, body_frame, &body_uid)?;
+    let mut state = relative(epoch)?;
+    state.frame = state.frame.with_mu_km3_s2(mu_km3_s2);
+
+    let elements = |e: PhysicsError| format!("no orbital elements for {what} at {epoch}: {e}");
+    let ecc = state.ecc().map_err(&elements)?;
+    if ecc >= 1.0 {
+        return Err(format!(
+            "{what} is not bound at {epoch} (e = {ecc}); an orbit needs e < 1"
+        ));
+    }
+    let period_s = state.period().map_err(&elements)?.to_seconds();
+
+    let (path_dt_s, path_km) = (0..samples)
+        .map(|i| {
+            let dt = period_s * (i as f64 / (samples - 1) as f64 - 0.5);
+            let r = relative(epoch + Duration::from_seconds(dt))?.radius_km;
+            Ok((dt, [r.x, r.y, r.z]))
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .unzip();
+
+    let (duration_centuries, duration_ns) = epoch_to_parts(epoch);
+
+    Ok(CelestialOrbit {
+        body,
+        centre,
+        sma_km: state.sma_km().map_err(&elements)?,
+        ecc,
+        inc_deg: state.inc_deg().map_err(&elements)?,
+        raan_deg: state.raan_deg().map_err(&elements)?,
+        aop_deg: state.aop_deg().map_err(&elements)?,
+        ta_deg: state.ta_deg().map_err(&elements)?,
+        period_s,
+        path_dt_s,
+        path_km,
+        duration_centuries,
+        duration_ns,
+    })
+}
+
+/// The schema of [`celestial_orbits`]: one row per orbit, columns as in [`CelestialOrbit`].
+/// Column meanings are fixed; extensions add columns.
+pub fn orbit_schema() -> SchemaRef {
+    let point = DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 3);
+    Arc::new(Schema::new(vec![
+        id_field("body_id"),
+        id_field("centre_id"),
+        Field::new("duration_centuries", DataType::Int16, false),
+        Field::new("duration_ns", DataType::UInt64, false),
+        Field::new("sma_km", DataType::Float64, false),
+        Field::new("ecc", DataType::Float64, false),
+        Field::new("inc_deg", DataType::Float64, false),
+        Field::new("raan_deg", DataType::Float64, false),
+        Field::new("aop_deg", DataType::Float64, false),
+        Field::new("ta_deg", DataType::Float64, false),
+        Field::new("period_s", DataType::Float64, false),
+        Field::new(
+            "path_dt_s",
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+            false,
+        ),
+        Field::new(
+            "path_km",
+            DataType::List(Arc::new(Field::new("item", point, true))),
+            false,
+        ),
+    ]))
+}
+
+/// [`celestial_orbit`] for each `(body, centre)` request, as an [`orbit_schema`] batch in
+/// request order. Errors if `requests` is empty or on the first rejected request.
+pub fn celestial_orbits(
+    almanac: &Almanac,
+    requests: &[(PrescribedId, Option<PrescribedId>)],
+    epoch: Epoch,
+    samples: usize,
+) -> Result<RecordBatch, String> {
+    if requests.is_empty() {
+        return Err("orbits list is empty — provide at least one astronomical body id".to_string());
+    }
+
+    let n = requests.len();
+    let (mut body_ids, mut centre_ids) = (id_builder(n), id_builder(n));
+    let mut centuries = Int16Builder::with_capacity(n);
+    let mut nanos = UInt64Builder::with_capacity(n);
+    let mut elements: [Float64Builder; 7] =
+        std::array::from_fn(|_| Float64Builder::with_capacity(n));
+    let mut path_dt_s = ListBuilder::new(Float64Builder::with_capacity(n * samples));
+    let mut path_km = ListBuilder::new(FixedSizeListBuilder::new(
+        Float64Builder::with_capacity(n * samples * 3),
+        3,
+    ));
+
+    for &(body, centre) in requests {
+        let orbit = celestial_orbit(almanac, body, centre, epoch, samples)?;
+
+        // Infallible: the builder width matches the id's.
+        body_ids
+            .append_value(orbit.body.as_bytes())
+            .map_err(|e| format!("failed to append body id: {e}"))?;
+        centre_ids
+            .append_value(orbit.centre.as_bytes())
+            .map_err(|e| format!("failed to append centre id: {e}"))?;
+        centuries.append_value(orbit.duration_centuries);
+        nanos.append_value(orbit.duration_ns);
+        let values = [
+            orbit.sma_km,
+            orbit.ecc,
+            orbit.inc_deg,
+            orbit.raan_deg,
+            orbit.aop_deg,
+            orbit.ta_deg,
+            orbit.period_s,
+        ];
+        for (builder, value) in elements.iter_mut().zip(values) {
+            builder.append_value(value);
+        }
+        path_dt_s.values().append_slice(&orbit.path_dt_s);
+        path_dt_s.append(true);
+        for point in &orbit.path_km {
+            path_km.values().values().append_slice(point);
+            path_km.values().append(true);
+        }
+        path_km.append(true);
+    }
+
+    let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(body_ids.finish()),
+        Arc::new(centre_ids.finish()),
+        Arc::new(centuries.finish()),
+        Arc::new(nanos.finish()),
+    ];
+    columns.extend(
+        elements
+            .iter_mut()
+            .map(|builder| Arc::new(builder.finish()) as ArrayRef),
+    );
+    columns.push(Arc::new(path_dt_s.finish()));
+    columns.push(Arc::new(path_km.finish()));
+
+    RecordBatch::try_new(orbit_schema(), columns)
+        .map_err(|e| format!("Failed to build orbit batch: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +963,184 @@ mod tests {
             err.contains("SPK") || err.contains("position"),
             "error should guide user to load a kernel; got: {err}"
         );
+    }
+
+    // --- Orbits ---
+
+    fn astro(e: i32, o: i32) -> PrescribedId {
+        PrescribedId::astronomical(e, o).unwrap()
+    }
+
+    #[test]
+    fn test_default_centre_follows_naif_numbering() {
+        let earth = CelestialBody::Earth.entity_id();
+        let mars = CelestialBody::Mars.entity_id();
+        let sun = CelestialBody::Sun.entity_id();
+        assert_eq!(default_centre(CelestialBody::Moon.entity_id()), Some(earth));
+        assert_eq!(default_centre(mars), Some(sun));
+        assert_eq!(default_centre(astro(401, 1)), Some(mars), "Phobos");
+        assert_eq!(
+            default_centre(astro(901, 901)),
+            Some(astro(999, 999)),
+            "Charon"
+        );
+        assert_eq!(
+            default_centre(astro(3, 1)),
+            Some(sun),
+            "a barycentre orbits the Sun"
+        );
+        assert_eq!(default_centre(sun), None);
+        assert_eq!(default_centre(astro(0, 1)), None, "the SSB");
+    }
+
+    #[test]
+    fn test_celestial_orbit_rejects_a_non_astro_id() {
+        let soloc = PrescribedId::new("acme.com", "truck_A").unwrap();
+        let err = celestial_orbit(&Almanac::default(), soloc, None, j2000_tai(), 361).unwrap_err();
+        assert!(err.contains("astronomical"), "got: {err}");
+    }
+
+    #[test]
+    fn test_celestial_orbit_rejects_one_body_as_its_own_centre() {
+        // Earth's body-fixed and GCRF ids share ephemeris id 399.
+        let err = celestial_orbit(
+            &Almanac::default(),
+            CelestialBody::Earth.entity_id(),
+            Some(astro(399, 1)),
+            j2000_tai(),
+            361,
+        )
+        .unwrap_err();
+        assert!(err.contains("one body"), "got: {err}");
+    }
+
+    #[test]
+    fn test_celestial_orbit_rejects_too_few_samples() {
+        let err = celestial_orbit(
+            &Almanac::default(),
+            CelestialBody::Earth.entity_id(),
+            None,
+            j2000_tai(),
+            1,
+        )
+        .unwrap_err();
+        assert!(err.contains("samples"), "got: {err}");
+    }
+
+    #[test]
+    fn test_celestial_orbit_without_a_default_centre_is_an_error() {
+        let sun = CelestialBody::Sun.entity_id();
+        let err = celestial_orbit(&Almanac::default(), sun, None, j2000_tai(), 361).unwrap_err();
+        assert!(err.contains("default centre"), "got: {err}");
+    }
+
+    #[test]
+    fn test_celestial_orbits_rejects_an_empty_list() {
+        let err = celestial_orbits(&Almanac::default(), &[], j2000_tai(), 361).unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn test_celestial_orbit_without_kernels_names_the_spk() {
+        let earth = CelestialBody::Earth.entity_id();
+        let err =
+            celestial_orbits(&Almanac::default(), &[(earth, None)], j2000_tai(), 361).unwrap_err();
+        assert!(
+            err.contains("SPK") || err.contains("position") || err.contains("GM"),
+            "error should guide user to load a kernel; got: {err}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires DE440s ephemeris (~150 MB download on first run, then cached)"]
+    fn test_celestial_orbit_real_almanac() {
+        use arrow::array::{Array, FixedSizeListArray, Float64Array, ListArray};
+
+        let almanac =
+            anise::prelude::MetaAlmanac::latest().expect("MetaAlmanac::latest() should succeed");
+        let epoch = j2000_tai();
+        let day_s = 86_400.0;
+        let au_km = 149_597_870.7;
+
+        let earth = celestial_orbit(&almanac, CelestialBody::Earth.entity_id(), None, epoch, 361)
+            .expect("Earth about the Sun");
+        assert_eq!(earth.centre, CelestialBody::Sun.entity_id());
+        assert!(
+            (earth.sma_km / au_km - 1.0).abs() < 0.01,
+            "a = {} km",
+            earth.sma_km
+        );
+        assert!((earth.ecc - 0.0167).abs() < 0.002, "e = {}", earth.ecc);
+        assert!(
+            (earth.period_s / day_s - 365.25).abs() < 1.0,
+            "P = {} s",
+            earth.period_s
+        );
+        assert!(
+            (earth.inc_deg - 23.44).abs() < 0.1,
+            "ICRF inc = {}",
+            earth.inc_deg
+        );
+
+        let moon = celestial_orbit(&almanac, CelestialBody::Moon.entity_id(), None, epoch, 361)
+            .expect("the Moon about Earth");
+        assert_eq!(moon.centre, CelestialBody::Earth.entity_id());
+        assert!(
+            (moon.period_s / day_s - 27.3).abs() < 1.0,
+            "P = {} s",
+            moon.period_s
+        );
+
+        // Solar perturbation leaves the Moon's path ~8% of a open after one osculating period.
+        for (orbit, closure) in [(&earth, 0.01), (&moon, 0.10)] {
+            assert_eq!(orbit.path_km.len(), 361);
+            assert_eq!(orbit.path_dt_s.len(), 361);
+            let (first, last) = (orbit.path_km[0], orbit.path_km[360]);
+            let gap = (0..3)
+                .map(|k| (first[k] - last[k]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!(
+                gap < closure * orbit.sma_km,
+                "path gap {gap} km vs a {} km",
+                orbit.sma_km
+            );
+
+            let half = orbit.period_s / 2.0;
+            assert!((orbit.path_dt_s[0] + half).abs() < 1e-6);
+            assert!((orbit.path_dt_s[360] - half).abs() < 1e-6);
+            let step = orbit.period_s / 360.0;
+            for pair in orbit.path_dt_s.windows(2) {
+                assert!((pair[1] - pair[0] - step).abs() < 1e-6, "uneven step");
+            }
+        }
+
+        let requests = [
+            (CelestialBody::Earth.entity_id(), None),
+            (CelestialBody::Moon.entity_id(), None),
+        ];
+        let batch = celestial_orbits(&almanac, &requests, epoch, 361).expect("orbit batch");
+        assert_eq!(batch.schema(), orbit_schema());
+        assert_eq!(batch.num_rows(), 2);
+        let path = batch
+            .column_by_name("path_km")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(path.value_length(1), 361);
+        let points = path
+            .values()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let coords = points
+            .values()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        // Row 1 (the Moon) starts at point 361.
+        assert_eq!(coords.value(361 * 3), moon.path_km[0][0]);
     }
 
     // --- integration test (requires DE440s download) ---

@@ -1,27 +1,28 @@
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use arrow::ipc::writer::IpcWriteOptions;
 use arrow::record_batch::RecordBatch;
 use arrow_flight::error::FlightError;
 use arrow_flight::{
-    decode::FlightRecordBatchStream, encode::FlightDataEncoderBuilder,
-    flight_service_server::FlightService, Action, ActionType, Criteria, Empty, FlightData,
-    FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse, PollInfo, PutResult,
-    SchemaAsIpc, SchemaResult, Ticket,
+    decode::FlightRecordBatchStream,
+    encode::FlightDataEncoderBuilder,
+    flight_service_server::{FlightService, FlightServiceServer},
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaAsIpc, SchemaResult, Ticket,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use tonic::{Request, Response, Status, Streaming};
 
 use anise::almanac::metaload::MetaFile;
-use soloc_ledger::ephemeris::celestial_snapshot;
+use soloc_ledger::ephemeris::{celestial_orbits, celestial_snapshot};
 use spacetimestamp::identity::PrescribedId;
 use spacetimestamp::ipc;
 use spacetimestamp::query::SpatiotemporalFilter;
 use spacetimestamp::vocabulary::{LengthUnit, Vocabulary};
 
-use crate::state::ServerState;
+use crate::state::{describe, ServerState};
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send + 'static>>;
 
@@ -98,15 +99,18 @@ fn parse_hex_id(s: &str) -> Result<PrescribedId, String> {
     PrescribedId::from_bytes(&bytes)
 }
 
+/// Mints one id, prefixing any error with `label` (e.g. `orbits[3].centre`).
+fn mint_one(w: &WireId, label: &str) -> Result<PrescribedId, Status> {
+    w.mint()
+        .map_err(|e| Status::invalid_argument(format!("{label}: {e}")))
+}
+
 /// Mints a whole list, reporting which entry failed — `field` names the list and an index
 /// locates the bad one when a client sends fifty.
 fn mint_all(ids: &[WireId], field: &str) -> Result<Vec<PrescribedId>, Status> {
     ids.iter()
         .enumerate()
-        .map(|(i, w)| {
-            w.mint()
-                .map_err(|e| Status::invalid_argument(format!("{field}[{i}]: {e}")))
-        })
+        .map(|(i, w)| mint_one(w, &format!("{field}[{i}]")))
         .collect()
 }
 
@@ -118,6 +122,31 @@ struct AppendSnapshotBody {
     bodies: Vec<WireId>,
     /// Epoch expressed as TAI seconds past J2000.
     epoch_tai_s: f64,
+}
+
+#[derive(Deserialize)]
+struct OrbitRequest {
+    body: WireId,
+    /// Defaults to the body's NAIF parent (planets → Sun, moons → planet).
+    #[serde(default)]
+    centre: Option<WireId>,
+}
+
+#[derive(Deserialize)]
+struct QueryOrbitsBody {
+    orbits: Vec<OrbitRequest>,
+    /// Epoch expressed as TAI seconds past J2000.
+    epoch_tai_s: f64,
+    /// Points per path, at most [`MAX_ORBIT_SAMPLES`].
+    #[serde(default = "default_orbit_samples")]
+    samples: usize,
+}
+
+/// Bounds one path at 2.4 MB, so a request cannot ask for an unbounded reply.
+const MAX_ORBIT_SAMPLES: usize = 100_000;
+
+fn default_orbit_samples() -> usize {
+    361
 }
 
 #[derive(Deserialize)]
@@ -159,9 +188,21 @@ pub struct SolocFlightService {
     pub state: Arc<ServerState>,
 }
 
+/// Default cap on one gRPC message, in bytes, applied to decoding and encoding alike.
+/// tonic's own default is 4 MiB.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
 impl SolocFlightService {
     pub fn new(state: Arc<ServerState>) -> Self {
         Self { state }
+    }
+
+    /// Wraps the service for tonic, capping each message at `max_message_size` bytes in both
+    /// directions.
+    pub fn into_server(self, max_message_size: usize) -> FlightServiceServer<Self> {
+        FlightServiceServer::new(self)
+            .max_decoding_message_size(max_message_size)
+            .max_encoding_message_size(max_message_size)
     }
 }
 
@@ -184,6 +225,28 @@ fn batch_from_ipc_bytes(bytes: &[u8]) -> Result<RecordBatch, Status> {
         .map_err(|e| Status::invalid_argument(format!("failed to concat IPC batches: {e}")))
 }
 
+/// A DoAction reply carrying one result body.
+fn single_result(
+    body: Vec<u8>,
+) -> Result<Response<BoxStream<Result<arrow_flight::Result, Status>>>, Status> {
+    let result = arrow_flight::Result { body: body.into() };
+    Ok(Response::new(Box::pin(futures::stream::once(
+        futures::future::ready(Ok(result)),
+    ))))
+}
+
+/// Read-locks `lock`; a poisoned lock is `internal`, naming `what`.
+fn read<'a, T>(lock: &'a RwLock<T>, what: &str) -> Result<RwLockReadGuard<'a, T>, Status> {
+    lock.read()
+        .map_err(|_| Status::internal(format!("{what} lock poisoned")))
+}
+
+/// Write-locks `lock`; a poisoned lock is `internal`, naming `what`.
+fn write<'a, T>(lock: &'a RwLock<T>, what: &str) -> Result<RwLockWriteGuard<'a, T>, Status> {
+    lock.write()
+        .map_err(|_| Status::internal(format!("{what} lock poisoned")))
+}
+
 /// Transforms a batch into the descriptor's target frame. Frame IDs that name another entity
 /// are resolved through the ledger's transform tree
 fn transform_with_ledger_frames(
@@ -191,14 +254,8 @@ fn transform_with_ledger_frames(
     batch: &RecordBatch,
     desc: &ExchangeDescriptor,
 ) -> Result<RecordBatch, Status> {
-    let almanac = state
-        .almanac
-        .read()
-        .map_err(|_| Status::internal("almanac lock poisoned"))?;
-    let ledger = state
-        .ledger
-        .read()
-        .map_err(|_| Status::internal("ledger lock poisoned"))?;
+    let almanac = read(&state.almanac, "almanac")?;
+    let ledger = read(&state.ledger, "ledger")?;
 
     // An unknown unit is a client error, not a silent km.
     let target_units = LengthUnit::from_code(desc.target_units)
@@ -251,13 +308,7 @@ impl FlightService for SolocFlightService {
         &self,
         _: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        let schema = self
-            .state
-            .ledger
-            .read()
-            .map_err(|_| Status::internal("ledger lock poisoned"))?
-            .schema()
-            .clone();
+        let schema = read(&self.state.ledger, "ledger")?.schema().clone();
         let ipc_options = IpcWriteOptions::default();
         let result = SchemaResult::try_from(SchemaAsIpc::new(&schema, &ipc_options))
             .map_err(|e| Status::internal(format!("schema encoding failed: {e}")))?;
@@ -284,10 +335,7 @@ impl FlightService for SolocFlightService {
         }
 
         let (schema, batches) = {
-            let ledger = state
-                .ledger
-                .read()
-                .map_err(|_| Status::internal("ledger lock poisoned"))?;
+            let ledger = read(&state.ledger, "ledger")?;
             let batches: Vec<RecordBatch> = match ticket.query_type {
                 QueryType::Filter => ledger
                     .stream_query(&filter)
@@ -350,10 +398,7 @@ impl FlightService for SolocFlightService {
             // Topology is derived from the rows themselves by `Ledger::append`, so the
             // batch is stored as-is. A batch introducing a cycle or an unresolvable parent
             // frame is rejected here.
-            state
-                .ledger
-                .write()
-                .map_err(|_| Status::internal("ledger lock poisoned"))?
+            write(&state.ledger, "ledger")?
                 .append(batch)
                 .map_err(|e| Status::invalid_argument(format!("append failed: {e}")))?;
         }
@@ -447,6 +492,15 @@ impl FlightService for SolocFlightService {
                     .to_string(),
             }),
             Ok(ActionType {
+                r#type: "query_orbits".to_string(),
+                description: "Query the almanac for astronomical bodies' osculating orbits at a \
+                              given epoch. Read-only. \
+                              Body: {orbits: [{body, centre?}], epoch_tai_s, samples?}. \
+                              Returns an Arrow IPC file of orbit_schema() rows: ICRF-axis \
+                              elements and a kernel-sampled path over one period."
+                    .to_string(),
+            }),
+            Ok(ActionType {
                 r#type: "export_names".to_string(),
                 description: "Export the display-name registry for federation. No body. \
                               Returns an Arrow IPC file binding each 16-byte id to the \
@@ -473,120 +527,66 @@ impl FlightService for SolocFlightService {
 
         match action.r#type.as_str() {
             "export_topology" => {
-                let batch = self
-                    .state
-                    .ledger
-                    .read()
-                    .map_err(|_| Status::internal("ledger lock poisoned"))?
+                let batch = read(&self.state.ledger, "ledger")?
                     .export_topology()
                     .map_err(|e| Status::internal(format!("export_topology failed: {e}")))?;
-                let bytes = batch_to_ipc_bytes(&batch)?;
-                let result = arrow_flight::Result { body: bytes.into() };
-                Ok(Response::new(Box::pin(futures::stream::once(
-                    futures::future::ready(Ok(result)),
-                ))))
+                single_result(batch_to_ipc_bytes(&batch)?)
             }
 
             "import_topology" => {
                 let batch = batch_from_ipc_bytes(&action.body)?;
-                let applied = self
-                    .state
-                    .ledger
-                    .write()
-                    .map_err(|_| Status::internal("ledger lock poisoned"))?
+                let applied = write(&self.state.ledger, "ledger")?
                     .merge_topology(&batch)
                     .map_err(|e| {
                         Status::invalid_argument(format!("import_topology failed: {e}"))
                     })?;
                 // `merge_topology` counts events it had not already seen, so re-importing the
                 // same peer log correctly reports 0 rather than the row count.
-                let result = arrow_flight::Result {
-                    body: format!("applied {applied} topology events")
-                        .into_bytes()
-                        .into(),
-                };
-                Ok(Response::new(Box::pin(futures::stream::once(
-                    futures::future::ready(Ok(result)),
-                ))))
+                single_result(format!("applied {applied} topology events").into_bytes())
             }
 
             "export_names" => {
-                let bytes = self
-                    .state
-                    .ledger
-                    .read()
-                    .map_err(|_| Status::internal("ledger lock poisoned"))?
+                let bytes = read(&self.state.ledger, "ledger")?
                     .names_to_ipc_bytes()
                     .map_err(|e| Status::internal(format!("export_names failed: {e}")))?;
-                let result = arrow_flight::Result { body: bytes.into() };
-                Ok(Response::new(Box::pin(futures::stream::once(
-                    futures::future::ready(Ok(result)),
-                ))))
+                single_result(bytes)
             }
 
             "import_names" => {
                 // Verification is all-or-nothing across the whole payload
-                let merged = self
-                    .state
-                    .ledger
-                    .write()
-                    .map_err(|_| Status::internal("ledger lock poisoned"))?
+                let merged = write(&self.state.ledger, "ledger")?
                     .merge_names_from_ipc_bytes(&action.body)
                     .map_err(|e| Status::invalid_argument(format!("import_names failed: {e}")))?;
-                let result = arrow_flight::Result {
-                    body: format!("merged {merged} names").into_bytes().into(),
-                };
-                Ok(Response::new(Box::pin(futures::stream::once(
-                    futures::future::ready(Ok(result)),
-                ))))
+                single_result(format!("merged {merged} names").into_bytes())
             }
 
             "save_ledger" => {
                 let body: SaveLedgerBody = serde_json::from_slice(&action.body).map_err(|e| {
                     Status::invalid_argument(format!("invalid save_ledger body: {e}"))
                 })?;
-                let ledger = self
-                    .state
-                    .ledger
-                    .read()
-                    .map_err(|_| Status::internal("ledger lock poisoned"))?;
-                let n = ledger.len();
+                let ledger = read(&self.state.ledger, "ledger")?;
                 ledger
                     .save_ipc(std::path::Path::new(&body.path))
                     .map_err(|e| Status::internal(format!("save_ledger failed: {e}")))?;
-                let result = arrow_flight::Result {
-                    body: format!("saved {n} batches to {}", body.path)
-                        .into_bytes()
-                        .into(),
-                };
-                Ok(Response::new(Box::pin(futures::stream::once(
-                    futures::future::ready(Ok(result)),
-                ))))
+                single_result(format!("saved {} to {}", describe(&ledger), body.path).into_bytes())
             }
 
             "load_ledger" => {
                 let body: SaveLedgerBody = serde_json::from_slice(&action.body).map_err(|e| {
                     Status::invalid_argument(format!("invalid load_ledger body: {e}"))
                 })?;
-                let new_ledger = soloc_ledger::ledger::Ledger::load_ipc(
+                let mut new_ledger = soloc_ledger::ledger::Ledger::load_ipc(
                     std::path::Path::new(&body.path),
                     &self.state.id_column,
                 )
                 .map_err(|e| Status::internal(format!("load_ledger failed: {e}")))?;
-                let n = new_ledger.len();
-                *self
-                    .state
-                    .ledger
-                    .write()
-                    .map_err(|_| Status::internal("ledger lock poisoned"))? = new_ledger;
-                let result = arrow_flight::Result {
-                    body: format!("loaded {n} batches from {}", body.path)
-                        .into_bytes()
-                        .into(),
-                };
-                Ok(Response::new(Box::pin(futures::stream::once(
-                    futures::future::ready(Ok(result)),
-                ))))
+                // A replaced ledger keeps the configured limit, or a reload would lift it.
+                new_ledger
+                    .set_memory_limit(self.state.memory_limit)
+                    .map_err(|e| Status::internal(format!("load_ledger failed: {e}")))?;
+                let size = describe(&new_ledger);
+                *write(&self.state.ledger, "ledger")? = new_ledger;
+                single_result(format!("loaded {size} from {}", body.path).into_bytes())
             }
 
             "load_kernel" => {
@@ -610,24 +610,14 @@ impl FlightService for SolocFlightService {
                 .map_err(|e| Status::internal(format!("kernel download/resolve failed: {e}")))?;
 
                 // Clone the current almanac, load the new kernel, then swap if successful.
-                let mut almanac_guard = self
-                    .state
-                    .almanac
-                    .write()
-                    .map_err(|_| Status::internal("almanac lock poisoned"))?;
+                let mut almanac_guard = write(&self.state.almanac, "almanac")?;
                 let updated = almanac_guard.clone().load(&local_path).map_err(|e| {
                     Status::internal(format!("failed to load kernel '{local_path}': {e}"))
                 })?;
                 *almanac_guard = updated;
                 drop(almanac_guard);
 
-                let msg = format!("kernel loaded: {}", body.source);
-                let result = arrow_flight::Result {
-                    body: msg.into_bytes().into(),
-                };
-                Ok(Response::new(Box::pin(futures::stream::once(
-                    futures::future::ready(Ok(result)),
-                ))))
+                single_result(format!("kernel loaded: {}", body.source).into_bytes())
             }
 
             "append_snapshot" => {
@@ -643,30 +633,56 @@ impl FlightService for SolocFlightService {
                 let epoch = hifitime::Epoch::from_tai_seconds(body.epoch_tai_s);
                 let ids = mint_all(&body.bodies, "bodies")?;
 
-                let almanac = self
-                    .state
-                    .almanac
-                    .read()
-                    .map_err(|_| Status::internal("almanac lock poisoned"))?;
+                let almanac = read(&self.state.almanac, "almanac")?;
 
                 let batch = celestial_snapshot(&almanac, &ids, epoch)
                     .map_err(|e| Status::internal(format!("celestial_snapshot failed: {e}")))?;
                 drop(almanac);
 
                 let n = batch.num_rows();
-                self.state
-                    .ledger
-                    .write()
-                    .map_err(|_| Status::internal("ledger lock poisoned"))?
+                write(&self.state.ledger, "ledger")?
                     .append(batch)
                     .map_err(|e| Status::invalid_argument(format!("append failed: {e}")))?;
 
-                let result = arrow_flight::Result {
-                    body: format!("appended {n} rows").into_bytes().into(),
-                };
-                Ok(Response::new(Box::pin(futures::stream::once(
-                    futures::future::ready(Ok(result)),
-                ))))
+                single_result(format!("appended {n} rows").into_bytes())
+            }
+
+            "query_orbits" => {
+                let body: QueryOrbitsBody = serde_json::from_slice(&action.body).map_err(|e| {
+                    Status::invalid_argument(format!("invalid query_orbits body: {e}"))
+                })?;
+
+                if body.orbits.is_empty() {
+                    return Err(Status::invalid_argument("orbits list is empty"));
+                }
+                if body.samples > MAX_ORBIT_SAMPLES {
+                    return Err(Status::invalid_argument(format!(
+                        "samples {} exceeds the cap of {MAX_ORBIT_SAMPLES}",
+                        body.samples
+                    )));
+                }
+
+                let epoch = hifitime::Epoch::from_tai_seconds(body.epoch_tai_s);
+                let requests = body
+                    .orbits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, o)| {
+                        let centre = o
+                            .centre
+                            .as_ref()
+                            .map(|c| mint_one(c, &format!("orbits[{i}].centre")))
+                            .transpose()?;
+                        Ok((mint_one(&o.body, &format!("orbits[{i}].body"))?, centre))
+                    })
+                    .collect::<Result<Vec<_>, Status>>()?;
+
+                let almanac = read(&self.state.almanac, "almanac")?;
+                let batch = celestial_orbits(&almanac, &requests, epoch, body.samples)
+                    .map_err(|e| Status::internal(format!("celestial_orbits failed: {e}")))?;
+                drop(almanac);
+
+                single_result(batch_to_ipc_bytes(&batch)?)
             }
 
             other => Err(Status::invalid_argument(format!(
@@ -692,38 +708,52 @@ mod tests {
         PrescribedId::new("demo", name).unwrap()
     }
 
-    /// A one-row entity batch placing `entity_id` relative to `frame_id`.
-    fn entity_batch(entity_id: PrescribedId, frame_id: PrescribedId, x: f64) -> RecordBatch {
-        let mut b = EntityBuilder::new(1);
-        b.append_entity(
-            entity_id,
-            frame_id,
-            LengthUnit::km,
-            TimeScaleCode::TAI,
-            PrescribedId::abstract_source("test", "src").unwrap(),
-            EstimateType::MEASURED,
-            [x, 0.0, 0.0],
-            [1.0, 0.0, 0.0, 0.0],
-            0,
-            0,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+    /// An entity batch placing `entity_id` at `x` km from `frame_id`, one row per TAI
+    /// nanosecond offset in `epochs_ns`.
+    fn entity_rows(
+        entity_id: PrescribedId,
+        frame_id: PrescribedId,
+        x: f64,
+        epochs_ns: std::ops::Range<u64>,
+    ) -> RecordBatch {
+        let mut b = EntityBuilder::new(epochs_ns.clone().count());
+        for ns in epochs_ns {
+            b.append_entity(
+                entity_id,
+                frame_id,
+                LengthUnit::km,
+                TimeScaleCode::TAI,
+                PrescribedId::abstract_source("test", "src").unwrap(),
+                EstimateType::MEASURED,
+                [x, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+                ns,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
         b.flush()
     }
 
     /// A service backed by an empty in-memory entity ledger — no paths, so no disk I/O.
     async fn make_service() -> SolocFlightService {
+        make_limited_service(None).await
+    }
+
+    /// [`make_service`] with `storage.memory_limit` set to `memory_limit`.
+    async fn make_limited_service(memory_limit: Option<usize>) -> SolocFlightService {
         let state = ServerState::new(
             Almanac::default(),
             None,
             None,
             None,
             "entity_id".to_string(),
+            memory_limit,
         )
         .await;
         SolocFlightService::new(Arc::new(state))
@@ -754,10 +784,10 @@ mod tests {
             let mut ledger = exporter.state.ledger.write().unwrap();
             let earth = PrescribedId::astronomical_from_name("IAU_EARTH").unwrap();
             ledger
-                .append(entity_batch(demo("facility"), earth, 50.0))
+                .append(entity_rows(demo("facility"), earth, 50.0, 0..1))
                 .unwrap();
             ledger
-                .append(entity_batch(demo("robot"), demo("facility"), 5.0))
+                .append(entity_rows(demo("robot"), demo("facility"), 5.0, 0..1))
                 .unwrap();
         }
 
@@ -841,19 +871,16 @@ mod tests {
         }
     }
 
-    /// A client may send the exchange descriptor in a message of its own, ahead of the schema.
-    #[tokio::test]
-    async fn test_do_exchange_accepts_a_descriptor_only_first_message() {
-        use arrow_flight::flight_service_client::FlightServiceClient;
-        use arrow_flight::flight_service_server::FlightServiceServer;
-
+    /// Serves `service` on a free local port, built as `main` builds it, and connects a client.
+    async fn serve(
+        service: SolocFlightService,
+    ) -> arrow_flight::flight_service_client::FlightServiceClient<tonic::transport::Channel> {
         let incoming =
             tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = incoming.local_addr().unwrap();
-        let service = make_service().await;
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(FlightServiceServer::new(service))
+                .add_service(service.into_server(DEFAULT_MAX_MESSAGE_SIZE))
                 .serve_with_incoming(incoming),
         );
 
@@ -862,7 +889,54 @@ mod tests {
             .connect()
             .await
             .unwrap();
-        let mut client = FlightServiceClient::new(channel);
+        arrow_flight::flight_service_client::FlightServiceClient::new(channel)
+    }
+
+    /// A single exchange message over tonic's 4 MiB default must be accepted, so a client
+    /// need not chunk its rows to stay under it.
+    #[tokio::test]
+    async fn test_do_exchange_accepts_a_message_over_4_mib() {
+        const ROWS: usize = 30_000;
+        let earth = PrescribedId::astronomical_from_name("Earth").unwrap();
+        let batch = entity_rows(demo("bot"), earth, 1.0, 0..ROWS as u64);
+
+        let mut client = serve(make_service().await).await;
+        let descriptor = FlightData::new().with_descriptor(FlightDescriptor::new_cmd(
+            br#"{"target_frame": "Earth"}"#.to_vec(),
+        ));
+        // One unsplit message for the whole batch; the encoder's default would split it.
+        let mut messages: Vec<FlightData> = FlightDataEncoderBuilder::new()
+            .with_max_flight_data_size(usize::MAX)
+            .build(futures::stream::iter([Ok(batch)]))
+            .try_collect()
+            .await
+            .unwrap();
+        let largest = messages.iter().map(|m| m.data_body.len()).max().unwrap();
+        assert!(largest > 4 * 1024 * 1024, "message is only {largest} bytes");
+        messages.insert(0, descriptor);
+
+        let replies: Vec<FlightData> = client
+            .do_exchange(futures::stream::iter(messages))
+            .await
+            .expect("exchange should be accepted")
+            .into_inner()
+            .try_collect()
+            .await
+            .expect("every reply should decode");
+        let mut decoded = FlightRecordBatchStream::new_from_flight_data(futures::stream::iter(
+            replies.into_iter().map(Ok),
+        ));
+        let mut rows = 0;
+        while let Some(batch) = decoded.next().await {
+            rows += batch.unwrap().num_rows();
+        }
+        assert_eq!(rows, ROWS);
+    }
+
+    /// A client may send the exchange descriptor in a message of its own, ahead of the schema.
+    #[tokio::test]
+    async fn test_do_exchange_accepts_a_descriptor_only_first_message() {
+        let mut client = serve(make_service().await).await;
         let descriptor = FlightData::new().with_descriptor(FlightDescriptor::new_cmd(
             br#"{"target_frame": "IAU_EARTH"}"#.to_vec(),
         ));
@@ -877,6 +951,44 @@ mod tests {
             .collect()
             .await;
         assert!(replies.iter().all(Result::is_ok), "{replies:?}");
+    }
+
+    /// `load_ledger` builds a fresh ledger from the file; it must carry the configured
+    /// memory limit, or a reload would silently lift it.
+    #[tokio::test]
+    async fn test_load_ledger_keeps_the_memory_limit() {
+        let earth = PrescribedId::astronomical_from_name("Earth").unwrap();
+        let mut full = soloc_ledger::ledger::Ledger::new(
+            &soloc_ledger::schemas::entity::entity_schema(),
+            "entity_id",
+        )
+        .unwrap();
+        for t in 0..200 {
+            full.append(entity_rows(demo("bot"), earth, 1.0, t..t + 1))
+                .unwrap();
+        }
+        let path = std::env::temp_dir().join("soloc_server_load_limit_test.arrows");
+        full.save_ipc(&path).unwrap();
+        let limit = full.resident_bytes() / 2;
+
+        let service = make_limited_service(Some(limit)).await;
+        let reply = service
+            .do_action(Request::new(Action {
+                r#type: "load_ledger".to_string(),
+                body: format!(r#"{{"path": "{}"}}"#, path.display()).into(),
+            }))
+            .await
+            .expect("load_ledger should succeed");
+        action_body(reply).await;
+
+        let ledger = service.state.ledger.read().unwrap();
+        assert!(
+            ledger.resident_bytes() <= limit,
+            "{} > {limit}",
+            ledger.resident_bytes()
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(soloc_ledger::ledger::names_sibling_path(&path)).ok();
     }
 
     /// A malformed body must be rejected as a client error, not surface as an internal panic.
@@ -921,6 +1033,79 @@ mod tests {
         );
         assert!(listed.contains(&"export_names".to_string()), "{listed:?}");
         assert!(listed.contains(&"import_names".to_string()), "{listed:?}");
+        assert!(listed.contains(&"query_orbits".to_string()), "{listed:?}");
+    }
+
+    /// Runs `query_orbits` with a JSON body, returning only the error status.
+    async fn query_orbits_error(body: &str) -> Status {
+        let result = make_service()
+            .await
+            .do_action(Request::new(Action {
+                r#type: "query_orbits".to_string(),
+                body: body.as_bytes().to_vec().into(),
+            }))
+            .await;
+        match result {
+            Ok(_) => panic!("query_orbits should fail for {body}"),
+            Err(status) => status,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_query_orbits_rejects_bad_requests_as_client_errors() {
+        let earth = r#"{"ephemeris_id": 399, "orientation_id": 399}"#;
+        for body in [
+            r#"{"orbits": [], "epoch_tai_s": 0}"#.to_string(),
+            r#"{"orbits": [{"body": {"ephemeris_id": 399, "orientation_id": 499}}], "epoch_tai_s": 0}"#
+                .to_string(),
+            format!(r#"{{"orbits": [{{"body": {earth}}}], "epoch_tai_s": 0, "samples": 100001}}"#),
+        ] {
+            let status = query_orbits_error(&body).await;
+            assert_eq!(status.code(), tonic::Code::InvalidArgument, "{body}: {status}");
+        }
+
+        let bad_centre = format!(
+            r#"{{"orbits": [{{"body": {earth}, "centre": {{"id": "zz"}}}}], "epoch_tai_s": 0}}"#
+        );
+        let status = query_orbits_error(&bad_centre).await;
+        assert!(status.message().contains("orbits[0].centre"), "{status}");
+    }
+
+    #[tokio::test]
+    async fn test_query_orbits_without_kernels_is_descriptive() {
+        let status = query_orbits_error(
+            r#"{"orbits": [{"body": {"ephemeris_id": 399, "orientation_id": 399}}], "epoch_tai_s": 0}"#,
+        )
+        .await;
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(
+            status.message().contains("SPK") || status.message().contains("GM"),
+            "{status}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DE440s ephemeris (~150 MB download on first run, then cached)"]
+    async fn test_query_orbits_replies_with_orbit_schema_ipc() {
+        let almanac = anise::prelude::MetaAlmanac::latest().unwrap();
+        let state =
+            ServerState::new(almanac, None, None, None, "entity_id".to_string(), None).await;
+        let service = SolocFlightService::new(Arc::new(state));
+        let body = r#"{"orbits": [
+            {"body": {"ephemeris_id": 399, "orientation_id": 399}},
+            {"body": {"ephemeris_id": 301, "orientation_id": 301}}
+        ], "epoch_tai_s": 0, "samples": 11}"#;
+        let response = service
+            .do_action(Request::new(Action {
+                r#type: "query_orbits".to_string(),
+                body: body.as_bytes().to_vec().into(),
+            }))
+            .await
+            .expect("query_orbits should succeed with kernels");
+
+        let batch = batch_from_ipc_bytes(&action_body(response).await).unwrap();
+        assert_eq!(batch.schema(), soloc_ledger::ephemeris::orbit_schema());
+        assert_eq!(batch.num_rows(), 2);
     }
 
     fn wire(json: &str) -> Result<PrescribedId, String> {

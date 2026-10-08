@@ -13,6 +13,9 @@ pub struct ServerState {
     /// `ledger_path` for both load-on-startup and save-on-shutdown.
     pub ledger_url: Option<String>,
     pub id_column: String,
+    /// `storage.memory_limit` in bytes, applied to every ledger the server holds, including
+    /// one replaced by the `load_ledger` action.
+    pub memory_limit: Option<usize>,
 }
 
 impl ServerState {
@@ -22,14 +25,12 @@ impl ServerState {
         ledger_url: Option<String>,
         schema_path: Option<PathBuf>,
         id_column: String,
+        memory_limit: Option<usize>,
     ) -> Self {
-        let ledger = if let Some(ref url) = ledger_url {
+        let mut ledger = if let Some(ref url) = ledger_url {
             match object_store_download(url, &id_column).await {
                 Ok(l) => {
-                    eprintln!(
-                        "soloc-server: ledger loaded from {url} ({} batches)",
-                        l.len()
-                    );
+                    eprintln!("soloc-server: ledger loaded from {url} ({})", describe(&l));
                     l
                 }
                 Err(e) => {
@@ -45,9 +46,9 @@ impl ServerState {
                 match Ledger::load_ipc(p, &id_column) {
                     Ok(l) => {
                         eprintln!(
-                            "soloc-server: ledger loaded from {:?} ({} batches)",
+                            "soloc-server: ledger loaded from {:?} ({})",
                             p,
-                            l.len()
+                            describe(&l)
                         );
                         Some(l)
                     }
@@ -63,12 +64,30 @@ impl ServerState {
             loaded.unwrap_or_else(|| new_empty_ledger(&schema_path, &id_column))
         };
 
+        // Stores the limit that took effect, so `load_ledger` never re-applies a refused one.
+        let memory_limit = match ledger.set_memory_limit(memory_limit) {
+            Ok(()) => {
+                if let Some(limit) = memory_limit {
+                    eprintln!(
+                        "soloc-server: memory limit {limit} bytes ({})",
+                        describe(&ledger)
+                    );
+                }
+                memory_limit
+            }
+            Err(e) => {
+                eprintln!("soloc-server: WARNING — memory_limit ignored: {e}. Keeping every row.");
+                None
+            }
+        };
+
         Self {
             ledger: Arc::new(RwLock::new(ledger)),
             almanac: Arc::new(RwLock::new(almanac)),
             ledger_path,
             ledger_url,
             id_column,
+            memory_limit,
         }
     }
 
@@ -80,7 +99,7 @@ impl ServerState {
             // threads and can deadlock (clippy: await_holding_lock).
             let serialized = match self.ledger.read() {
                 Ok(ledger) => match ledger.save_ipc_to_bytes() {
-                    Ok(bytes) => Some((bytes, ledger.len())),
+                    Ok(bytes) => Some((bytes, describe(&ledger))),
                     Err(e) => {
                         eprintln!("soloc-server: WARNING — ledger serialization failed: {e}");
                         None
@@ -91,11 +110,9 @@ impl ServerState {
                     None
                 }
             };
-            if let Some((bytes, n_batches)) = serialized {
+            if let Some((bytes, size)) = serialized {
                 match object_store_upload(bytes, url).await {
-                    Ok(()) => {
-                        eprintln!("soloc-server: ledger saved to {url} ({n_batches} batches)")
-                    }
+                    Ok(()) => eprintln!("soloc-server: ledger saved to {url} ({size})"),
                     Err(e) => {
                         eprintln!("soloc-server: WARNING — object-store upload failed: {e}")
                     }
@@ -114,9 +131,9 @@ impl ServerState {
                         );
                     } else {
                         eprintln!(
-                            "soloc-server: ledger saved to {:?} ({} batches)",
+                            "soloc-server: ledger saved to {:?} ({})",
                             path,
-                            ledger.len()
+                            describe(&ledger)
                         );
                     }
                 }
@@ -126,6 +143,15 @@ impl ServerState {
             }
         }
     }
+}
+
+/// A ledger's size as the server reports it in log lines and action replies.
+pub fn describe(ledger: &Ledger) -> String {
+    format!(
+        "{} batches, {:.1} MB resident",
+        ledger.len(),
+        ledger.resident_bytes() as f64 / 1e6
+    )
 }
 
 /// Creates an empty ledger using `schema_path` (if provided) or the default entity schema.

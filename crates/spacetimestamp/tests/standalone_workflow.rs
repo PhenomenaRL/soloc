@@ -9,7 +9,9 @@ use arrow::array::{Array, FixedSizeListArray, Float64Array, RecordBatch, StructA
 use nalgebra::{Isometry3, Translation3, UnitQuaternion};
 use std::collections::HashMap;
 
-use spacetimestamp::ephemeris::j2000_tai;
+use spacetimestamp::ephemeris::{
+    CelestialBody, celestial_orbit, celestial_orbits, default_centre, j2000_tai, orbit_schema,
+};
 use spacetimestamp::identity::PrescribedId;
 use spacetimestamp::schemas::entity::EntityBuilder;
 use spacetimestamp::topology::TransformTree;
@@ -221,6 +223,24 @@ fn typos_and_abstract_frames_are_rejected_without_a_ledger() {
         tree.is_empty(),
         "a rejected batch must leave the tree empty"
     );
+}
+
+#[test]
+fn orbit_queries_need_only_an_almanac() {
+    // 1. Centres come from the NAIF numbering alone: no kernel, no ledger.
+    let moon = CelestialBody::Moon.entity_id();
+    assert_eq!(default_centre(moon), Some(CelestialBody::Earth.entity_id()));
+    assert_eq!(default_centre(CelestialBody::Sun.entity_id()), None);
+
+    // 2. The reply schema stands on its own, so a client can be written against it up front.
+    assert!(orbit_schema().field_with_name("path_km").is_ok());
+
+    // 3. An empty almanac is a descriptive error, not a panic: the orbit needs a kernel.
+    let almanac = Almanac::default();
+    let err = celestial_orbit(&almanac, moon, None, j2000_tai(), 361).unwrap_err();
+    assert!(err.contains("SPK") || err.contains("GM"), "got: {err}");
+    let err = celestial_orbits(&almanac, &[(moon, None)], j2000_tai(), 361).unwrap_err();
+    assert!(err.contains("SPK") || err.contains("GM"), "got: {err}");
 }
 
 fn assert_positions_match(actual: [f64; 3], expected: [f64; 3], label: &str) {
