@@ -18,6 +18,8 @@ from sim import scenario as sc
 from sim.ephemeris import Ephemeris
 from sim.geo import EARTH, GCRF, MARS, MOON, SUN, GreatCircle, fixed_to_geodetic
 from sim.land import CANALS, outlines
+from sim.models import regatta as rg
+from sim.models.sailboat import polar
 from sim.roster import roster
 from soloc_client import (CENTURY_NS, SolocClient, id_bytes, matches, positions, sts_field,
                           tai_ns_from_utc)
@@ -27,6 +29,7 @@ MARK = "#eb6834"
 INK_MUTED = "#6b6a63"
 GRID = "#e6e5df"
 BODY_FILL = "#d9d8d2"
+WATER = "#dcebf5"
 SERIES = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4")   # categorical slots 1-5
 DAYS = sc.DURATION_S // 86400
 
@@ -384,6 +387,107 @@ def plot_flight_altitudes(rows, ids, t_s, fleet, out_dir: Path) -> Path:
     return path
 
 
+def regatta_rows(g, table: pa.Table):
+    # Imported here: snapshot_sim imports this module's style.
+    from tools.snapshot_sim import Rows
+    return Rows(table, g.names, g.venue.id, tai_ns_from_utc(sc.T0))
+
+
+def plot_regatta(g, table: pa.Table, out_dir: Path) -> Path:
+    """The race in venue ENU, as stored: each boat from the warning to its finish over the
+    course, and the whole race day (docks, motor route) over the venue. The fleet sails the
+    default tactician; SAIL-10 sails whatever `--regatta-policy` named."""
+    rows, c = regatta_rows(g, table), g.course
+    rings = [np.array([g.venue.enu(a, o)[:2] for a, o in ring]) for ring in sc.BASIN_WATER]
+    fig, (near, whole) = plt.subplots(1, 2, figsize=(15, 7.2), layout="constrained",
+                                      gridspec_kw={"width_ratios": [1.6, 1]})
+    finish = {}
+    for ax in (near, whole):
+        for ring in rings:
+            ax.fill(ring[:, 0], ring[:, 1], color=WATER, linewidth=0)
+        for b in g.boats:
+            k = rows.index[b.name]
+            if ax is near:
+                r, end = rg.replay(c, rows.t_s[k], rows.pos[k])
+                finish[b.name] = r.finish_s
+                k = k[(rows.t_s[k] >= rg.WARNING_S) & (rows.t_s[k] < end)]
+            else:
+                k = k[(rows.t_s[k] >= rg.ON_S) & (rows.t_s[k] <= rg.OFF_S)]
+            mine = b is g.boats[-1]
+            ax.plot(rows.pos[k, 0], rows.pos[k, 1], color=MARK if mine else TRACK,
+                    linewidth=1.4 if mine else 0.7, alpha=1.0 if mine else 0.55, zorder=3 if mine else 2,
+                    label=None if b.name not in ("SAIL-01", g.boats[-1].name) else
+                    f"{b.name} (--regatta-policy)" if mine else "fleet (default tactician)")
+        ax.plot(*np.column_stack([c.rc, c.marks["MARK-PIN"]]), "--", color=INK_MUTED, linewidth=0.9)
+        marks = np.array(list(c.marks.values()))
+        ax.plot(marks[:, 0], marks[:, 1], "o", color="#3d3c37", markersize=5, zorder=4)
+        ax.plot(*c.rc, "s", color="#3d3c37", markersize=6, zorder=4)
+        ax.set_aspect("equal")
+        ax.set_xlabel("east (m)", fontsize=8)
+        ax.set_ylabel("north (m)", fontsize=8)
+        style(ax)
+    for name, xy in (("W", c.marks["MARK-W"]), ("gate", c.marks["MARK-GATE-2"]), ("pin", c.marks["MARK-PIN"]),
+                     ("RC", c.rc)):
+        near.annotate(name, xy, xytext=(6, -10), textcoords="offset points", fontsize=8, color="#3d3c37")
+    done = sorted((t, n) for n, t in finish.items() if t is not None)
+    if done:
+        t, n = done[0]
+        k = rows.upto(n, t + sc.REGATTA_CADENCE_S)[-1]
+        near.annotate(f"{n} first, {timedelta(seconds=round(t - rg.GUN_S))}", rows.pos[k], xytext=(8, 12),
+                      textcoords="offset points", fontsize=8, color="#3d3c37")
+    pts = np.array([c.rc, *c.marks.values(), *c.staging])
+    lo, hi = pts.min(0) - 700, pts.max(0) + 700
+    near.set_xlim(lo[0], hi[0])
+    near.set_ylim(lo[1], hi[1])
+    near.legend(fontsize=8, loc="lower right")
+    near.set_title("from the warning signal to each boat's finish (■ RC boat, ● marks, dashed = line)", fontsize=10)
+    e0, e1, n0, n1 = sc.REGATTA_WIND.extent_m
+    whole.set_xlim(e0, e1)
+    whole.set_ylim(n0, n1)
+    whole.set_title("race day 13:00–18:00 ADT, docks to course", fontsize=10)
+    fig.suptitle(f"{g.venue.name} regatta, {sc.REGATTA_GUN:%Y-%m-%d}: stored rows in venue ENU", fontsize=11)
+    path = out_dir / "regatta.png"
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path
+
+
+def plot_regatta_speed(g, table: pa.Table, out_dir: Path) -> Path:
+    """Each boat's stored speed while sailing against the polar bound for the wind at its row,
+    one panel per boat; dips below the bound are tacks, gybes and luffs."""
+    rows, c = regatta_rows(g, table), g.course
+    fig, axes = plt.subplots(2, 5, figsize=(16, 5.8), sharex=True, sharey=True, layout="constrained")
+    for ax, b in zip(axes.flat, g.boats):
+        k = rows.index[b.name]
+        r, end = rg.replay(c, rows.t_s[k], rows.pos[k])
+        k = k[(rows.t_s[k] >= rg.WARNING_S) & (rows.t_s[k] < end)]
+        twd = np.empty(len(k))
+        tws = np.empty(len(k))
+        for j, i in enumerate(k):
+            twd[j], tws[j] = g.wind.at(rows.pos[i, 0], rows.pos[i, 1], float(rows.t_s[i]))
+        minutes = (rows.t_s[k] - rg.GUN_S) / 60
+        for _, t in r.roundings:
+            ax.axvline((t - rg.GUN_S) / 60, color=GRID, linewidth=0.8)
+        ax.plot(minutes, rows.speed[k], color=MARK if b is g.boats[-1] else TRACK, linewidth=1.0,
+                label="stored speed")
+        ax.plot(minutes, polar(rows.heading[k] - twd, tws), color="#3d3c37", linewidth=0.8,
+                linestyle="--", label="polar bound")
+        note = f"finished {timedelta(seconds=round(r.finish_s - rg.GUN_S))}" if r.finish_s else "DNF"
+        ax.set_title(f"{b.name}, {note}", fontsize=9)
+        style(ax)
+    for ax in axes[-1]:
+        ax.set_xlabel("minutes from the gun", fontsize=8)
+    for ax in axes[:, 0]:
+        ax.set_ylabel("speed (m/s)", fontsize=8)
+    axes.flat[0].legend(fontsize=7, loc="lower right")
+    fig.suptitle("Regatta boat speed while sailing vs the polar for the wind at each row (drops = tack, "
+                 "gybe or luff; grey verticals = roundings; SAIL-10 in orange sails --regatta-policy)", fontsize=11)
+    path = out_dir / "regatta_speed.png"
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("path")
@@ -430,6 +534,10 @@ def main():
         print(plot_tracks(rows, ids, t_s, ships, f"Ship tracks over {DAYS} days (dot = position at T0; "
                           "dotted = full lanes; boxes = canal exemptions)", out_dir, "ships.png",
                           routes=[GreatCircle(lane.waypoints) for lane in sc.LANES], canals=True))
+    g = world.regatta
+    if present & {b.id for b in g.boats}:
+        print(plot_regatta(g, rows, out_dir))
+        print(plot_regatta_speed(g, rows, out_dir))
 
 
 if __name__ == "__main__":

@@ -61,6 +61,15 @@ def on_land(lat, lon) -> np.ndarray:
     return land & ~in_canal(lat, lon)
 
 
+def in_rings(lat, lon, rings) -> np.ndarray:
+    """Boolean mask: which `(lat, lon)` degree pairs fall inside any of the `(lat, lon)` rings."""
+    pts = np.column_stack([np.atleast_1d(lon), np.atleast_1d(lat)]).astype(float)
+    inside = np.zeros(len(pts), bool)
+    for ring in rings:
+        inside |= MplPath(np.array(ring)[:, ::-1]).contains_points(pts)
+    return inside
+
+
 def outlines():
     """Every ring as an `(N, 2)` lon/lat array, for drawing."""
     return [p.vertices for ext, holes, _ in polygons() for p in (ext, *holes)]

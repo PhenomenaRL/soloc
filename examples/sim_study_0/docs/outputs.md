@@ -15,11 +15,13 @@
 | `aircraft.png` | aircraft tracks over the land polygons |
 | `flight_altitudes.png` | each aircraft's altitude over the 5 days |
 | `ships.png` | ship tracks over the land polygons, with every full lane dotted and the canal boxes outlined |
+| `regatta.png` | the race in venue ENU over the water polygons: each boat from the warning to its finish, and the whole race day from the docks; the fleet in one colour, SAIL-10 (the `--regatta-policy` boat) highlighted |
+| `regatta_speed.png` | each boat's stored speed while sailing against the polar bound for the wind at its row, one panel per boat; drops are tacks, gybes and luffs |
 
 ## 3D viewer
 
 `python -m tools.export_viewer out/sim_study_0.arrow` turns a saved ledger into one standalone
-HTML file, `out/sim_study_0_3d.html` (~43 MB). The tracks, the body ephemerides, the Earth
+HTML file, `out/sim_study_0_3d.html` (~47 MB). The tracks, the body ephemerides, the Earth
 coastlines and three.js are inlined into `tools/viewer_template.html`, so the page opens offline by double-click
 in any WebGL browser. Building it needs a running server.
 
@@ -33,6 +35,14 @@ It is one scene, nested the way the ledger's frames are:
   in body-fixed km as stored.
 - **Each site's ENU frame:** sits on its body at the facility's stored pose, with its robots in
   metres over the road grid.
+- **The regatta venue:** sits on Earth the same way. It shows:
+  - the Bedford Bay and Basin water, the start line and the met buoys
+  - the marks, while they are laid
+  - the sailboats and the RC boat
+  - arrows for the wind from `out/wind.arrow`, refreshed each minute on race day and hidden
+    outside it
+
+  "Go to" puts the camera 4 km away. The boats show within 12 km.
 
 Body positions and orientations come from the server: a zero offset in each body frame is
 exchanged to ICRF at 5 min steps over the window. That is the same resolution the ledger does.
@@ -52,8 +62,9 @@ a facility (a craft on its pad or landed) are composed through the facility's st
 Every entity is a small model with its body axes (x red, y green, z blue) at its interpolated
 pose; models keep a constant size on screen. The controls:
 - a time slider with ticks at the launches, burns, hand-offs, touchdowns, boardings and
-  disembarks, and at Parker's perihelion
-- play at 1 min/s up to 3 h/s
+  disembarks, at Parker's perihelion, and at the regatta's marks laid, warning, gun, first and
+  last finish and marks lifted
+- play at 5 s/s up to 3 h/s
 - trails from 15 min to the whole track
 - labels, a hover readout (position in the entity's own frame), and a clickable legend that
   hides a category
@@ -62,6 +73,29 @@ Robots riding a craft are left out (crawlers on a hull, CARGO-01 in flight), sin
 is invisible at orbit scale; following CARGO-01 holds at the pad until it steps off. On Earth sites
 the survey tracks look jagged: a robot moves up to 45 m between its 30 s rows, and the survey
 rows are 10 m apart, so straight lines between samples cut the corners.
+
+## Wind: out/wind.arrow
+
+`run_sim.py` also samples each venue's analytic wind (`sim/wind.py`) onto a 250 m grid every
+minute over the venue's window, an Arrow IPC file with columns `venue`, `t` (UTC), `lat`, `lon`,
+`u` and `v` (m/s east and north, the way the air moves). For the regatta that is 164,346 rows,
+about 9.5 MB. It is a side table, not ledger rows.
+
+## Situation snapshots: tools/snapshot_sim.py
+
+`tools.snapshot_sim` draws an arena as a decision maker would see it at an instant. It reads the
+saved ledger and `wind.arrow` beside it, with no server needed, and writes one PNG per instant
+to `out/snapshots/`. Each PNG has three panels:
+- the whole venue
+- the course, with 5-minute tails, headings, marks while laid, the RC boat and the met buoys over
+  the wind quivers
+- the standings: legs done, next mark, distance and speed, or finishing time, from replaying the
+  stored rows through the referee
+
+```bash
+python -m tools.snapshot_sim out/sim_study_0.arrow --scenario regatta --at 2026-09-05T17:20:00
+python -m tools.snapshot_sim out/sim_study_0.arrow --scenario regatta --every 10m   # 13:00–18:00 ADT
+```
 
 ## Rows: tools/view_sim.py
 

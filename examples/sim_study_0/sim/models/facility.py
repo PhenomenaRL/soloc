@@ -3,7 +3,7 @@
 
 import numpy as np
 
-from sim.geo import enu_basis, geodetic_to_fixed, quat_from_matrix
+from sim.geo import enu_basis, fixed_to_geodetic, geodetic_to_fixed, quat_from_matrix
 from sim.models import Row
 from sim.scenario import AUTHORITY, FACILITY_CADENCE_S, FACILITY_TIMESCALE, FacilitySpec
 from soloc_client import KIND_SOLOC, mint
@@ -17,6 +17,17 @@ class Facility:
         self.position_km = geodetic_to_fixed(spec.body, spec.lat_deg, spec.lon_deg, spec.h_km)
         self.basis = enu_basis(spec.lat_deg, spec.lon_deg)
         self.quaternion = quat_from_matrix(self.basis)
+
+    def geodetic(self, east_m, north_m) -> tuple[np.ndarray, np.ndarray]:
+        """`(lat, lon)` degrees of points on the facility's ENU plane."""
+        enu = np.column_stack([np.ravel(east_m), np.ravel(north_m), np.zeros(np.size(east_m))])
+        lat, lon, _ = fixed_to_geodetic(self.spec.body, self.position_km + enu @ self.basis.T / 1000)
+        return lat, lon
+
+    def enu(self, lat_deg: float, lon_deg: float, h_km: float = 0.0) -> np.ndarray:
+        """`(east, north, up)` metres of a geodetic point."""
+        p = geodetic_to_fixed(self.spec.body, lat_deg, lon_deg, h_km)
+        return self.basis.T @ (p - self.position_km) * 1000
 
     def due(self, t_s: int) -> bool:
         return t_s % FACILITY_CADENCE_S == 0

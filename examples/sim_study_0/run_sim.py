@@ -1,5 +1,6 @@
 """The driver: ticks the scenario on a 5 s grid, appends one batch per 10 min of sim time,
-snapshots the bodies hourly, and saves the ledger.
+snapshots the bodies hourly, and saves the ledger. On an arena's decision tick it flushes first,
+so the arena's policies read the latest rows back through `current_state`.
 
 Run against a freshly started serve.sh (empty ledger). Stops on the first append failure.
 """
@@ -13,13 +14,16 @@ import pyarrow.flight as fl
 
 from sim import scenario as sc
 from sim.roster import roster
+from sim.strategies import load
+from sim.wind import write_table
 from soloc_client import KIND_ABSTRACT, KIND_SOLOC, SolocClient, registry_ipc, tai_ns_from_utc
 
 
 class Sim:
-    def __init__(self, client: SolocClient, seed: int):
+    def __init__(self, client: SolocClient, seed: int, regatta_policy=None):
         self.client = client
-        self.entities = roster(seed, client).entities
+        self.world = roster(seed, client, regatta_policy)
+        self.entities = self.world.entities
         self.t0_ns = tai_ns_from_utc(sc.T0)
         self.buffer = client.buffer()
         self.batches = self.rows = self.snapshots = 0
@@ -55,6 +59,11 @@ class Sim:
     def run(self):
         self.register_names()
         for t_s in range(0, sc.DURATION_S + 1, sc.BASE_TICK_S):
+            deciding = [a for a in self.world.arenas if a.decide_at(t_s)]
+            if deciding:
+                self.flush(t_s - sc.BASE_TICK_S)
+                for arena in deciding:
+                    arena.decide(self.client, t_s)
             self.step(t_s)
             if (t_s + sc.BASE_TICK_S) % sc.BATCH_S == 0 or t_s == sc.DURATION_S:
                 self.flush(t_s)
@@ -66,13 +75,16 @@ def main():
     p.add_argument("--server", default="grpc://localhost:50051")
     p.add_argument("--out", default="out/sim_study_0.arrow")
     p.add_argument("--seed", type=int, default=sc.SEED)
+    p.add_argument("--regatta-policy", metavar="MOD:FN",
+                   help="strategy for the last regatta boat (see docs/arena.md)")
     args = p.parse_args()
 
+    policy = load(args.regatta_policy) if args.regatta_policy else None
     client = SolocClient(args.server)
     if client.query_all().num_rows:
         sys.exit("ledger is not empty; restart serve.sh first")
 
-    sim = Sim(client, args.seed)
+    sim = Sim(client, args.seed, policy)
     started = time.monotonic()
     try:
         sim.run()
@@ -84,8 +96,13 @@ def main():
     out = Path(args.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     print(client.action("save_ledger", {"path": str(out)}))
+    wind_path = out.with_name("wind.arrow")
+    n = write_table(wind_path, [a.wind for a in sim.world.arenas])
+    print(f"{n:,} wind samples → {wind_path}")
     print(f"{len(sim.entities)} entities, {sim.rows:,} entity rows + {sim.snapshots} snapshot rows "
           f"in {time.monotonic() - started:.0f} s")
+    for arena in sim.world.arenas:
+        print(arena.result())
 
 
 if __name__ == "__main__":

@@ -2,12 +2,13 @@
 
 The window is 2026-09-01T00:00 → 2026-09-06T00:00 UTC. The driver (`run_sim.py`) ticks a 5 s
 grid, asks every entity whether it is due, and appends one batch per 10 min of sim time (721
-appends). Each `do_put` is `Ledger::append` (validation, TAI normalisation, topology and cycle
+appends), plus one before every regatta decision tick. Each `do_put` is `Ledger::append` (validation, TAI normalisation, topology and cycle
 checks on every batch), `append_snapshot` adds the celestial bodies from the kernels, and
 `save_ledger` is `Ledger::save_ipc`.
 
-A full run prints `102 entities, 1,168,613 entity rows + 484 snapshot rows` and writes
-`out/sim_study_0.arrow` plus its `out/sim_study_0.arrow.names.arrow` name registry.
+A full run prints `121 entities, 1,221,722 entity rows + 484 snapshot rows` and the regatta's
+finishing order, and writes `out/sim_study_0.arrow` plus its `out/sim_study_0.arrow.names.arrow`
+name registry and the `out/wind.arrow` side table.
 
 `sim/scenario.py` holds the roster and every schedule (times, orbits, airports, lanes); the
 models live in `sim/models/`.
@@ -26,6 +27,10 @@ models live in `sim/models/`.
 | 14 crawlers | their host spacecraft | m | TAI | 30 s | hull robots looping a band around the host's 4 × 2 × 2 m hull, 4 of them on MARS-TRANSFER-1; CRAWLER-01 steps off LUNA-1 onto Shackleton Base 1 h after touchdown and surveys the grid cell the base's own surveyors leave free |
 | 10 aircraft | IAU_EARTH | km | UTC | 60 s | 2-4 great-circle legs among 15 real airports: climb to 11 km, cruise at 900 km/h, descend, 1.5-3 h turnarounds |
 | 20 ships | IAU_EARTH | km | GPST | 60 s | 8 hand-placed sea lanes (Malacca/Suez, Panama, Cape route, transpacific, transatlantic, …) at 22-40 km/h, docking 8-24 h at each end |
+| Bedford Basin | IAU_EARTH | km | TAI | 1 h | the regatta venue, a facility whose ENU frame sits at the course centre in Bedford Basin, Halifax |
+| 10 sailboats, RC-BOAT | Bedford Basin | m | GPST | 5 s on race day (09-05 13:00–18:00 ADT), else 1 h | leave the Bedford Basin Yacht Club docks one a minute from 13:00 ADT, motor through Bedford Bay to the start area, race a 3-lap windward-leeward (1.2 km beat, gun 14:00 ADT) under a strategy each, then motor home. RC-BOAT anchors at the line's starboard end |
+| 4 marks | Bedford Basin | m | TAI | 1 min while laid (13:30–17:30 ADT) | windward mark, a 2-mark leeward gate and the start pin; no rows outside that window |
+| 3 met buoys | Bedford Basin | m | TAI | as the boats | moored; the wind field itself is in `out/wind.arrow` |
 | 4 bodies | ICRF | km | TAI | 1 h | `append_snapshot` of Sun, Earth, Moon, Mars |
 
 - **Frame tree.** The deepest chain is 3 hops: CRAWLER-04 rides the landed LUNA-1, which sits
@@ -54,6 +59,9 @@ models live in `sim/models/`.
 - **Other columns.** Every sim row carries velocity (m/s, in its parent frame), and every row
   except a facility's also carries `mass_kg` and `dimensions` (m). Apart from Parker's,
   `source_id` is `sim.soloc/kinematic_sim_v1` and `estimate_type` is `SIMULATED`.
+- **Arena.** The regatta's boats are stepped online. Every 10 s from the warning signal, the
+  driver flushes its buffer and each boat's strategy reads the fleet and the marks back through
+  `current_state` and returns a heading. See [arena.md](arena.md).
 - **Aiming.** Every command builds the roster with kernel reads through the server, so the Moon
   flight and the Mars transfer are aimed at where the bodies really are.
 
@@ -79,3 +87,9 @@ that already covers the window) after changing `T0` or `T_END`.
   than exactly 900.
 - **Sea lanes** are checked against Natural Earth 1:50m land (`sim/land.py`). At that scale the
   Suez and Panama canals are land, so rows inside the boxes in `land.CANALS` are exempt.
+- **Sailing** is kinematic: polar speed for the true wind at the boat, with tacks and gybes
+  costing sailing time. There is no current, leeway, heel, acceleration or collision, and boats
+  do not affect each other. Natural Earth does not resolve Bedford Basin, so the water check uses
+  `scenario.BASIN_WATER`, simplified from OpenStreetMap.
+- **The venue plane.** Regatta rows sit at z = 0 on the venue's ENU plane, which rises above the
+  sea away from its origin: about 1.1 m at the docks, 3.8 km out.

@@ -22,16 +22,21 @@ per frame, under one name.
 import argparse
 import base64
 import json
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
 
 from sim import DATA
 from sim import scenario as sc
 from sim.ephemeris import Ephemeris
 from sim.geo import EARTH, GCRF, ICRF, MARS, MOON, SUN, quat_from_matrix
 from sim.land import outlines
+from sim.models import regatta as rg
 from sim.roster import roster
+from sim.wind import read_table
 from soloc_client import CENTURY_NS, SolocClient, astronomical, id_bytes, sts_field, tai_ns_from_utc
 from tools.view_sim import load
 
@@ -39,6 +44,8 @@ THREE_JS = DATA / "three.min.js"
 TEMPLATE = Path(__file__).parent / "viewer_template.html"
 EPHEMERIS_STEP_S = 300
 DAY_S = 86400
+VENUE_REACH_KM = 12.0           # the camera distance under which the venue's boats show
+VENUE_VIEW_KM = 4.0             # "Go to" distance
 
 # (name, NAIF id, mean radius km, colour, draw orbit)
 BODIES = (
@@ -136,14 +143,42 @@ def framed(rows: Rows, entity_id: bytes, frame_id: bytes):
     return rows.t_s[k], rows.pos[k] * rows.km[k][:, None], rows.quat[k]
 
 
-def track(name: str, cat: str, t, xyz, quat, wide: bool = False) -> dict | None:
+def track(name: str, cat: str, t, xyz, quat, wide: bool = False, model: str | None = None) -> dict | None:
     """Quaternions are `[w, x, y, z]`, rotating the entity's body axes into its context frame.
-    `wide` keeps positions as float64, for tracks far from their context's centre."""
+    `wide` keeps positions as float64, for tracks far from their context's centre. `model`
+    picks a shape other than the category's."""
     if len(t) == 0:
         return None
-    return {"name": name, "cat": cat, "t": b64(t), "wide": wide,
+    return {"name": name, "cat": cat, "model": model or cat, "t": b64(t), "wide": wide,
             "p": b64(np.asarray(xyz).ravel(), np.float64 if wide else np.float32),
             "q": b64(np.asarray(quat).ravel())}
+
+
+def venue_context(g, rows: Rows, name, wind_path: Path) -> dict:
+    """The regatta venue: a site context with the water, the line and the wind as its layout."""
+    pose, c, vid = Pose(rows, g.venue.id), g.course, g.venue.id
+    tracks = [track(name(b), "sailboat", *on_site(rows, b.id, vid), model="motorboat" if b is g.rc else None)
+              for b in (g.rc, *g.boats)]
+    tracks += [track(name(m), "marker", *on_site(rows, m.id, vid), model="mark") for m in g.marks]
+    tracks += [track(name(b), "marker", *on_site(rows, b.id, vid), model="buoy") for b in g.buoys]
+    ctx = {"id": g.venue.spec.code.lower(), "kind": "site", "layout": "venue", "body": EARTH.name,
+           "name": name(g.venue), "frame": f"{name(g.venue)} ENU",
+           "p": pose.p_km.tolist(), "q": quat_from_matrix(pose.r),
+           "extent": list(sc.REGATTA_WIND.extent_m), "reach": VENUE_REACH_KM, "view": VENUE_VIEW_KM,
+           "water": [[g.venue.enu(a, o)[:2].round(1).tolist() for a, o in ring] for ring in sc.BASIN_WATER],
+           "line": [c.rc.tolist(), c.marks["MARK-PIN"].tolist()],
+           "tracks": [t for t in tracks if t]}
+    if wind_path.exists():
+        w = read_table(wind_path)
+        w = w.filter(pc.equal(w["venue"], g.venue.name))
+        t = w["t"].cast(pa.int64()).to_numpy() - int((sc.T0 - datetime(1970, 1, 1)).total_seconds())
+        times = np.unique(t)
+        first = t == times[0]
+        xy = np.array([g.venue.enu(a, o)[:2] for a, o in zip(w["lat"].to_numpy()[first], w["lon"].to_numpy()[first])])
+        uv = np.column_stack([w["u"].to_numpy(), w["v"].to_numpy()])   # time-major, grid in the same order
+        ctx["wind"] = {"t0": float(times[0]), "step": float(times[1] - times[0]), "n": len(times),
+                       "xy": b64(xy.ravel()), "uv": b64(uv.ravel())}
+    return ctx
 
 
 def ephemeris(eph: Ephemeris, naif: int, t_s: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -252,6 +287,9 @@ def main():
                          "p": poses[f.id].p_km.tolist(), "q": quat_from_matrix(poses[f.id].r),
                          "half": sc.SITE_HALF_WIDTH_M, "roads": list(sc.SITE_ROADS_M),
                          "depot": list(sc.DEPOT_M), "tracks": [t for t in tracks if t]})
+    g = world.regatta
+    if len(rows.of(g.venue.id)):
+        contexts.append(venue_context(g, rows, name, args.path.with_name("wind.arrow")))
 
     events = []
     for c in world.spacecraft:
@@ -268,6 +306,20 @@ def main():
         k = int(np.argmin(np.linalg.norm(p.p - p.sun_p, axis=1)))
         if 0 < k < len(p.t_s) - 1:
             events.append({"t": float(p.t_s[k]), "label": f"{name(p)} perihelion"})
+    if len(rows.of(g.venue.id)):
+        finishes = []
+        for b in g.boats:
+            k = rows.of(b.id)
+            r, _ = rg.replay(g.course, rows.t_s[k], rows.pos[k, :2])
+            if r.finish_s is not None:
+                finishes.append(r.finish_s)
+        events += [{"t": rg.LAID_S[0], "label": "regatta marks laid"},
+                   {"t": rg.WARNING_S, "label": "regatta warning signal"},
+                   {"t": rg.GUN_S, "label": "regatta start gun"},
+                   {"t": rg.LAID_S[1], "label": "regatta marks lifted"}]
+        if finishes:
+            events += [{"t": min(finishes), "label": "regatta first finish"},
+                       {"t": max(finishes), "label": "regatta last finish"}]
 
     data = {"t0": sc.T0.isoformat() + "Z", "duration": sc.DURATION_S, "source": args.path.name,
             "ephemerisStep": EPHEMERIS_STEP_S, "bodies": bodies, "orbits": orbits, "arcs": arcs,

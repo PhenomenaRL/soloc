@@ -382,3 +382,126 @@ DOCKED_AT_T0_S = (2 * 3600, 20 * 3600)   # how long those still stay
 
 def ship_name(i: int) -> str:
     return f"SHIP-{i + 1:02d}"
+
+
+# -- wind: an analytic field per venue (sim/wind.py) ---------------------------------------------
+
+
+@dataclass(frozen=True)
+class WindSpec:
+    """Mean speed and direction, a sinusoidal direction shift, a linear build, and Gaussian
+    puffs advected with the mean wind. Speed and direction hold their `on` values before `on`
+    and their `off` values after `off`. `extent_m` (east lo, hi, north lo, hi, venue ENU m) bounds
+    the puffs, which wrap around it, and the written table."""
+    venue: str
+    tws_m_s: float
+    twd_deg: float                   # compass direction the wind blows from
+    build_m_s_h: float
+    shift_deg: float
+    shift_period_s: float
+    puffs: int
+    puff_radius_m: float             # Gaussian sigma
+    puff_gain: float                 # peak fractional speed-up
+    on: datetime
+    off: datetime
+    extent_m: tuple[float, float, float, float]
+
+
+WIND_GRID_M = 250.0                  # out/wind.arrow: grid spacing and time step
+WIND_TABLE_S = 60
+
+
+# -- regatta: Bedford Basin, Halifax. Children report venue ENU metres about the course centre --
+
+REGATTA_VENUE = FacilitySpec("Bedford Basin", "BBN", EARTH, 44.6970, -63.6380)
+REGATTA_ON = datetime(2026, 9, 5, 16)          # 13:00 ADT, boats leave the dock
+REGATTA_OFF = datetime(2026, 9, 5, 21)         # 18:00 ADT
+REGATTA_WARNING = datetime(2026, 9, 5, 16, 55)
+REGATTA_GUN = datetime(2026, 9, 5, 17)
+REGATTA_TIME_LIMIT = datetime(2026, 9, 5, 19, 30)   # boats still racing are DNF and motor home
+MARKS_LAID = (datetime(2026, 9, 5, 16, 30), datetime(2026, 9, 5, 20, 30))
+
+REGATTA_CADENCE_S = 5                # boats, RC boat and met buoys inside [REGATTA_ON, REGATTA_OFF]
+REGATTA_IDLE_CADENCE_S = 3600        # and outside it
+MARK_CADENCE_S = 60
+DECISION_S = 10
+BOAT_TIMESCALE = "GPST"
+MARK_TIMESCALE = "TAI"
+
+REGATTA_WIND = WindSpec("Bedford Basin", tws_m_s=5.0, twd_deg=200.0, build_m_s_h=0.3,
+                        shift_deg=10.0, shift_period_s=720.0, puffs=6, puff_radius_m=300.0,
+                        puff_gain=0.3, on=REGATTA_ON, off=REGATTA_OFF,
+                        extent_m=(-2750.0, 2250.0, -2500.0, 3750.0))
+
+BOATS = 10
+BOAT_MASS_KG = 1400.0
+BOAT_DIMENSIONS_M = (7.3, 2.7, 11.0)           # L × W × H, the mast included
+RC_NAME = "RC-BOAT"
+RC_MASS_KG = 9000.0
+RC_DIMENSIONS_M = (12.0, 4.0, 4.0)
+MOTOR_M_S = 2.5
+DEPART_EVERY_S = 60                  # from REGATTA_ON: the RC boat, then the boats in turn
+RC_LEAVES_AFTER_S = 300              # after the last boat finishes or is DNF
+
+# Polar: 0 inside the no-go zone, else min(cap, gain · TWS · (floor + (1 − floor) · sin(π (TWA − no-go) / (180 − no-go)))).
+NO_GO_DEG = 40.0
+POLAR_GAIN = 0.65
+POLAR_FLOOR = 0.7
+POLAR_MAX_M_S = 3.5
+TACK_PENALTY_S = 8.0                 # sailing time lost per tack or gybe
+GYBE_PENALTY_S = 5.0
+
+# Windward-leeward: start, W, gate, W, gate, W, finish on the start line from above.
+COURSE_AXIS_DEG = REGATTA_WIND.twd_deg         # compass bearing from the line to the windward mark
+BEAT_M = 1200.0                      # line centre → windward mark; the course centre is halfway
+LINE_M = 250.0                       # RC boat (starboard end) ↔ pin
+GATE_ABOVE_LINE_M = 100.0
+GATE_WIDTH_M = 80.0
+LAPS = 3
+ROUND_RADIUS_M = 30.0
+STAGING_BELOW_LINE_M = 200.0         # boats wait for the warning spread along this line
+STAGING_SPREAD_M = 200.0
+
+DOCK = (44.7260, -63.6639)           # the first berth, off the BBYC shore; boats berth east of it
+BERTH_STEP_M = (15.0, 0.0)
+DOCK_HEADING_DEG = 90.0
+MOTOR_ROUTE = ((44.7180, -63.6653), (44.7113, -63.6602))   # dock → down Bedford Bay → the neck
+
+MET_BUOYS_M = ((-900.0, 0.0), (900.0, -300.0), (0.0, -1500.0))
+MARK_MASS_KG = 25.0
+MARK_DIMENSIONS_M = (1.5, 1.5, 1.8)
+BUOY_MASS_KG = 1500.0
+BUOY_DIMENSIONS_M = (3.0, 3.0, 4.0)
+
+# (lat, lon) rings, simplified to ~25 m from the OpenStreetMap outlines of Bedford Bay and
+# Bedford Basin. The Basin's south edge is OSM's cut across the harbour, not a shore.
+BASIN_WATER = (
+    ((44.7149, -63.6713), (44.7122, -63.6708), (44.7118, -63.6691), (44.7123, -63.6666),
+     (44.7116, -63.6652), (44.7111, -63.6648), (44.7107, -63.6652), (44.7105, -63.6666),
+     (44.7100, -63.6659), (44.7099, -63.6673), (44.7082, -63.6640), (44.7139, -63.6551),
+     (44.7149, -63.6552), (44.7150, -63.6562), (44.7157, -63.6569), (44.7165, -63.6596),
+     (44.7165, -63.6607), (44.7168, -63.6604), (44.7172, -63.6610), (44.7211, -63.6597),
+     (44.7211, -63.6581), (44.7231, -63.6578), (44.7239, -63.6563), (44.7251, -63.6561),
+     (44.7244, -63.6573), (44.7254, -63.6583), (44.7264, -63.6607), (44.7291, -63.6620),
+     (44.7288, -63.6626), (44.7260, -63.6641), (44.7257, -63.6653), (44.7238, -63.6676),
+     (44.7211, -63.6698), (44.7209, -63.6692), (44.7203, -63.6710), (44.7197, -63.6703),
+     (44.7187, -63.6709), (44.7185, -63.6704), (44.7176, -63.6707), (44.7170, -63.6704)),
+    ((44.7082, -63.6640), (44.7065, -63.6630), (44.7056, -63.6631), (44.7039, -63.6616),
+     (44.7015, -63.6604), (44.6991, -63.6599), (44.6948, -63.6604), (44.6915, -63.6597),
+     (44.6910, -63.6590), (44.6898, -63.6593), (44.6881, -63.6588), (44.6803, -63.6511),
+     (44.6766, -63.6223), (44.6808, -63.6143), (44.6824, -63.6132), (44.6844, -63.6140),
+     (44.6854, -63.6135), (44.6853, -63.6142), (44.6864, -63.6144), (44.6883, -63.6159),
+     (44.6896, -63.6161), (44.6896, -63.6166), (44.6918, -63.6168), (44.6917, -63.6175),
+     (44.6933, -63.6170), (44.6921, -63.6187), (44.6942, -63.6161), (44.6958, -63.6167),
+     (44.6979, -63.6188), (44.6992, -63.6209), (44.7031, -63.6234), (44.7035, -63.6233),
+     (44.7044, -63.6276), (44.7059, -63.6298), (44.7066, -63.6316), (44.7066, -63.6330),
+     (44.7059, -63.6333), (44.7067, -63.6349), (44.7063, -63.6337), (44.7070, -63.6328),
+     (44.7083, -63.6349), (44.7087, -63.6373), (44.7092, -63.6372), (44.7092, -63.6366),
+     (44.7096, -63.6370), (44.7099, -63.6387), (44.7109, -63.6407), (44.7106, -63.6418),
+     (44.7125, -63.6469), (44.7129, -63.6470), (44.7123, -63.6500), (44.7128, -63.6510),
+     (44.7138, -63.6513), (44.7137, -63.6526), (44.7142, -63.6530), (44.7139, -63.6551)),
+)
+
+
+def boat_name(i: int) -> str:
+    return f"SAIL-{i + 1:02d}"

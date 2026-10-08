@@ -13,7 +13,7 @@ was recorded under a small `memory_limit` or the server's limit evicted part of 
 
 | Check | What it confirms |
 |---|---|
-| roster | `current_state` holds every facility, spacecraft, probe, robot, crawler, aircraft, ship and body, and nothing else |
+| roster | `current_state` holds every facility, spacecraft, probe, robot, crawler, aircraft, ship, regatta entity and body, and nothing else; the regatta marks are absent, since they were lifted hours before the window ends |
 | names | the `.names.arrow` sibling reloaded a name for every sim entity |
 | units / timescale | only `km`/`m` stored, every row normalised to TAI |
 | schedule | each entity's stored epochs are exactly its model's schedule |
@@ -34,6 +34,11 @@ was recorded under a small `memory_limit` or the server's limit evicted part of 
 | topology | the parent changes are exactly the 10 that the models' phases predict |
 | aircraft | every row between the lowest field and cruise altitude; at rest only on an airfield; 900 km/h (±1%) ground speed at cruise altitude |
 | ships | at sea level; 22-40 km/h (±1%) under way; at rest only at a berth; every row on water |
+| regatta frame | every boat, mark and buoy row is framed on the venue at z = 0, and sits on water (`scenario.BASIN_WATER`); 6 boat rows resolved to IAU_EARTH land on the venue's ENU plane |
+| race | each boat's stored rows, replayed through the referee, start after the gun, round W, gate, W, gate, W in order and finish |
+| polar | while sailing, every row's speed is at most the polar speed for the wind at its position and time (`sim/wind.py`), along its heading |
+| docks | outside race day the boats and RC-BOAT sit at rest in their berths, and all are back by 18:00 ADT |
+| RC boat, marks | RC-BOAT holds the line's starboard end from the warning to the last finish; marks and buoys never move |
 
 Resolving rows through the ledger at historical epochs scans for the parent's pose once per
 `(frame, epoch)`. The resolution checks therefore run on a few epochs, and the per-row checks

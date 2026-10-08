@@ -17,8 +17,10 @@ import pyarrow as pa
 from sim import scenario as sc
 from sim.ephemeris import Ephemeris
 from sim.geo import EARTH, GCRF, ICRF, SUN, fixed_to_geodetic, geodetic_to_fixed
-from sim.land import CANALS, in_canal, on_land
+from sim.land import CANALS, in_canal, in_rings, on_land
+from sim.models import regatta as rg
 from sim.models.robot import HULL_REACH_M
+from sim.models.sailboat import polar, wrap180
 from sim.models.spacecraft import Orbit
 from sim.roster import roster
 from soloc_client import (CENTURY_NS, SolocClient, id_bytes, matches, positions, sts_field,
@@ -95,9 +97,11 @@ def main():
 
     world = roster(args.seed, client)
     body_by_id = {b.frame_id: b for b in sc.SNAPSHOT_BODIES}
+    g = world.regatta
     fleet_models = {"facilities": world.facilities, "spacecraft": world.spacecraft,
                     "probes": world.probes, "robots": world.robots, "crawlers": world.crawlers,
-                    "cargo": world.cargo, "aircraft": world.aircraft, "ships": world.ships}
+                    "cargo": world.cargo, "aircraft": world.aircraft, "ships": world.ships,
+                    "regatta": [g.venue, g.rc, *g.boats, *g.buoys], "marks": g.marks}
     by_id = {e.id: e for e in world.entities}
 
     d = Data(client)
@@ -121,9 +125,13 @@ def main():
     state_ids = set(id_bytes(state.column("entity_id")))
     members = {**{k: {e.id for e in v} for k, v in fleet_models.items()}, "bodies": set(body_by_id)}
     for name, ids in members.items():
-        if fleets[name]:
+        if fleets[name] and name != "marks":
             got = len(state_ids & ids)
             check(f"current_state has all {len(ids)} {name}", got == len(ids), f"{got}")
+    if fleets["marks"]:
+        got = len(state_ids & members["marks"])
+        check(f"current_state omits the {len(members['marks'])} marks, lifted at {utc(sc.seconds(sc.MARKS_LAID[1]))}",
+              got == 0, f"{got} present")
     unknown = state_ids - set(by_id) - set(body_by_id)
     check("current_state has no unknown entities", not unknown, f"{len(unknown)} unknown")
 
@@ -184,6 +192,8 @@ def main():
         check_aircraft(d, fleets["aircraft"])
     if fleets["ships"]:
         check_ships(d, fleets["ships"])
+    if fleets["regatta"]:
+        check_regatta(d, g)
 
     print(f"\n{results.count(True)}/{len(results)} passed")
     sys.exit(0 if all(results) else 1)
@@ -261,6 +271,90 @@ def check_ships(d: Data, ids: set[bytes]):
     canal = int(in_canal(s.lat, s.lon).sum())
     check("every ship row is on water (Natural Earth 1:50m land)", bool(wet.all()),
           f"{int((~wet).sum())} on land; {canal} rows inside the {'/'.join(CANALS)} canal boxes")
+
+
+# -- regatta ----------------------------------------------------------------------------------
+
+
+def check_regatta(d: Data, g):
+    venue, course = g.venue, g.course
+    kids = [e for e in (g.rc, *g.boats, *g.marks, *g.buoys) if e.id in d.index]
+    idx = np.sort(np.concatenate([d.index[e.id] for e in kids]))
+    framed = bool(matches(d.frames[idx], venue.id).all())
+    worst_z = float(np.abs(d.pos[idx, 2]).max())
+    check("regatta rows framed on the venue, on its ENU plane", framed and worst_z == 0.0,
+          f"{len(idx):,} rows, max |z| = {worst_z} m")
+
+    lat, lon = venue.geodetic(d.pos[idx, 0], d.pos[idx, 1])
+    wet = in_rings(lat, lon, sc.BASIN_WATER)
+    check("every regatta row on water (Bedford Bay and Basin polygons)", bool(wet.all()),
+          f"{int((~wet).sum())} dry")
+
+    ks = [d.at(b.id, t) for b in g.boats[:3] for t in (rg.GUN_S, rg.GUN_S + 1800)]
+    fixed = d.resolve(ks, EARTH.frame)
+    local = venue.position_km + d.pos[ks] @ venue.basis.T / 1000
+    err = float(np.linalg.norm(fixed - local, axis=1).max() * 1e6)
+    check(f"boat rows resolved through the venue to IAU_EARTH sit on its ENU plane ({len(ks)} rows)",
+          err <= 1.0, f"max {err:.3f} mm off")
+
+    sub = d.rows.take(pa.array(idx))
+    at = {k: j for j, k in enumerate(idx.tolist())}
+    vel = sub.column("velocity").combine_chunks().flatten().to_numpy().reshape(-1, 3)[:, :2]
+    q = sts_field(sub, "quaternion").flatten().to_numpy().reshape(-1, 4)
+    heading = (90 - np.degrees(2 * np.arctan2(q[:, 3], q[:, 0]))) % 360
+    referees, sailing = {}, []
+    for b in g.boats:
+        k = d.of(b.id)
+        k = k[np.argsort(d.t_s[k], kind="stable")]
+        t = d.t_s[k]
+        r, end = rg.replay(course, t, d.pos[k, :2])
+        referees[b.name] = r
+        sailing += [at[i] for i in k[(t >= rg.WARNING_S) & (t < end)]]
+    done = sorted((r.finish_s, n) for n, r in referees.items() if r.finish_s is not None)
+    late = [n for n, r in referees.items() if r.start_s is not None and r.start_s < rg.GUN_S]
+    ocs = sum(r.ocs for r in referees.values())
+    check(f"replayed from the ledger, every boat started after the gun, rounded {', '.join(course.legs[:-1])} "
+          "in order and finished", len(done) == len(g.boats) and not late,
+          f"{len(done)}/{len(g.boats)} finished, {ocs} OCS"
+          + (f", first {done[0][1]} in {timedelta(seconds=round(done[0][0] - rg.GUN_S))}" if done else ""))
+
+    s = np.array(sailing)
+    twd, tws = np.empty(len(s)), np.empty(len(s))
+    t_rows = d.t_s[idx[s]]
+    for t in np.unique(t_rows):
+        m = t_rows == t
+        twd[m], tws[m] = g.wind.at(d.pos[idx[s[m]], 0], d.pos[idx[s[m]], 1], float(t))
+    speed = np.linalg.norm(vel[s], axis=1)
+    bound = polar(heading[s] - twd, tws)
+    moving = speed > 0
+    along = np.degrees(np.arctan2(vel[s, 0], vel[s, 1])) % 360
+    skew = float(np.abs(wrap180(along - heading[s]))[moving].max(initial=0.0))
+    over = float((speed - bound).max())
+    check("sailing rows: speed ≤ the polar for the wind there, along the heading",
+          over <= 1e-9 and skew <= 1e-6,
+          f"{len(s):,} rows, {int((speed < bound - 1e-9).sum())} slowed by a tack, gybe or luff, "
+          f"max excess {max(over, 0):.1e} m/s, max skew {skew:.1e}°")
+
+    away = []
+    for b in (g.rc, *g.boats):
+        k = d.of(b.id)
+        rest = k[(d.t_s[k] < rg.ON_S) | (d.t_s[k] >= rg.OFF_S)]
+        off = np.linalg.norm(d.pos[rest, :2] - b.berth, axis=1).max()
+        moving = np.abs(vel[[at[i] for i in rest]]).max()
+        if off > 1e-6 or moving > 0:
+            away.append(b.name)
+    check("boats and the RC boat at rest in their berths outside 13:00–18:00 ADT, back by 18:00",
+          not away, f"{len(away)} away" if away else f"{len(g.boats) + 1} boats")
+
+    last = max((f for f, _ in done), default=rg.TIME_LIMIT_S)
+    k = d.of(g.rc.id, rg.WARNING_S, last + 1)
+    miss = float(np.linalg.norm(d.pos[k, :2] - course.rc, axis=1).max())
+    check("the RC boat holds the line's starboard end from the warning to the last finish",
+          miss <= 1e-6, f"{len(k)} rows, max {miss:.1e} m off")
+
+    placed = max(float(np.linalg.norm(d.pos[d.of(m.id), :2] - m.xy, axis=1).max())
+                 for m in (*g.marks, *g.buoys) if m.id in d.index)
+    check("marks and met buoys stay where they were laid", placed <= 1e-9, f"max {placed:.1e} m")
 
 
 # -- robots -----------------------------------------------------------------------------------
