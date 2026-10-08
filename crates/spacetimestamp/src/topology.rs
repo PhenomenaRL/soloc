@@ -92,10 +92,11 @@ pub struct IngestOutcome {
 /// The parent graph derived from ingested rows.
 ///
 /// Stores topology only, no pose data. `latest` is the O(1) fast path for
-/// "who is X's parent right now"; `log` is the append-only history that makes
-/// "who was X's parent at epoch E" answerable. There is no deletion. A topology
-/// correction is just another event that supersedes the old edge, mirroring how
-/// the ledger already corrects bad poses.
+/// "who is X's parent right now"; `log` is the history that makes "who was X's parent
+/// at epoch E" answerable. A topology correction is just another event that supersedes
+/// the old edge, mirroring how the ledger already corrects bad poses. The log's only
+/// deletion is [`TransformTree::trim_before`], which bounds it to the ledger's window and
+/// keeps every edge in force within it.
 #[derive(Debug, Clone, Default)]
 pub struct TransformTree {
     /// child_id → (parent_id, epoch the edge took effect).
@@ -407,6 +408,38 @@ impl TransformTree {
             events,
             latest_rows,
         })
+    }
+
+    /// Drops the history no query at or after `window_start` can reach. Returns the number
+    /// of events removed.
+    ///
+    /// For each child, keeps every event at or after `window_start`, plus its latest event
+    /// before it: the edge in force when the window opens. So `parent_at` answers the same
+    /// for every epoch `≥ window_start`. Among equal-epoch events the later-logged one is
+    /// the one in force, matching `parent_at`. `latest` is untouched.
+    pub fn trim_before(&mut self, window_start: Duration) -> usize {
+        // child → log index of its edge in force at `window_start`
+        let mut in_force: IdMap<usize> = IdMap::default();
+        for (i, event) in self.log.iter().enumerate() {
+            if event.epoch >= window_start {
+                continue;
+            }
+            let newer_kept = in_force
+                .get(&event.child_id)
+                .is_some_and(|&j| self.log[j].epoch > event.epoch);
+            if !newer_kept {
+                in_force.insert(event.child_id, i);
+            }
+        }
+
+        let before = self.log.len();
+        let mut i = 0;
+        self.log.retain(|event| {
+            let keep = event.epoch >= window_start || in_force.get(&event.child_id) == Some(&i);
+            i += 1;
+            keep
+        });
+        before - self.log.len()
     }
 
     /// Records `event` in the log and advances `latest` if it is not superseded.
@@ -867,6 +900,79 @@ mod tests {
         assert_eq!(tree.parent_at(ent("robot"), ns(499)), Some(ent("facility")));
         assert_eq!(tree.parent_at(ent("robot"), ns(500)), Some(ent("truck")));
         assert_eq!(tree.parent_at(ent("robot"), ns(9999)), Some(ent("truck")));
+    }
+
+    /// Trimming keeps the edge in force at the window start and everything after it, so
+    /// every in-window epoch answers as before; only pre-window history is gone.
+    #[test]
+    fn test_trim_before_keeps_the_edge_in_force() {
+        let mut tree = TransformTree::new();
+        for (parent, t) in [("facility", 100), ("truck", 500), ("ship", 2000)] {
+            tree.ingest_batch(&make_batch(&[(ent("robot"), ent(parent), t)]), "entity_id")
+                .unwrap();
+        }
+        let in_window = [1000, 1999, 2000, 9999];
+        let before: Vec<_> = in_window
+            .iter()
+            .map(|&t| tree.parent_at(ent("robot"), ns(t)))
+            .collect();
+
+        assert_eq!(tree.trim_before(ns(1000)), 1, "only the facility edge goes");
+        assert_eq!(tree.log_len(), 2);
+        let after: Vec<_> = in_window
+            .iter()
+            .map(|&t| tree.parent_at(ent("robot"), ns(t)))
+            .collect();
+        assert_eq!(after, before);
+        assert_eq!(tree.parent_at(ent("robot"), ns(1000)), Some(ent("truck")));
+        assert_eq!(
+            tree.parent_at(ent("robot"), ns(100)),
+            None,
+            "pre-window history"
+        );
+    }
+
+    /// An entity that never re-parents after the window opens keeps its only edge, so it
+    /// and every chain through it still resolve inside the window.
+    #[test]
+    fn test_trim_before_keeps_a_static_entity_resolvable() {
+        let earth = PrescribedId::astronomical_from_name("IAU_EARTH").unwrap();
+        let mut tree = TransformTree::new();
+        tree.ingest_batch(&make_batch(&[(ent("beacon"), earth, 0)]), "entity_id")
+            .unwrap();
+        tree.ingest_batch(
+            &make_batch(&[(ent("rover"), ent("beacon"), 5000)]),
+            "entity_id",
+        )
+        .unwrap();
+
+        assert_eq!(tree.trim_before(ns(5000)), 0);
+        assert_eq!(
+            tree.ancestry_at(ent("rover"), ns(6000)).unwrap(),
+            vec![ent("rover"), ent("beacon"), earth]
+        );
+    }
+
+    /// Among equal-epoch events before the window, the later-logged one is in force, as
+    /// `parent_at` reads it, so that is the one kept.
+    #[test]
+    fn test_trim_before_tie_keeps_the_later_logged_event() {
+        let mut tree = TransformTree::new();
+        tree.ingest_batch(
+            &make_batch(&[(ent("robot"), ent("facility"), 100)]),
+            "entity_id",
+        )
+        .unwrap();
+        tree.ingest_batch(
+            &make_batch(&[(ent("robot"), ent("truck"), 100)]),
+            "entity_id",
+        )
+        .unwrap();
+        let before = tree.parent_at(ent("robot"), ns(150));
+
+        assert_eq!(tree.trim_before(ns(200)), 1);
+        assert_eq!(tree.parent_at(ent("robot"), ns(150)), before);
+        assert_eq!(before, Some(ent("truck")));
     }
 
     #[test]

@@ -1,0 +1,10 @@
+# soloc-server config for sim_study_0. serve.sh points $SOLOC_CONFIG here; set $SOLOC_CONFIG
+# yourself to use another file. Kernels come from serve.sh ($SOLOC_KERNEL_PATHS), not from here.
+
+[storage]
+# Cap on the ledger's resident memory. Past it, the server evicts the oldest rows for good and
+# keeps each entity's latest row, so the ledger holds a rolling window of recent history.
+# The full 5-day sim is ~575 MB, so 2GB holds all of it and nothing is evicted.
+# Units: B, KB, MB, GB, TB (powers of 1000) or KiB, MiB, GiB, TiB (powers of 1024).
+# Remove the line to keep every row with no cap. See "Memory limit" in README.md.
+memory_limit = "2GB"

@@ -4,8 +4,12 @@
 //! overwrites existing data. Measured observations (from telescopes, sensors, manual input)
 //! and simulation outputs (`estimate_type = SIMULATED`) coexist in the same store
 //! and are distinguished by their `estimate_type` field.
+//!
+//! Batches are held as bounded segments. Under a memory limit
+//! ([`Ledger::set_memory_limit`]) the oldest segments are evicted, keeping each entity's
+//! latest row, so the ledger holds a rolling window of recent history.
 
-use arrow::array::{Array, BooleanBuilder, FixedSizeBinaryArray};
+use arrow::array::{Array, ArrayData, BooleanBuilder, FixedSizeBinaryArray, UInt64Array};
 use arrow::datatypes::{Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use hifitime::{Duration, Epoch};
@@ -14,7 +18,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anise::prelude::Almanac;
-use spacetimestamp::ephemeris::j2000_tai;
+use spacetimestamp::ephemeris::{epoch_from_parts, j2000_tai};
 use spacetimestamp::identity::{
     IdMap, IdSet, NameRegistry, PrescribedId, as_id_column, id_at, id_type, registry_schema,
 };
@@ -24,15 +28,26 @@ use spacetimestamp::schema::StsColumns;
 use spacetimestamp::topology::TransformTree;
 use spacetimestamp::transforms::{ResolvedFrame, normalize_batch_to_tai, transform_batch};
 use spacetimestamp::validation::{validate_spacetimestamp_batch, validate_sts_schema};
-use spacetimestamp::vocabulary::LengthUnit;
+use spacetimestamp::vocabulary::{LengthUnit, TimeScaleCode};
 
 use spacetimestamp::schemas::SpaceTimestampSchema;
 
-/// Merge batches in memory when the count exceeds this to keep query latency bounded.
+/// Seal the unsealed tail into one segment when it holds more batches than this, to keep
+/// query latency bounded.
 ///
 /// Benchmarks show ~11 µs fixed overhead per batch. At 50 batches of ≥1000 rows each,
 /// time-filter queries stay under ~1 ms. Beyond this threshold, merging pays off.
 const SEGMENT_THRESHOLD: usize = 50;
+
+/// The largest segment the ledger holds with no memory limit: the tail seals when it holds
+/// more bytes than this, so a few large appends still produce bounded segments. Under a limit
+/// the target can be smaller (see [`Ledger::segment_target`]).
+const SEGMENT_TARGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Under a memory limit, segments are kept to at most this fraction of it (see
+/// [`Ledger::segment_target`]), so eviction never has to drop more than an eighth of the
+/// budget at once.
+const SEGMENTS_PER_LIMIT: usize = 8;
 
 /// Default staleness window for [`Ledger::current_state`] when `not_before` is not supplied.
 /// Rows older than (latest stored timestamp − this window) are excluded.
@@ -62,7 +77,20 @@ pub struct Ledger {
     /// The Arrow schema this ledger was created with. Stored so it is always
     /// available even when the ledger is empty (no batches yet).
     schema: SchemaRef,
-    batches: Vec<RecordBatch>,
+    /// Rows kept past eviction because each is still its entity's latest. First in
+    /// iteration order (see [`Ledger::all_segments`]).
+    pinned: Option<Segment>,
+    /// Sealed segments, oldest first. A sealed segment is never copied again.
+    segments: Vec<Segment>,
+    /// One segment per append since the last seal, oldest first.
+    tail: Vec<Segment>,
+    /// Sum of [`Segment::bytes`] over `pinned`, `segments` and `tail`.
+    resident_bytes: usize,
+    /// Byte budget for `resident_bytes`, enforced by eviction. `None` keeps every row.
+    memory_limit: Option<usize>,
+    /// Set once the over-budget warning has been logged, so it is not repeated on every
+    /// append. Cleared when eviction brings the ledger back within budget.
+    over_budget_warned: bool,
     /// Name of the entity-identity column (e.g. `"entity_id"`). Empty string = no id column.
     id_column: String,
     /// Parent graph derived from appended rows. Topology only, never a pose value.
@@ -72,6 +100,106 @@ pub struct Ledger {
     latest_pose: IdMap<LatestPose>,
     /// Display names for the ids this ledger has been told about.
     names: NameRegistry,
+}
+
+/// One immutable stored batch, with its epoch range and size measured once.
+#[derive(Debug)]
+struct Segment {
+    batch: RecordBatch,
+    /// Earliest row epoch, as an offset from J2000 TAI. For an empty batch it is greater than
+    /// `max_epoch`, so every range check skips it.
+    min_epoch: Duration,
+    /// Latest row epoch, as an offset from J2000 TAI.
+    max_epoch: Duration,
+    /// [`allocated_bytes`] of `batch`.
+    bytes: usize,
+}
+
+impl Segment {
+    /// Measures `batch`. Epochs honour each row's `timescale_id`, so the range is right even
+    /// for a loaded batch that was never normalised to TAI.
+    fn new(batch: RecordBatch) -> Result<Self, String> {
+        let (mut min_epoch, mut max_epoch) = (Duration::MAX, Duration::MIN);
+        let sts = StsColumns::try_new(&batch)?;
+        for row in 0..batch.num_rows() {
+            let (centuries, nanos) = sts.epoch_parts_at(row);
+            let epoch = match sts.timescale_at(row)? {
+                TimeScaleCode::TAI => Duration::from_parts(centuries, nanos),
+                ts => epoch_from_parts(centuries, nanos, ts.into()) - j2000_tai(),
+            };
+            min_epoch = min_epoch.min(epoch);
+            max_epoch = max_epoch.max(epoch);
+        }
+        let bytes = allocated_bytes(&batch);
+        Ok(Self {
+            batch,
+            min_epoch,
+            max_epoch,
+            bytes,
+        })
+    }
+
+    /// Whether any row may fall in the inclusive range `[start, end]`.
+    fn overlaps(&self, start: Duration, end: Duration) -> bool {
+        self.min_epoch <= end && self.max_epoch >= start
+    }
+}
+
+/// Every allocation `batch`'s buffers live in: its start address → its capacity in bytes.
+fn allocations(batch: &RecordBatch) -> HashMap<*const u8, usize> {
+    let mut found = HashMap::new();
+    let mut pending: Vec<ArrayData> = batch.columns().iter().map(|c| c.to_data()).collect();
+    while let Some(data) = pending.pop() {
+        let nulls = data.nulls().map(|n| n.buffer());
+        for buffer in data.buffers().iter().chain(nulls) {
+            found.insert(buffer.data_ptr().as_ptr().cast_const(), buffer.capacity());
+        }
+        pending.extend(data.child_data().iter().cloned());
+    }
+    found
+}
+
+/// Bytes held by `batch`'s buffers, counting each underlying allocation once.
+///
+/// Arrow's `get_array_memory_size` charges a shared allocation to every array that slices
+/// it. A batch decoded from IPC or Flight keeps all its arrays in one message body, so that
+/// count comes out many times what the batch actually holds.
+fn allocated_bytes(batch: &RecordBatch) -> usize {
+    allocations(batch).values().sum()
+}
+
+/// Whether `bytes` is close enough to `target` to leave unsplit: at most an eighth over.
+///
+/// The slack stops a chunk that was cut to size from being split again when it is
+/// re-measured a few bytes larger (buffer padding, or the IPC body it is reloaded into).
+fn within_target(bytes: usize, target: usize) -> bool {
+    bytes <= target + target / 8
+}
+
+/// `batch` as segments of about `max_bytes` each: one uncopied segment when it is
+/// [`within_target`], else row-range chunks in order, cut to `max_bytes`. A chunk can exceed
+/// its share by its buffers' 64-byte alignment padding.
+///
+/// Each chunk is copied into its own buffers, so evicting one frees its memory. A zero-copy
+/// slice would keep the whole original allocation alive, and so would a single-input
+/// `concat`, which arrow returns as a slice.
+fn split_oversized(batch: &RecordBatch, max_bytes: usize) -> Result<Vec<Segment>, String> {
+    let (bytes, rows) = (allocated_bytes(batch), batch.num_rows());
+    if within_target(bytes, max_bytes) || rows < 2 {
+        return Ok(vec![Segment::new(batch.clone())?]);
+    }
+    // Rounded down, so a chunk's share of the bytes stays within `max_bytes`.
+    let chunk_rows = (rows * max_bytes / bytes).max(1);
+    (0..rows)
+        .step_by(chunk_rows)
+        .map(|start| {
+            let end = (start + chunk_rows).min(rows) as u64;
+            let indices = UInt64Array::from_iter_values(start as u64..end);
+            let chunk = arrow::compute::take_record_batch(batch, &indices)
+                .map_err(|e| format!("failed to split a batch: {e}"))?;
+            Segment::new(chunk)
+        })
+        .collect()
 }
 
 /// The most recent pose ingested for one entity. This is the pose cache for
@@ -98,14 +226,7 @@ impl Ledger {
     /// exists in the schema.
     pub fn new(schema: &SchemaRef, id_column: &str) -> Result<Self, String> {
         Self::validate_schema(schema, id_column)?;
-        Ok(Self {
-            schema: schema.clone(),
-            batches: Vec::new(),
-            id_column: id_column.to_string(),
-            transform_tree: TransformTree::new(),
-            latest_pose: IdMap::default(),
-            names: NameRegistry::new(),
-        })
+        Ok(Self::from_parts(schema.clone(), id_column))
     }
 
     /// Creates an empty ledger from a [`SpaceTimestampSchema`] implementor.
@@ -187,7 +308,8 @@ impl Ledger {
     pub fn append(&mut self, batch: RecordBatch) -> Result<(), String> {
         let batch = conform_to_schema(batch, &self.schema)?;
         validate_spacetimestamp_batch(&batch)?;
-        let normalized = normalize_batch_to_tai(&batch)?;
+        // Measured before anything is mutated, so a failure here leaves the ledger unchanged.
+        let segment = Segment::new(normalize_batch_to_tai(&batch)?)?;
 
         // Topology is derived from the *normalised* rows so every epoch compared is on the
         // TAI scale. A batch that would introduce a cycle, or that names a frame which
@@ -195,11 +317,10 @@ impl Ledger {
         // so a rejected batch leaves the tree untouched and nothing is pushed below.
         let outcome = self
             .transform_tree
-            .ingest_batch(&normalized, &self.id_column)?;
-        self.update_pose_cache(&normalized, outcome.latest_rows);
+            .ingest_batch(&segment.batch, &self.id_column)?;
+        self.update_pose_cache(&segment.batch, outcome.latest_rows);
 
-        self.batches.push(normalized);
-        self.seal_and_flush_if_needed();
+        self.push_segment(segment);
         Ok(())
     }
 
@@ -208,20 +329,39 @@ impl Ledger {
     /// Errors if the stored data contains a cycle, which a ledger built through `append`
     /// cannot produce; a file that trips this was written by something that bypassed it.
     fn rebuild_derived_state(&mut self) -> Result<(), String> {
-        if self.id_column.is_empty() || self.batches.is_empty() {
+        if self.id_column.is_empty() {
             return Ok(());
         }
-        // Moved out so the ingest below can borrow the batches while mutating self.
-        let batches = std::mem::take(&mut self.batches);
-        let result = (|| {
-            for batch in &batches {
-                let outcome = self.transform_tree.ingest_batch(batch, &self.id_column)?;
-                self.update_pose_cache(batch, outcome.latest_rows);
-            }
-            Ok(())
-        })();
-        self.batches = batches;
-        result
+        // Cloned (cheap, `Arc`s) so the ingest below can mutate self.
+        let batches: Vec<RecordBatch> = self.all_batches().cloned().collect();
+        for batch in &batches {
+            let outcome = self.transform_tree.ingest_batch(batch, &self.id_column)?;
+            self.update_pose_cache(batch, outcome.latest_rows);
+        }
+        Ok(())
+    }
+
+    /// Every stored segment in insertion order: pinned, then sealed, then tail.
+    fn all_segments(&self) -> impl Iterator<Item = &Segment> {
+        self.pinned.iter().chain(&self.segments).chain(&self.tail)
+    }
+
+    /// Every stored batch, in the order of [`Ledger::all_segments`].
+    fn all_batches(&self) -> impl Iterator<Item = &RecordBatch> {
+        self.all_segments().map(|s| &s.batch)
+    }
+
+    /// The stored batches that may hold rows passing `filter`'s time range.
+    fn batches_for<'a>(
+        &'a self,
+        filter: &SpatiotemporalFilter,
+    ) -> impl Iterator<Item = &'a RecordBatch> + 'a {
+        let range = filter
+            .time_range
+            .map(|(start, end)| (start - j2000_tai(), end - j2000_tai()));
+        self.all_segments()
+            .filter(move |s| range.is_none_or(|(start, end)| s.overlaps(start, end)))
+            .map(|s| &s.batch)
     }
 
     /// Drops the pose cache, forcing [`Ledger::resolve_frame_at`] down its scan path.
@@ -267,26 +407,214 @@ impl Ledger {
         }
     }
 
-    /// Merges all batches into one when the batch count exceeds [`SEGMENT_THRESHOLD`].
+    /// Adds `segment` to the tail, seals the tail if it has grown past a threshold, then
+    /// evicts down to the memory limit.
+    fn push_segment(&mut self, segment: Segment) {
+        self.resident_bytes += segment.bytes;
+        self.tail.push(segment);
+        self.seal_tail_if_needed();
+        self.enforce_memory_limit();
+    }
+
+    /// Caps [`Ledger::resident_bytes`] at `limit` by evicting the oldest data, or lifts the
+    /// cap with `None`. Applies immediately.
     ///
-    /// If concat fails (schema mismatch, OOM), the ledger is left unchanged.
-    fn seal_and_flush_if_needed(&mut self) {
-        if self.batches.len() <= SEGMENT_THRESHOLD {
+    /// Eviction drops whole sealed segments, oldest `max_epoch` first, and evicted rows are
+    /// gone. Each entity's latest row is kept ("pinned"), so `current_state` and
+    /// present-epoch transforms still see every entity, and the topology log is trimmed to
+    /// the window that remains. The unsealed tail is never evicted, so the ledger can stay
+    /// over budget by up to the tail plus the pinned rows.
+    ///
+    /// The limit bounds [`Ledger::resident_bytes`], not the process: decode buffers and
+    /// memory the allocator keeps after frees come on top of it.
+    ///
+    /// Segments are kept to about an eighth of the limit (at most 256 MiB). Sealed segments
+    /// well over that (e.g. a file saved before segments existed) are first split into copied
+    /// chunks, one segment at a time, so eviction can drop them a piece at a time.
+    ///
+    /// Errors for a ledger with no id column, which has no entities whose rows to pin.
+    pub fn set_memory_limit(&mut self, limit: Option<usize>) -> Result<(), String> {
+        if limit.is_some() && self.id_column.is_empty() {
+            return Err(
+                "a memory limit needs an id column: without one, no row is any entity's latest \
+                 and eviction could drop everything"
+                    .to_string(),
+            );
+        }
+        self.memory_limit = limit;
+        self.over_budget_warned = false;
+        self.split_sealed_segments();
+        self.enforce_memory_limit();
+        Ok(())
+    }
+
+    /// The largest segment the ledger should hold: [`SEGMENT_TARGET_BYTES`], or
+    /// 1/[`SEGMENTS_PER_LIMIT`] of the memory limit when that is smaller.
+    fn segment_target(&self) -> usize {
+        self.memory_limit.map_or(SEGMENT_TARGET_BYTES, |limit| {
+            (limit / SEGMENTS_PER_LIMIT).clamp(1, SEGMENT_TARGET_BYTES)
+        })
+    }
+
+    /// Splits every sealed segment not [`within_target`] of [`Ledger::segment_target`], in
+    /// place and in order. A segment that fails to split is kept whole (with one warning), so the ledger
+    /// is never left part-way.
+    fn split_sealed_segments(&mut self) {
+        let target = self.segment_target();
+        for segment in std::mem::take(&mut self.segments) {
+            if within_target(segment.bytes, target) {
+                self.segments.push(segment);
+                continue;
+            }
+            match split_oversized(&segment.batch, target) {
+                Ok(chunks) => {
+                    let chunk_bytes: usize = chunks.iter().map(|c| c.bytes).sum();
+                    self.resident_bytes = self.resident_bytes - segment.bytes + chunk_bytes;
+                    self.segments.extend(chunks);
+                }
+                Err(e) => {
+                    log::warn!("ledger kept a {}-byte segment whole: {e}", segment.bytes);
+                    self.segments.push(segment);
+                }
+            }
+        }
+    }
+
+    /// Evicts sealed segments until within the memory limit, then trims the topology log.
+    fn enforce_memory_limit(&mut self) {
+        let Some(limit) = self.memory_limit else {
+            return;
+        };
+        let mut evicted = false;
+        while self.resident_bytes > limit {
+            let stopped = match self.evict_oldest_segment() {
+                Ok(true) => {
+                    evicted = true;
+                    continue;
+                }
+                Ok(false) => format!(
+                    "only pinned rows and the unsealed tail remain ({} bytes)",
+                    self.resident_bytes
+                ),
+                Err(e) => format!("eviction failed: {e}"),
+            };
+            if !self.over_budget_warned {
+                log::warn!("ledger is over its {limit}-byte memory limit: {stopped}");
+                self.over_budget_warned = true;
+            }
+            break;
+        }
+        if self.resident_bytes <= limit {
+            self.over_budget_warned = false;
+        }
+        if evicted && let Some(start) = self.window_start() {
+            self.transform_tree.trim_before(start);
+        }
+    }
+
+    /// Evicts the sealed segment with the oldest `max_epoch`, first moving its rows that are
+    /// still their entity's latest into `pinned`. Returns `false` if there is no sealed
+    /// segment. On error nothing has changed.
+    fn evict_oldest_segment(&mut self) -> Result<bool, String> {
+        let Some(idx) = (0..self.segments.len()).min_by_key(|&i| self.segments[i].max_epoch) else {
+            return Ok(false);
+        };
+
+        // Build the new pinned set before touching anything. Re-filtering the old pinned
+        // rows drops those a later row has since superseded.
+        let survivors = self.still_latest(&self.segments[idx].batch)?;
+        let pinned = match &self.pinned {
+            Some(old) => {
+                let merged = arrow::compute::concat_batches(&self.schema, [&old.batch, &survivors])
+                    .map_err(|e| format!("failed to merge pinned rows: {e}"))?;
+                self.still_latest(&merged)?
+            }
+            None => survivors,
+        };
+        let pinned = match pinned.num_rows() {
+            0 => None,
+            _ => Some(Segment::new(pinned)?),
+        };
+
+        let victim = self.segments.remove(idx);
+        self.resident_bytes -= victim.bytes;
+        if let Some(old) = self.pinned.take() {
+            self.resident_bytes -= old.bytes;
+        }
+        if let Some(new) = &pinned {
+            self.resident_bytes += new.bytes;
+        }
+        self.pinned = pinned;
+        Ok(true)
+    }
+
+    /// The rows of `batch` still at their entity's latest epoch, which eviction must keep.
+    ///
+    /// Every row at that epoch is kept, not just one, so `current_state`'s priority rule
+    /// still sees every candidate.
+    fn still_latest(&self, batch: &RecordBatch) -> Result<RecordBatch, String> {
+        let Some(cols) = PoseColumns::try_new(batch, &self.id_column) else {
+            return Ok(RecordBatch::new_empty(self.schema.clone()));
+        };
+        let mut mask = BooleanBuilder::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let latest = cols.id_at(row).and_then(|id| self.latest_pose.get(&id));
+            mask.append_value(latest.is_some_and(|p| cols.epoch_at(row) == p.epoch));
+        }
+        apply_boolean_mask(batch, &mask.finish())
+    }
+
+    /// The epoch the ledger holds in full from: the oldest row outside `pinned`.
+    fn window_start(&self) -> Option<Duration> {
+        self.segments
+            .iter()
+            .chain(&self.tail)
+            .filter(|s| s.batch.num_rows() > 0)
+            .map(|s| s.min_epoch)
+            .min()
+    }
+
+    /// Seals the tail once it holds more than [`SEGMENT_THRESHOLD`] batches or
+    /// [`Ledger::segment_target`] bytes: concatenated into one batch (a lone append is used
+    /// as it is), then split down to the segment target.
+    ///
+    /// Only the tail is copied, never an older segment, so total copy work is linear in the
+    /// rows ingested and the extra memory a seal needs is one segment. If the copy fails
+    /// (OOM), the tail stays unsealed and the ledger is otherwise unchanged.
+    fn seal_tail_if_needed(&mut self) {
+        let target = self.segment_target();
+        let tail_bytes: usize = self.tail.iter().map(|s| s.bytes).sum();
+        if self.tail.len() <= SEGMENT_THRESHOLD && tail_bytes <= target {
             return;
         }
-        if let Ok(merged) = arrow::compute::concat_batches(&self.schema, &self.batches) {
-            self.batches = vec![merged];
-        }
+        let merged = match self.tail.as_slice() {
+            [only] => Ok(only.batch.clone()),
+            tail => arrow::compute::concat_batches(&self.schema, tail.iter().map(|s| &s.batch))
+                .map_err(|e| e.to_string()),
+        };
+        let Ok(sealed) = merged.and_then(|batch| split_oversized(&batch, target)) else {
+            return;
+        };
+        let sealed_bytes: usize = sealed.iter().map(|s| s.bytes).sum();
+        self.resident_bytes = self.resident_bytes - tail_bytes + sealed_bytes;
+        self.tail.clear();
+        self.segments.extend(sealed);
     }
 
     /// Returns the number of batches currently stored.
     pub fn len(&self) -> usize {
-        self.batches.len()
+        self.all_segments().count()
     }
 
     /// Returns `true` if the ledger holds no batches.
     pub fn is_empty(&self) -> bool {
-        self.batches.is_empty()
+        self.len() == 0
+    }
+
+    /// Bytes held by the stored batches, each underlying allocation counted once. This is
+    /// what the memory limit bounds; the process uses more (see [`Ledger::set_memory_limit`]).
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
     }
 
     /// Filters all batches and returns the matching rows as a single concatenated
@@ -295,15 +623,16 @@ impl Ledger {
     /// Uses [`spacetimestamp::query::filter_batch`] internally, so the same frame-uniformity
     /// rules apply: spatial filters require all rows to be in the same frame.
     ///
-    /// Returns an empty batch (correct schema, 0 rows) when there are no matches.
+    /// Returns an empty batch (correct schema, 0 rows) when there are no matches. A segment
+    /// whose epoch range misses the filter's time range is skipped unread.
     pub fn query(&self, filter: &SpatiotemporalFilter) -> Result<RecordBatch, String> {
-        if self.batches.is_empty() {
+        if self.is_empty() {
             return Err("Ledger is empty".to_string());
         }
 
         let mut kept: Vec<RecordBatch> = Vec::new();
 
-        for batch in &self.batches {
+        for batch in self.batches_for(filter) {
             let filtered = filter_batch(batch, filter)?;
             if filtered.num_rows() > 0 {
                 kept.push(filtered);
@@ -322,12 +651,12 @@ impl Ledger {
     ///
     /// This is the preferred API for streaming data to eg. a UI renderer. the first
     /// matching batch is yielded immediately rather than waiting for a full ledger scan.
+    /// A segment whose epoch range misses the filter's time range yields nothing.
     pub fn stream_query<'a>(
         &'a self,
         filter: &'a SpatiotemporalFilter,
     ) -> impl Iterator<Item = Result<RecordBatch, String>> + 'a {
-        self.batches
-            .iter()
+        self.batches_for(filter)
             .map(move |batch| filter_batch(batch, filter))
     }
 
@@ -335,7 +664,7 @@ impl Ledger {
     ///
     /// If `entity_ids` is `Some` and this ledger has no `id_column`, returns `None`.
     pub fn latest_snapshot(&self, entity_ids: Option<&[PrescribedId]>) -> Option<RecordBatch> {
-        let last = self.batches.last()?;
+        let last = self.all_batches().last()?;
 
         let ids = match entity_ids {
             None => return Some(last.clone()),
@@ -428,7 +757,7 @@ impl Ledger {
         let mut best_dur: Option<Duration> = None;
         let mut best: Option<ResolvedFrame> = None;
 
-        for batch in &self.batches {
+        for batch in self.all_batches() {
             let Some(cols) = PoseColumns::try_new(batch, &self.id_column) else {
                 continue;
             };
@@ -547,26 +876,23 @@ impl Ledger {
         self.names.merge_batches(&batches)
     }
 
-    /// Merges all batches into a single [`RecordBatch`] for serialisation.
-    fn merge_for_ipc(&self) -> Result<RecordBatch, String> {
-        if self.batches.len() == 1 {
-            return Ok(self.batches[0].clone());
-        }
-        arrow::compute::concat_batches(&self.schema, &self.batches)
-            .map_err(|e| format!("Failed to merge batches for IPC write: {e}"))
+    /// Every stored batch as its own IPC batch, in insertion order. Nothing is concatenated,
+    /// so saving costs no second copy of the ledger.
+    fn batches_for_ipc(&self) -> Vec<RecordBatch> {
+        self.all_batches().cloned().collect()
     }
 
     /// Serializes all batches to an Arrow IPC file at `path`, and the name registry to a
     /// sibling file beside it (see [`names_sibling_path`]).
     pub fn save_ipc(&self, path: &Path) -> Result<(), String> {
-        if self.batches.is_empty() {
+        if self.is_empty() {
             return Err(
                 "Cannot save an empty ledger — use save_schema_ipc to persist just the schema"
                     .to_string(),
             );
         }
 
-        ipc::write_file(path, &[self.merge_for_ipc()?], &self.schema)?;
+        ipc::write_file(path, &self.batches_for_ipc(), &self.schema)?;
 
         let names_path = names_sibling_path(path);
         std::fs::write(&names_path, self.names_to_ipc_bytes()?).map_err(|e| {
@@ -599,7 +925,7 @@ impl Ledger {
     pub fn load_schema_ipc(path: &Path, id_column: &str) -> Result<Self, String> {
         let schema = ipc::read_file_schema(path)?;
         Self::validate_schema(&schema, id_column)?;
-        Ok(Self::from_parts(schema, Vec::new(), id_column))
+        Ok(Self::from_parts(schema, id_column))
     }
 
     /// Serializes the ledger's schema to an in-memory Arrow IPC buffer with zero data batches.
@@ -616,25 +942,16 @@ impl Ledger {
     pub fn from_schema_ipc_bytes(bytes: &[u8], id_column: &str) -> Result<Self, String> {
         let schema = ipc::read_bytes_schema(bytes)?;
         Self::validate_schema(&schema, id_column)?;
-        Ok(Self::from_parts(schema, Vec::new(), id_column))
+        Ok(Self::from_parts(schema, id_column))
     }
 
     /// Returns the maximum stored timestamp as a J2000-relative [`Duration`], or `None`
-    /// if the ledger is empty or contains no parseable timestamps.
+    /// if the ledger holds no rows.
     fn latest_stored_duration(&self) -> Option<Duration> {
-        let mut latest: Option<Duration> = None;
-        for batch in &self.batches {
-            let sts = StsColumns::try_new(batch).ok()?;
-            for row in 0..batch.num_rows() {
-                let (centuries, nanos) = sts.epoch_parts_at(row);
-                let dur = Duration::from_parts(centuries, nanos);
-                latest = Some(match latest {
-                    None => dur,
-                    Some(prev) => prev.max(dur),
-                });
-            }
-        }
-        latest
+        self.all_segments()
+            .filter(|s| s.batch.num_rows() > 0)
+            .map(|s| s.max_epoch)
+            .max()
     }
 
     /// Returns the single best pose per row-key across the entire ledger.
@@ -648,13 +965,13 @@ impl Ledger {
     ///   If this ledger has no `id_column`, an `id_filter` of `Some(_)` returns an empty batch.
     ///
     /// `not_before`: rows whose timestamp is strictly before this epoch are excluded.
-    ///   When `None`, defaults to (latest stored timestamp. [`CURRENT_STATE_WINDOW_NS`]).
+    ///   When `None`, defaults to one hour before the latest stored timestamp.
     pub fn current_state(
         &self,
         id_filter: Option<&[PrescribedId]>,
         not_before: Option<Epoch>,
     ) -> Result<RecordBatch, String> {
-        if self.batches.is_empty() {
+        if self.is_empty() {
             return Err("Ledger is empty".to_string());
         }
 
@@ -674,7 +991,8 @@ impl Ledger {
         // row_key → (epoch_dur, priority, batch_idx, row_idx)
         let mut best: HashMap<RowKey, (Duration, u8, usize, usize)> = HashMap::new();
 
-        for (batch_idx, batch) in self.batches.iter().enumerate() {
+        let batches: Vec<&RecordBatch> = self.all_batches().collect();
+        for (batch_idx, batch) in batches.iter().enumerate() {
             // id column lookup — `None` if absent, wrong type, or null-bearing, in which case
             // the rows below fall back to being keyed by index.
             let eid_col_opt = if self.id_column.is_empty() {
@@ -738,7 +1056,7 @@ impl Ledger {
 
         let mut rows: Vec<RecordBatch> = Vec::with_capacity(best.len());
         for (_, _, batch_idx, row_idx) in best.values() {
-            let batch = &self.batches[*batch_idx];
+            let batch = batches[*batch_idx];
             let mut mask = BooleanBuilder::with_capacity(batch.num_rows());
             for i in 0..batch.num_rows() {
                 mask.append_value(i == *row_idx);
@@ -773,13 +1091,13 @@ impl Ledger {
 
     /// Serializes all batches to an in-memory Arrow IPC buffer.
     pub fn save_ipc_to_bytes(&self) -> Result<Vec<u8>, String> {
-        if self.batches.is_empty() {
+        if self.is_empty() {
             return Err(
                 "Cannot save an empty ledger — use schema_to_ipc_bytes to persist just the schema"
                     .to_string(),
             );
         }
-        ipc::write_bytes(&[self.merge_for_ipc()?], &self.schema)
+        ipc::write_bytes(&self.batches_for_ipc(), &self.schema)
     }
 
     /// Deserializes a ledger from an in-memory Arrow IPC buffer.
@@ -790,11 +1108,16 @@ impl Ledger {
         Self::from_loaded(schema, batches, id_column, "IPC bytes")
     }
 
-    /// Assembles a ledger with no derived state built yet.
-    fn from_parts(schema: SchemaRef, batches: Vec<RecordBatch>, id_column: &str) -> Self {
+    /// Assembles an empty ledger without validating `schema`.
+    fn from_parts(schema: SchemaRef, id_column: &str) -> Self {
         Self {
             schema,
-            batches,
+            pinned: None,
+            segments: Vec::new(),
+            tail: Vec::new(),
+            resident_bytes: 0,
+            memory_limit: None,
+            over_budget_warned: false,
             id_column: id_column.to_string(),
             transform_tree: TransformTree::new(),
             latest_pose: IdMap::default(),
@@ -803,6 +1126,12 @@ impl Ledger {
     }
 
     /// Validates a loaded schema, rejects an empty payload, and rebuilds the derived state.
+    ///
+    /// Each batch becomes a sealed segment as it stands, in saved order: nothing is copied,
+    /// and all of it can be evicted. A loaded ledger has no memory limit yet; setting one
+    /// splits any oversized segment (see [`Ledger::set_memory_limit`]). A file this ledger
+    /// wrote holds at most [`SEGMENT_THRESHOLD`] small batches (its old tail), so the segment
+    /// count stays bounded.
     fn from_loaded(
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
@@ -813,7 +1142,12 @@ impl Ledger {
         if batches.is_empty() {
             return Err(format!("{source} contained no record batches"));
         }
-        let mut ledger = Self::from_parts(schema, batches, id_column);
+        let mut ledger = Self::from_parts(schema, id_column);
+        for batch in batches {
+            let segment = Segment::new(batch)?;
+            ledger.resident_bytes += segment.bytes;
+            ledger.segments.push(segment);
+        }
         ledger.rebuild_derived_state()?;
         Ok(ledger)
     }
@@ -1104,6 +1438,101 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(ledger.len(), 1);
+        assert_eq!((ledger.segments.len(), ledger.tail.len()), (1, 0));
+    }
+
+    /// The column of `segment` as a bare address, to tell whether it was copied.
+    fn column_addr(segment: &Segment) -> *const () {
+        Arc::as_ptr(segment.batch.column(0)) as *const ()
+    }
+
+    /// A second seal concatenates only the new tail; the first sealed segment keeps its
+    /// buffers, so no row is ever copied twice.
+    #[test]
+    fn test_seal_never_recopies_a_sealed_segment() {
+        let mut ledger = make_sts_ledger();
+        let n = SEGMENT_THRESHOLD + 1;
+        for i in 0..n {
+            ledger.append(make_batch([0.0; 3], i as u64)).unwrap();
+        }
+        let first = column_addr(&ledger.segments[0]);
+
+        for i in n..2 * n {
+            ledger.append(make_batch([0.0; 3], i as u64)).unwrap();
+        }
+        assert_eq!(ledger.segments.len(), 2);
+        assert_eq!(column_addr(&ledger.segments[0]), first);
+        assert_eq!(ledger.segments[0].batch.num_rows(), n);
+        assert_eq!(ledger.segments[1].batch.num_rows(), n);
+    }
+
+    /// `resident_bytes` tracks the batches actually held, through appends and seals.
+    #[test]
+    fn test_resident_bytes_is_the_sum_of_stored_batches() {
+        let mut ledger = make_sts_ledger();
+        assert_eq!(ledger.resident_bytes(), 0);
+        for i in 0..SEGMENT_THRESHOLD + 5 {
+            ledger.append(make_batch([0.0; 3], i as u64)).unwrap();
+            let held: usize = ledger.all_batches().map(allocated_bytes).sum();
+            assert_eq!(ledger.resident_bytes(), held, "after append {i}");
+        }
+    }
+
+    /// Segment epoch ranges come from the rows, including a sealed segment's.
+    #[test]
+    fn test_segment_epoch_range() {
+        let mut ledger = make_sts_ledger();
+        for i in 0..=SEGMENT_THRESHOLD {
+            ledger
+                .append(make_batch([0.0; 3], 1000 + i as u64))
+                .unwrap();
+        }
+        let sealed = &ledger.segments[0];
+        assert_eq!(sealed.min_epoch, Duration::from_parts(0, 1000));
+        assert_eq!(
+            sealed.max_epoch,
+            Duration::from_parts(0, 1000 + SEGMENT_THRESHOLD as u64)
+        );
+        assert_eq!(
+            ledger.latest_stored_duration(),
+            Some(Duration::from_parts(0, 1000 + SEGMENT_THRESHOLD as u64))
+        );
+    }
+
+    /// A time range that misses whole segments skips them, and returns exactly the rows a
+    /// full scan would.
+    #[test]
+    fn test_time_range_query_prunes_segments_but_returns_the_same_rows() {
+        let mut ledger = make_sts_ledger();
+        let n = SEGMENT_THRESHOLD + 1;
+        // Two sealed segments, ns [0, n) and [n, 2n), and a tail at ns [2n, 2n + 3).
+        for i in 0..2 * n + 3 {
+            ledger
+                .append(make_batch([i as f64, 0.0, 0.0], i as u64))
+                .unwrap();
+        }
+        assert_eq!((ledger.segments.len(), ledger.tail.len()), (2, 3));
+
+        let at = |ns: usize| j2000() + Duration::from_parts(0, ns as u64);
+        let filter = SpatiotemporalFilter::new().with_time_range(at(n + 5), at(n + 9));
+        assert_eq!(
+            ledger.batches_for(&filter).count(),
+            1,
+            "only the second segment overlaps"
+        );
+
+        let pruned = ledger.query(&filter).unwrap();
+        let mut scanned = 0;
+        for batch in ledger.all_batches() {
+            scanned += filter_batch(batch, &filter).unwrap().num_rows();
+        }
+        assert_eq!(pruned.num_rows(), 5);
+        assert_eq!(pruned.num_rows(), scanned);
+        let streamed: usize = ledger
+            .stream_query(&filter)
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+        assert_eq!(streamed, 5);
     }
 
     #[test]
@@ -1150,13 +1579,431 @@ mod tests {
             Ledger::load_ipc_from_bytes(&bytes, "").unwrap(),
             Ledger::load_ipc(&path, "").unwrap(),
         ] {
-            // Rows are preserved; `merge_for_ipc` concatenates every batch into 1 on save.
-            assert_eq!(loaded.len(), 1);
-            let total_rows: usize = loaded.batches.iter().map(|b| b.num_rows()).sum();
+            // Each stored batch is saved as its own IPC batch, so both come back.
+            assert_eq!(loaded.len(), 2);
+            let total_rows: usize = loaded.all_batches().map(|b| b.num_rows()).sum();
             assert_eq!(total_rows, 2);
         }
 
         remove_saved_ledger(&path);
+    }
+
+    /// A ledger of sealed segments plus a tail saves as many IPC batches and reloads to the
+    /// same batches, in the same order.
+    #[test]
+    fn test_multi_batch_ipc_round_trip_keeps_batches_and_order() {
+        let mut ledger = make_sts_ledger();
+        for i in 0..2 * (SEGMENT_THRESHOLD + 1) + 3 {
+            ledger
+                .append(make_batch([i as f64, 0.0, 0.0], i as u64))
+                .unwrap();
+        }
+        let loaded = Ledger::load_ipc_from_bytes(&ledger.save_ipc_to_bytes().unwrap(), "").unwrap();
+
+        assert_eq!(loaded.len(), ledger.len());
+        let before: Vec<&RecordBatch> = ledger.all_batches().collect();
+        let after: Vec<&RecordBatch> = loaded.all_batches().collect();
+        assert_eq!(before, after);
+        let held: usize = after.iter().copied().map(allocated_bytes).sum();
+        assert_eq!(loaded.resident_bytes(), held);
+    }
+
+    /// Saving after a seal keeps an entity ledger whole: the reloaded ledger has the same
+    /// current state, and resolves the same entity chain at the same epochs.
+    #[test]
+    fn test_save_after_a_seal_round_trips_entity_data() {
+        let earth = PrescribedId::astronomical_from_name("Earth").unwrap();
+        let (base, rover) = (demo("base"), demo("rover"));
+        let ident = [1.0, 0.0, 0.0, 0.0];
+
+        let mut ledger = make_entity_ledger();
+        ledger
+            .append(make_entity_batch(base, earth, [10.0, 0.0, 0.0], ident, 0))
+            .unwrap();
+        for i in 1..=SEGMENT_THRESHOLD + 5 {
+            ledger
+                .append(make_entity_batch(
+                    rover,
+                    base,
+                    [i as f64, 0.0, 0.0],
+                    ident,
+                    i as u64,
+                ))
+                .unwrap();
+        }
+        assert_eq!(ledger.segments.len(), 1, "a seal has happened");
+
+        let loaded =
+            Ledger::load_ipc_from_bytes(&ledger.save_ipc_to_bytes().unwrap(), "entity_id").unwrap();
+
+        let sorted = |l: &Ledger| {
+            let state = l.current_state(None, Some(j2000())).unwrap();
+            let ids = state.column_by_name("entity_id").unwrap();
+            let order = arrow::compute::sort_to_indices(ids, None, None).unwrap();
+            arrow::compute::take_record_batch(&state, &order).unwrap()
+        };
+        assert_eq!(sorted(&loaded), sorted(&ledger));
+
+        // ns 0 predates the rover's first row, so both must agree it does not resolve.
+        assert!(ledger.resolve_to_root(rover, j2000()).is_none());
+        for ns in [0, 1, 30, SEGMENT_THRESHOLD as u64 + 5] {
+            let at = j2000() + Duration::from_parts(0, ns);
+            let before = ledger.resolve_to_root(rover, at);
+            let after = loaded.resolve_to_root(rover, at);
+            assert_eq!(before, after, "at ns {ns}");
+        }
+        let latest = j2000() + Duration::from_parts(0, SEGMENT_THRESHOLD as u64 + 5);
+        let (_, iso) = loaded.resolve_to_root(rover, latest).unwrap();
+        assert_eq!(iso.translation.x, 10.0 + (SEGMENT_THRESHOLD + 5) as f64);
+    }
+
+    // -----------------------------------------------------------------------
+    // memory limit and eviction
+    // -----------------------------------------------------------------------
+
+    /// One entity batch holding a row per `(entity, frame, x_km)`, all at epoch `ns`.
+    fn entity_rows(rows: &[(PrescribedId, PrescribedId, f64)], ns: u64) -> RecordBatch {
+        use crate::schemas::entity::EntityBuilder;
+        let mut b = EntityBuilder::new(rows.len());
+        for &(id, frame, x) in rows {
+            b.append_entity(
+                id,
+                frame,
+                LengthUnit::km,
+                TimeScaleCode::TAI,
+                test_source(),
+                EstimateType::MEASURED,
+                [x, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+                ns,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        b.flush()
+    }
+
+    fn at_ns(ns: u64) -> Epoch {
+        j2000() + Duration::from_parts(0, ns)
+    }
+
+    /// The bytes a full unsealed tail of `batch(t)` appends occupies, so a test can set a
+    /// limit that the tail alone never exceeds.
+    fn full_tail_bytes(batch: impl Fn(u64) -> RecordBatch) -> usize {
+        let mut probe = make_entity_ledger();
+        for t in 0..SEGMENT_THRESHOLD as u64 {
+            probe.append(batch(t)).unwrap();
+        }
+        probe.resident_bytes()
+    }
+
+    fn row_count(ledger: &Ledger) -> usize {
+        ledger.all_batches().map(|b| b.num_rows()).sum()
+    }
+
+    /// A batch decoded from IPC (or Flight) keeps every array in one message body. Each
+    /// allocation must count once, or a reloaded ledger reports many times its real size
+    /// and the memory limit evicts far too much.
+    #[test]
+    fn test_resident_bytes_count_a_shared_ipc_allocation_once() {
+        let earth = PrescribedId::astronomical_from_name("Earth").unwrap();
+        let mut ledger = make_entity_ledger();
+        for t in 0..200 {
+            ledger
+                .append(entity_rows(&[(demo("bot"), earth, 1.0)], t))
+                .unwrap();
+        }
+        let bytes = ledger.save_ipc_to_bytes().unwrap();
+        let loaded = Ledger::load_ipc_from_bytes(&bytes, "entity_id").unwrap();
+        assert!(
+            loaded.resident_bytes() <= 2 * bytes.len(),
+            "{} resident for a {}-byte file",
+            loaded.resident_bytes(),
+            bytes.len()
+        );
+    }
+
+    /// One batch holding `bot`'s track for epochs `0..n` ns, one row each, x = epoch: the
+    /// shape of a file saved before segments existed.
+    fn timeline(n: u64) -> RecordBatch {
+        let earth = PrescribedId::astronomical_from_name("Earth").unwrap();
+        let steps: Vec<RecordBatch> = (0..n)
+            .map(|t| entity_rows(&[(demo("bot"), earth, t as f64)], t))
+            .collect();
+        arrow::compute::concat_batches(&steps[0].schema(), &steps).unwrap()
+    }
+
+    /// An oversized batch splits into copied chunks: they reassemble the original rows in
+    /// order, each is within the cap, and none shares an allocation with the original, so
+    /// evicting one frees its memory.
+    #[test]
+    fn test_split_oversized_copies_chunks_within_the_cap() {
+        let batch = timeline(1000);
+        let cap = allocated_bytes(&batch) / 4;
+        let chunks = split_oversized(&batch, cap).unwrap();
+
+        assert!(chunks.len() >= 4, "{} chunks", chunks.len());
+        let rejoined =
+            arrow::compute::concat_batches(&batch.schema(), chunks.iter().map(|c| &c.batch))
+                .unwrap();
+        assert_eq!(rejoined, batch);
+        let original = allocations(&batch);
+        for chunk in &chunks {
+            // Each buffer is padded to 64 bytes, so a chunk may exceed its share by that much.
+            let padding = 64 * allocations(&chunk.batch).len();
+            assert!(chunk.bytes <= cap + padding, "{} > {cap}", chunk.bytes);
+            assert!(
+                allocations(&chunk.batch)
+                    .keys()
+                    .all(|p| !original.contains_key(p))
+            );
+        }
+    }
+
+    /// A batch within the cap comes back as it is, with no copy.
+    #[test]
+    fn test_split_oversized_keeps_a_batch_within_the_cap() {
+        let batch = timeline(10);
+        let chunks = split_oversized(&batch, allocated_bytes(&batch)).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(allocations(&chunks[0].batch), allocations(&batch));
+    }
+
+    /// A ledger loaded from a single-batch file holds one big segment. Setting a limit splits
+    /// it to the segment target first, so eviction keeps a recent window rather than dropping
+    /// the whole segment and leaving only pinned rows.
+    #[test]
+    fn test_memory_limit_splits_a_loaded_single_batch_segment() {
+        let mut source = make_entity_ledger();
+        source.append(timeline(1000)).unwrap();
+        let mut ledger =
+            Ledger::load_ipc_from_bytes(&source.save_ipc_to_bytes().unwrap(), "entity_id").unwrap();
+        assert_eq!(ledger.segments.len(), 1);
+
+        let limit = ledger.resident_bytes() / 2;
+        ledger.set_memory_limit(Some(limit)).unwrap();
+
+        assert!(ledger.resident_bytes() <= limit);
+        let target = limit / SEGMENTS_PER_LIMIT;
+        assert!(
+            ledger
+                .segments
+                .iter()
+                .all(|s| within_target(s.bytes, target))
+        );
+        let kept = row_count(&ledger);
+        assert!(kept > 250, "only {kept} of 1000 rows kept");
+        assert!(ledger.window_start().unwrap() > Duration::from_parts(0, 0));
+    }
+
+    /// Segments cut to size under a limit are not split again when the ledger is saved and
+    /// reloaded under the same limit, though the reload measures them a few bytes larger.
+    #[test]
+    fn test_reload_under_the_same_limit_does_not_resplit() {
+        let batch = timeline(1000);
+        let limit = allocated_bytes(&batch) / 2;
+        let mut ledger = make_entity_ledger();
+        ledger.set_memory_limit(Some(limit)).unwrap();
+        ledger.append(batch).unwrap();
+
+        let mut loaded =
+            Ledger::load_ipc_from_bytes(&ledger.save_ipc_to_bytes().unwrap(), "entity_id").unwrap();
+        loaded.set_memory_limit(Some(limit)).unwrap();
+        assert_eq!(loaded.len(), ledger.len());
+        assert_eq!(row_count(&loaded), row_count(&ledger));
+    }
+
+    /// One append larger than the segment target is split when it seals, so eviction can
+    /// still keep part of it.
+    #[test]
+    fn test_memory_limit_splits_an_oversized_append() {
+        let batch = timeline(1000);
+        let limit = allocated_bytes(&batch) / 2;
+        let mut ledger = make_entity_ledger();
+        ledger.set_memory_limit(Some(limit)).unwrap();
+        ledger.append(batch).unwrap();
+
+        assert!(ledger.resident_bytes() <= limit);
+        let kept = row_count(&ledger);
+        assert!(kept > 250, "only {kept} of 1000 rows kept");
+        assert!(kept < 1000, "nothing was evicted");
+    }
+
+    #[test]
+    fn test_set_memory_limit_requires_an_id_column() {
+        let mut ledger = make_sts_ledger();
+        assert!(ledger.set_memory_limit(Some(1 << 20)).is_err());
+        assert!(ledger.set_memory_limit(None).is_ok());
+    }
+
+    /// Over a long run, resident bytes never exceed the limit (which is above what the tail
+    /// alone can hold), old rows are evicted, and every entity's latest row survives.
+    #[test]
+    fn test_memory_limit_bounds_resident_bytes() {
+        let earth = PrescribedId::astronomical_from_name("Earth").unwrap();
+        let (a, b) = (demo("a"), demo("b"));
+        let batch = |t: u64| entity_rows(&[(a, earth, t as f64), (b, earth, 0.0)], t);
+        let limit = 4 * full_tail_bytes(batch);
+
+        let mut ledger = make_entity_ledger();
+        ledger.set_memory_limit(Some(limit)).unwrap();
+        let steps = 20 * (SEGMENT_THRESHOLD as u64 + 1);
+        for t in 0..steps {
+            ledger.append(batch(t)).unwrap();
+            assert!(
+                ledger.resident_bytes() <= limit,
+                "step {t}: {} > {limit}",
+                ledger.resident_bytes()
+            );
+        }
+
+        assert!(
+            row_count(&ledger) < 2 * steps as usize,
+            "nothing was evicted"
+        );
+        assert!(ledger.window_start().unwrap() > Duration::from_parts(0, 0));
+        let state = ledger.current_state(None, Some(j2000())).unwrap();
+        assert_eq!(state.num_rows(), 2);
+        let (_, iso) = ledger.resolve_frame_at(a, at_ns(steps)).unwrap();
+        assert_eq!(iso.translation.x, (steps - 1) as f64);
+    }
+
+    /// An entity appended once, at t0, has its only row pinned when that row's segment is
+    /// evicted. `current_state` still returns it, and a chain through it still resolves.
+    #[test]
+    fn test_static_entity_survives_eviction() {
+        let earth = PrescribedId::astronomical_from_name("Earth").unwrap();
+        let (beacon, rover) = (demo("beacon"), demo("rover"));
+        let batch = |t: u64| entity_rows(&[(rover, beacon, t as f64)], t);
+
+        let mut ledger = make_entity_ledger();
+        ledger
+            .set_memory_limit(Some(2 * full_tail_bytes(batch)))
+            .unwrap();
+        ledger
+            .append(entity_rows(&[(beacon, earth, 100.0)], 0))
+            .unwrap();
+        let steps = 10 * (SEGMENT_THRESHOLD as u64 + 1);
+        for t in 1..=steps {
+            ledger.append(batch(t)).unwrap();
+        }
+
+        assert!(
+            ledger.window_start().unwrap() > Duration::from_parts(0, 0),
+            "the t0 segment must have been evicted"
+        );
+        let pinned = ledger.pinned.as_ref().expect("the beacon row is pinned");
+        assert_eq!(pinned.batch.num_rows(), 1);
+
+        let state = ledger.current_state(None, Some(j2000())).unwrap();
+        assert_eq!(state.num_rows(), 2, "beacon and rover");
+        let (root, iso) = ledger.resolve_to_root(rover, at_ns(steps)).unwrap();
+        assert_eq!(root, earth);
+        assert_eq!(iso.translation.x, 100.0 + steps as f64);
+    }
+
+    /// After eviction, a save and reload keeps every entity's current parent and pose, and
+    /// agrees on ancestry at every in-window epoch. The pre-window re-parent is trimmed from
+    /// the topology log; the in-window one is kept.
+    #[test]
+    fn test_evict_save_reload_keeps_current_topology_and_poses() {
+        let earth = PrescribedId::astronomical_from_name("Earth").unwrap();
+        let (beacon, rover, truck) = (demo("beacon"), demo("rover"), demo("truck"));
+        let steps = 10 * (SEGMENT_THRESHOLD as u64 + 1);
+        let (early_hop, late_hop) = (10, steps - 20);
+        // rover: under Earth, then the beacon (pre-window), then the truck (in-window).
+        let rover_parent = |t: u64| match t {
+            t if t < early_hop => earth,
+            t if t < late_hop => beacon,
+            _ => truck,
+        };
+        let batch = |t: u64| {
+            entity_rows(
+                &[(rover, rover_parent(t), 1.0), (truck, earth, t as f64)],
+                t,
+            )
+        };
+
+        let mut ledger = make_entity_ledger();
+        ledger
+            .set_memory_limit(Some(2 * full_tail_bytes(batch)))
+            .unwrap();
+        ledger
+            .append(entity_rows(&[(beacon, earth, 100.0)], 0))
+            .unwrap();
+        for t in 1..=steps {
+            ledger.append(batch(t)).unwrap();
+        }
+
+        let window = ledger.window_start().unwrap();
+        assert!(
+            window > Duration::from_parts(0, early_hop)
+                && window <= Duration::from_parts(0, late_hop)
+        );
+        // beacon@0, truck@1, rover@1 (Earth) trimmed, rover@early (beacon) in force, rover@late.
+        assert_eq!(ledger.export_topology().unwrap().num_rows(), 4);
+
+        let loaded =
+            Ledger::load_ipc_from_bytes(&ledger.save_ipc_to_bytes().unwrap(), "entity_id").unwrap();
+        let future = at_ns(steps + 1000);
+        for id in [beacon, rover, truck] {
+            assert_eq!(
+                loaded.transform_tree.current_parent(id),
+                ledger.transform_tree.current_parent(id)
+            );
+            assert_eq!(
+                loaded.resolve_frame_at(id, future),
+                ledger.resolve_frame_at(id, future)
+            );
+        }
+
+        let first = window.to_parts().1;
+        for ns in [first, first + 7, late_hop - 1, late_hop, steps] {
+            let at = Duration::from_parts(0, ns);
+            for id in [beacon, rover, truck] {
+                assert_eq!(
+                    loaded.transform_tree.ancestry_at(id, at),
+                    ledger.transform_tree.ancestry_at(id, at),
+                    "ancestry of {id} at ns {ns}"
+                );
+            }
+        }
+    }
+
+    /// A limit below what the tail alone holds evicts every sealed segment and then stops,
+    /// keeping the tail and pinned rows rather than failing or looping.
+    #[test]
+    fn test_limit_below_the_tail_stops_without_losing_latest_rows() {
+        let earth = PrescribedId::astronomical_from_name("Earth").unwrap();
+        let a = demo("a");
+        let mut ledger = make_entity_ledger();
+        ledger.set_memory_limit(Some(1)).unwrap();
+        for t in 0..3 * (SEGMENT_THRESHOLD as u64 + 1) {
+            ledger
+                .append(entity_rows(&[(a, earth, t as f64)], t))
+                .unwrap();
+        }
+        assert!(ledger.segments.is_empty());
+        assert!(ledger.resident_bytes() > 1);
+        // Each of the three seals pinned `a`'s latest row; the two superseded ones are gone.
+        let pinned = ledger.pinned.as_ref().unwrap();
+        assert_eq!(pinned.batch.num_rows(), 1);
+        assert_eq!(
+            pinned.max_epoch,
+            Duration::from_parts(0, 3 * (SEGMENT_THRESHOLD as u64 + 1) - 1)
+        );
+        assert_eq!(
+            ledger
+                .current_state(None, Some(j2000()))
+                .unwrap()
+                .num_rows(),
+            1
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1939,8 +2786,8 @@ mod tests {
         )
         .unwrap();
 
-        // Two batches in one IPC file, written directly rather than through `merge_for_ipc`,
-        // so the forged batch stays a separate batch the reader must reject on its own.
+        // Two batches in one IPC file, so the forged batch stays a separate batch the reader
+        // must reject on its own.
         let buf = ipc::write_bytes(&[good, forged], &registry_schema()).unwrap();
 
         let mut peer = make_entity_ledger();

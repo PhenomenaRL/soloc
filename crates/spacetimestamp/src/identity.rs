@@ -134,7 +134,7 @@ impl PrescribedId {
     /// directly into the 16 bytes (see [`astro_frame`](Self::astro_frame)), so the id is
     /// self-describing and resolves to a [`Frame`](anise::prelude::Frame) with no name
     /// registry. The pair is validated against the canonical frame table
-    /// ([`recognised`](crate::ephemeris::recognised)); an unrecognised pair, including a
+    /// ([`recognised`]); an unrecognised pair, including a
     /// nonsense combination like `(399, 499)`, is rejected. Static and offline.
     pub fn astronomical(ephemeris_id: i32, orientation_id: i32) -> Result<Self, String> {
         if !recognised(ephemeris_id, orientation_id) {
@@ -154,7 +154,7 @@ impl PrescribedId {
     /// canonical table.
     ///
     /// The single home of name-based astro minting: a transform target, a wire request, a
-    /// registry label, a test. Names are byte-exact ([`frame_pair`](crate::ephemeris::frame_pair)),
+    /// registry label, a test. Names are byte-exact ([`frame_pair`]),
     /// so a typo or wrong case is rejected here rather than minting a wrong id.
     pub fn astronomical_from_name(name: &str) -> Result<Self, String> {
         let (e, o) = frame_pair(name)

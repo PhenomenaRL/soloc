@@ -17,6 +17,9 @@
 //! 3. Dynamic: P_rot    --[Almanac.translate()]--> P_target (shift origin to target frame origin)
 //! ```
 //!
+//! In full: `P_target = R_root→target · P_root + R_J2000→target · r`, where `r` is the
+//! translation below.
+//!
 //! Positions use `Point3` (isometry applies translation + rotation).
 //! Orientations use `UnitQuaternion` (rotation only).
 //! Kinematic fields outside the spacetimestamp struct (velocity, angular_velocity, acceleration)
@@ -25,8 +28,11 @@
 //! # Anise Convention
 //!
 //! `almanac.translate(from_frame, to_frame, epoch, ...)` returns a `CartesianState` whose
-//! `radius_km` is the position of the `from_frame` origin expressed in `to_frame` coordinates.
-//! This is the additive offset applied after rotating the position vector into target orientation.
+//! `radius_km` is the position of the `from_frame` origin relative to the `to_frame` origin,
+//! expressed in **J2000 axes** whatever either frame's orientation: anise does not rotate SPK
+//! data. It must be rotated J2000 → target before it is added. Skipping that rotation is
+//! exact only for a J2000-aligned target (ICRF, GCRF), and is off by up to the origin
+//! distance otherwise. anise's own `Almanac::transform` skips it too; `transform_to` does not.
 //!
 //! # Timescale Note
 //!
@@ -40,6 +46,7 @@
 //! Isometries returned by the resolver are always in kilometres, regardless of the row's
 //! `units_pos` field. Row coordinates are converted to km before the isometry is applied.
 
+use anise::constants::orientations::J2000;
 use anise::prelude::*;
 use arrow::array::{Array, Int16Builder, StructArray, UInt8Builder, UInt64Builder};
 use arrow::record_batch::RecordBatch;
@@ -143,6 +150,10 @@ pub fn transform_batch(
     // in one or two roots, so this replaces a per-row string resolve with a 16-byte hash.
     let mut root_cache: IdMap<Frame> = IdMap::default();
 
+    // J2000 → target rotation per epoch. The target is fixed for the call, so the epoch is
+    // the whole key.
+    let mut j2000_cache: HashMap<(i16, u64), Rotation3<f64>> = HashMap::new();
+
     for i in 0..num_rows {
         let original_frame_id = cols.frame_at(i)?;
         let source_id = cols.source_at(i)?;
@@ -169,9 +180,10 @@ pub fn transform_batch(
 
         // Resolved against this row's own epoch, so a batch spanning several timesteps
         // gets the pose that was current at each one.
+        let epoch_key = epoch.to_tai_duration().to_parts();
         let dynamic = resolve_dynamic_frame.and_then(|resolve| {
             *dynamic_cache
-                .entry((original_frame_id, epoch.to_tai_duration().to_parts()))
+                .entry((original_frame_id, epoch_key))
                 .or_insert_with(|| resolve(original_frame_id, epoch))
         });
 
@@ -210,8 +222,8 @@ pub fn transform_batch(
         };
 
         // almanac.translate(from, to, epoch) → radius_km is the position of `from`'s origin
-        // expressed in `to` frame coordinates. This is the additive shift that maps a vector
-        // already rotated into `to` orientation from the `from` origin to the `to` origin.
+        // relative to `to`'s origin, in J2000 axes whatever either frame's orientation (the
+        // raw SPK data, unrotated).
         let translation = almanac
             .translate(root_frame, target_frame, epoch, None)
             .map_err(|e| {
@@ -230,8 +242,32 @@ pub fn transform_batch(
         let rot_matrix: Rotation3<f64> = Rotation3::from_matrix_unchecked(dcm.rot_mat);
         let rot_quat: UnitQuaternion<f64> = UnitQuaternion::from_rotation_matrix(&rot_matrix);
 
+        // The translation is in J2000 axes, so it needs its own rotation into the target's:
+        // identity for a J2000-aligned target, unneeded when the origins coincide (the
+        // translation is zero, and an almanac without orientation data still works), else
+        // one lookup per epoch.
+        let j2000_to_target = if target_frame.orientation_id == J2000
+            || root_frame.ephem_origin_match(target_frame)
+        {
+            Rotation3::identity()
+        } else {
+            match j2000_cache.get(&epoch_key) {
+                Some(rot) => *rot,
+                None => {
+                    let dcm = almanac
+                        .rotate(target_frame.with_orient(J2000), target_frame, epoch)
+                        .map_err(|e| {
+                            format!("Anise rotate error ('J2000' → '{target_frame_name}'): {e}")
+                        })?;
+                    let rot = Rotation3::from_matrix_unchecked(dcm.rot_mat);
+                    j2000_cache.insert(epoch_key, rot);
+                    rot
+                }
+            }
+        };
+
         // Compose final position and orientation (all quantities in km at this point)
-        let pos_target = rot_matrix * pos_root + pos_root_wrt_target;
+        let pos_target = rot_matrix * pos_root + j2000_to_target * pos_root_wrt_target;
         let quat_target = rot_quat * quat_root;
 
         // Convert position back to the requested output unit
@@ -286,7 +322,7 @@ pub fn transform_batch(
 /// duration_ns)` are SI-second offsets from `2000-01-01T12:00:00 TAI`. Rows already in TAI
 /// are passed through unchanged (fast path when all rows are TAI returns a cheap clone).
 ///
-/// This is called by [`soloc_ledger::ledger::Ledger::append`] so that all stored data shares a
+/// This is called by `soloc_ledger::ledger::Ledger::append` so that all stored data shares a
 /// single timescale, making temporal comparisons and almanac queries unambiguous.
 pub fn normalize_batch_to_tai(batch: &RecordBatch) -> Result<RecordBatch, String> {
     let schema = batch.schema();
@@ -363,6 +399,7 @@ pub fn normalize_batch_to_tai(batch: &RecordBatch) -> Result<RecordBatch, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anise::math::cartesian::CartesianState;
     use arrow::datatypes::{DataType, Field, Schema};
     use nalgebra::Translation3;
 
@@ -910,5 +947,91 @@ mod tests {
         assert_eq!(read_centuries_ns(&result, 0), (0, 500));
         let (c1, n1) = read_centuries_ns(&result, 1);
         assert_eq!(epoch_from_parts(c1, n1, TimeScale::TAI), utc_epoch);
+    }
+
+    // -----------------------------------------------------------------------
+    // Root → target against real kernels (T1)
+    // -----------------------------------------------------------------------
+
+    /// Transforms one row at `pos_km` in `root` into `target` and checks it against anise's
+    /// `transform_to` on the same state. `transform_to` is the oracle because it rotates into
+    /// J2000 before translating; anise's `transform(root, target)` does not, and shares T1.
+    fn assert_matches_anise(almanac: &Almanac, root: &str, target: &str, pos_km: [f64; 3]) {
+        let epoch = Epoch::from_gregorian_tai_at_midnight(2026, 1, 1);
+        let root_frame = crate::ephemeris::resolve_astronomical_frame(root).unwrap();
+        let target_frame = crate::ephemeris::resolve_astronomical_frame(target).unwrap();
+        let (centuries, ns) = epoch_to_parts(epoch);
+
+        let mut builder = SpaceTimestampBuilder::new(1);
+        builder.append_spacetimestamp(
+            PrescribedId::astronomical_from_name(root).unwrap(),
+            LengthUnit::km,
+            TimeScaleCode::TAI,
+            source(),
+            EstimateType::MEASURED,
+            pos_km,
+            [1.0, 0.0, 0.0, 0.0],
+            centuries,
+            ns,
+            None,
+            None,
+        );
+        let batch = make_sts_batch(&mut builder);
+        let result = transform_batch(&batch, target, almanac, LengthUnit::km, None).unwrap();
+        let got = read_output_pos(&result, 0);
+
+        let state = CartesianState::new(
+            pos_km[0], pos_km[1], pos_km[2], 0.0, 0.0, 0.0, epoch, root_frame,
+        );
+        let expected = almanac
+            .transform_to(state, target_frame, None)
+            .unwrap()
+            .radius_km;
+
+        let err = (Vector3::from(got) - expected).norm();
+        assert!(
+            err < 1e-5,
+            "{root} → {target}: got {got:?}, anise {expected:?}, off by {err} km"
+        );
+    }
+
+    fn real_almanac() -> Almanac {
+        MetaAlmanac::latest().expect("MetaAlmanac::latest() should succeed")
+    }
+
+    const P_KM: [f64; 3] = [7000.0, -1200.0, 300.0];
+
+    // Rotating targets with a different origin: wrong before the T1 fix.
+
+    #[test]
+    #[ignore = "requires DE440s ephemeris (~150 MB download on first run, then cached)"]
+    fn test_icrf_to_iau_sun_matches_anise() {
+        assert_matches_anise(&real_almanac(), "ICRF", "IAU_SUN", P_KM);
+    }
+
+    #[test]
+    #[ignore = "requires DE440s ephemeris (~150 MB download on first run, then cached)"]
+    fn test_gcrf_to_iau_moon_matches_anise() {
+        assert_matches_anise(&real_almanac(), "GCRF", "IAU_MOON", P_KM);
+    }
+
+    #[test]
+    #[ignore = "requires DE440s ephemeris (~150 MB download on first run, then cached)"]
+    fn test_iau_moon_to_iau_earth_matches_anise() {
+        assert_matches_anise(&real_almanac(), "IAU_MOON", "IAU_EARTH", P_KM);
+    }
+
+    // Regressions: same origin, and inertial → inertial.
+
+    #[test]
+    #[ignore = "requires DE440s ephemeris (~150 MB download on first run, then cached)"]
+    fn test_iau_earth_to_gcrf_matches_anise() {
+        assert_matches_anise(&real_almanac(), "IAU_EARTH", "GCRF", P_KM);
+    }
+
+    #[test]
+    #[ignore = "requires DE440s ephemeris (~150 MB download on first run, then cached)"]
+    fn test_icrf_to_gcrf_matches_anise() {
+        assert_matches_anise(&real_almanac(), "ICRF", "GCRF", P_KM);
     }
 }

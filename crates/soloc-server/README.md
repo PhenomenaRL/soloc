@@ -44,12 +44,14 @@ empty ledger); on `SIGTERM` it drains in-flight work and persists. Configuration
 # config.toml
 [server]
 bind = "0.0.0.0:50051"
+max_message_size = 67108864               # bytes per gRPC message, each way; default 64 MiB
 
 [storage]
 # ledger_url (s3:// gs:// az:// file://) takes priority over ledger_path.
 ledger_path = "/var/data/ledger.arrows"
 # schema_path = "/var/data/schema.arrow"   # optional zero-row IPC schema for a fresh ledger
 id_column = "entity_id"
+# memory_limit = "5GB"   # optional: evict the oldest rows past this, keeping each entity's latest
 
 [ephemeris]
 kernels = ["/path/to/de440s.bsp", "/path/to/pck11.pca"]
