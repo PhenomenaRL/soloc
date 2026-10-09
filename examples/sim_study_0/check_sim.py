@@ -13,12 +13,14 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+from matplotlib.path import Path as MplPath
 
 from sim import scenario as sc
 from sim.ephemeris import Ephemeris
 from sim.geo import EARTH, GCRF, ICRF, SUN, fixed_to_geodetic, geodetic_to_fixed
 from sim.land import CANALS, in_canal, in_rings, on_land
 from sim.models import regatta as rg
+from sim.models import wildfire as wf
 from sim.models.robot import HULL_REACH_M
 from sim.models.sailboat import polar, wrap180
 from sim.models.spacecraft import Orbit
@@ -97,11 +99,12 @@ def main():
 
     world = roster(args.seed, client)
     body_by_id = {b.frame_id: b for b in sc.SNAPSHOT_BODIES}
-    g = world.regatta
+    g, w = world.regatta, world.wildfire
     fleet_models = {"facilities": world.facilities, "spacecraft": world.spacecraft,
                     "probes": world.probes, "robots": world.robots, "crawlers": world.crawlers,
                     "cargo": world.cargo, "aircraft": world.aircraft, "ships": world.ships,
-                    "regatta": [g.venue, g.rc, *g.boats, *g.buoys], "marks": g.marks}
+                    "regatta": [g.venue, g.rc, *g.boats, *g.buoys], "marks": g.marks,
+                    "wildfire": [w.venue, *w.crews], "fire": [*w.vertices, *w.trenches]}
     by_id = {e.id: e for e in world.entities}
 
     d = Data(client)
@@ -125,13 +128,17 @@ def main():
     state_ids = set(id_bytes(state.column("entity_id")))
     members = {**{k: {e.id for e in v} for k, v in fleet_models.items()}, "bodies": set(body_by_id)}
     for name, ids in members.items():
-        if fleets[name] and name != "marks":
+        if fleets[name] and name not in ("marks", "fire"):
             got = len(state_ids & ids)
             check(f"current_state has all {len(ids)} {name}", got == len(ids), f"{got}")
     if fleets["marks"]:
         got = len(state_ids & members["marks"])
         check(f"current_state omits the {len(members['marks'])} marks, lifted at {utc(sc.seconds(sc.MARKS_LAID[1]))}",
               got == 0, f"{got} present")
+    if fleets["fire"]:
+        got = len(state_ids & fleets["fire"])
+        check(f"current_state has every fire vertex and trench born ({len(fleets['fire'])} of a pool of "
+              f"{len(members['fire'])})", got == len(fleets["fire"]), f"{got}")
     unknown = state_ids - set(by_id) - set(body_by_id)
     check("current_state has no unknown entities", not unknown, f"{len(unknown)} unknown")
 
@@ -152,6 +159,8 @@ def main():
     grid = range(0, sc.DURATION_S + 1, sc.BASE_TICK_S)
     wrong_count, off_schedule = [], []
     for i in present:
+        if getattr(by_id.get(i), "dynamic", False):
+            continue                     # born and stopped by the run; checked with the wildfire
         if i in body_by_id:
             expected = np.arange(0, sc.DURATION_S + 1, sc.SNAPSHOT_S)
         else:
@@ -194,6 +203,8 @@ def main():
         check_ships(d, fleets["ships"])
     if fleets["regatta"]:
         check_regatta(d, g)
+    if fleets["wildfire"]:
+        check_wildfire(d, w)
 
     print(f"\n{results.count(True)}/{len(results)} passed")
     sys.exit(0 if all(results) else 1)
@@ -355,6 +366,101 @@ def check_regatta(d: Data, g):
     placed = max(float(np.linalg.norm(d.pos[d.of(m.id), :2] - m.xy, axis=1).max())
                  for m in (*g.marks, *g.buoys) if m.id in d.index)
     check("marks and met buoys stay where they were laid", placed <= 1e-9, f"max {placed:.1e} m")
+
+
+# -- wildfire ---------------------------------------------------------------------------------
+
+
+def check_wildfire(d: Data, w):
+    kids = [e for e in (*w.crews, *w.vertices, *w.trenches) if e.id in d.index]
+    idx = np.sort(np.concatenate([d.index[e.id] for e in kids]))
+    framed = bool(matches(d.frames[idx], w.venue.id).all())
+    worst_z = float(np.abs(d.pos[idx, 2]).max())
+    check("wildfire rows framed on the venue, on its ENU plane", framed and worst_z == 0.0,
+          f"{len(idx):,} rows, max |z| = {worst_z} m")
+
+    vk = np.concatenate([d.index[v.id] for v in w.vertices if v.id in d.index])
+    rep = wf.FireReplay(d.t_s[vk], np.array([w.names[i] for i in d.ids[vk]]), d.pos[vk, :2])
+    check("every spawned vertex was born midway between two ring neighbours", not rep.unmatched,
+          f"{len(rep.born)} vertices, {len(rep.history) - 1} spawn ticks, {len(rep.unmatched)} unmatched")
+
+    # Trenches as (born, a, b), from their stored centre, yaw and length.
+    lines = []
+    for tr in w.trenches:
+        if tr.id not in d.index:
+            continue
+        k = d.index[tr.id]
+        sub = d.rows.take(pa.array(k))
+        q = sts_field(sub, "quaternion").flatten().to_numpy().reshape(-1, 4)
+        yaw = 2 * np.arctan2(q[:, 3], q[:, 0])
+        dims = np.array(sub.column("dimensions").to_pylist())
+        if np.ptp(d.pos[k], axis=0).max() > 0 or np.ptp(yaw) > 0 or np.ptp(dims, axis=0).max() > 0:
+            lines.append(None)
+            continue
+        half = dims[0, 0] / 2 * np.array([np.cos(yaw[0]), np.sin(yaw[0])])
+        lines.append((float(d.t_s[k].min()), d.pos[k[0], :2] - half, d.pos[k[0], :2] + half, dims[0]))
+    bad = sum(l is None for l in lines)
+    lines = [l for l in lines if l is not None]
+    dims = np.array([l[3] for l in lines]) if lines else np.zeros((0, 3))
+    check(f"trenches are static, at most {sc.TRENCH_M:.0f} m × {sc.TRENCH_WIDTH_M} m × {sc.TRENCH_DEPTH_M} m",
+          bad == 0 and bool(np.all(dims[:, 0] <= sc.TRENCH_M + 1.0))
+          and bool(np.all(dims[:, 1:] == [sc.TRENCH_WIDTH_M, sc.TRENCH_DEPTH_M])),
+          f"{len(lines)} trenches, {dims[:, 0].sum() / 1000:.2f} km, {bad} moved")
+
+    # Every step of a moving vertex: no faster than the head rate where it started, and never
+    # across a trench finished before it.
+    p0, p1, t0 = [], [], []
+    for n, (t, xy) in rep.rows.items():
+        run = t <= rep.stop[n]
+        k = np.flatnonzero(run[1:] & (np.diff(t) == sc.FIRE_STEP_S))
+        p0.append(xy[k]), p1.append(xy[k + 1]), t0.append(t[k])
+    p0, p1, t0 = np.concatenate(p0), np.concatenate(p1), np.concatenate(t0)
+    bound = np.empty(len(t0))
+    for t in np.unique(t0):
+        m = t0 == t
+        bound[m] = wf.head_rate(w.fuel, w.wind, p0[m, 0], p0[m, 1], float(t)) * sc.FIRE_STEP_S
+    excess = float((np.linalg.norm(p1 - p0, axis=1) - bound).max())
+    crossed = 0
+    if lines:
+        born = np.array([l[0] for l in lines])
+        a, e = np.array([l[1] for l in lines]), np.array([l[2] - l[1] for l in lines])
+        dd = p1 - p0
+        cross = lambda u, v: u[..., 0] * v[..., 1] - u[..., 1] * v[..., 0]
+        for lo in range(0, len(p0), 4096):
+            sl = slice(lo, lo + 4096)
+            ap = a[None] - p0[sl, None]
+            den = cross(dd[sl, None], e[None])
+            with np.errstate(divide="ignore", invalid="ignore"):
+                s, u = cross(ap, e[None]) / den, cross(ap, dd[sl, None]) / den
+            hit = (den != 0) & (s >= 0) & (s <= 1) & (u >= 0) & (u <= 1) & (born[None] < (t0[sl] + sc.FIRE_STEP_S)[:, None])
+            crossed += int(hit.any(1).sum())
+    check("fire steps no faster than the head rate there, and never across a finished trench",
+          excess <= 1e-9 and crossed == 0,
+          f"{len(p0):,} steps, max excess {max(excess, 0):.1e} m, {crossed} crossings")
+
+    # Crews: never in burnt ground, never within SAFE_M of a moving vertex, at most walking pace.
+    near_min, inside = math.inf, 0
+    k = np.concatenate([d.of(c.id, wf.IGNITION_S) for c in w.crews])
+    v = d.rows.take(pa.array(k)).column("velocity").combine_chunks().flatten().to_numpy().reshape(-1, 3)
+    fast = float(np.linalg.norm(v[:, :2], axis=1).max())
+    for t in np.unique(d.t_s[k]):
+        at = d.pos[k[d.t_s[k] == t], :2]
+        ring = rep.ring_at(t)
+        moving = [n for n in ring if rep.moving(n, t)]
+        if moving:
+            near_min = min(near_min, float(np.linalg.norm(rep.at(moving, t)[:, None] - at[None], axis=-1).min()))
+        inside += int(MplPath(rep.at(ring, t)).contains_points(at).sum())
+    check(f"crews never in burnt ground or within {sc.SAFE_M:.0f} m of a moving vertex, at most "
+          f"{sc.WALK_M_S} m/s", inside == 0 and near_min >= sc.SAFE_M and fast <= sc.WALK_M_S + 1e-9,
+          f"closest {near_min:.1f} m, {inside} rows inside, fastest {fast:.2f} m/s")
+
+    end = max(rep.stop.values())
+    ring = rep.ring_at(sc.DURATION_S)
+    xy = rep.at(ring, sc.DURATION_S)
+    area = abs(np.dot(xy[:, 0], np.roll(xy[:, 1], -1)) - np.dot(xy[:, 1], np.roll(xy[:, 0], -1))) / 2e4
+    check("replayed from the ledger, the fire is contained (every vertex stopped)", math.isfinite(end),
+          (f"at {utc(end)}, {timedelta(seconds=round(end - wf.IGNITION_S))} after ignition" if math.isfinite(end)
+           else "still spreading at the window's end") + f", {area:.1f} ha, {len(ring)} vertices")
 
 
 # -- robots -----------------------------------------------------------------------------------

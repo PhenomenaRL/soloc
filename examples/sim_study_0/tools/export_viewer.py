@@ -22,6 +22,7 @@ per frame, under one name.
 import argparse
 import base64
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -35,8 +36,11 @@ from sim.ephemeris import Ephemeris
 from sim.geo import EARTH, GCRF, ICRF, MARS, MOON, SUN, quat_from_matrix
 from sim.land import outlines
 from sim.models import regatta as rg
+from sim.models import wildfire as wf
 from sim.roster import roster
 from sim.wind import read_table
+from tools.snapshot_sim import FireView, fuel_grid
+from tools.snapshot_sim import Rows as SnapRows
 from soloc_client import CENTURY_NS, SolocClient, astronomical, id_bytes, sts_field, tai_ns_from_utc
 from tools.view_sim import load
 
@@ -46,6 +50,8 @@ EPHEMERIS_STEP_S = 300
 DAY_S = 86400
 VENUE_REACH_KM = 12.0           # the camera distance under which the venue's boats show
 VENUE_VIEW_KM = 4.0             # "Go to" distance
+FIRE_REACH_KM = 15.0
+FIRE_VIEW_KM = 2.5
 
 # (name, NAIF id, mean radius km, colour, draw orbit)
 BODIES = (
@@ -169,16 +175,54 @@ def venue_context(g, rows: Rows, name, wind_path: Path) -> dict:
            "line": [c.rc.tolist(), c.marks["MARK-PIN"].tolist()],
            "tracks": [t for t in tracks if t]}
     if wind_path.exists():
-        w = read_table(wind_path)
-        w = w.filter(pc.equal(w["venue"], g.venue.name))
-        t = w["t"].cast(pa.int64()).to_numpy() - int((sc.T0 - datetime(1970, 1, 1)).total_seconds())
-        times = np.unique(t)
-        first = t == times[0]
-        xy = np.array([g.venue.enu(a, o)[:2] for a, o in zip(w["lat"].to_numpy()[first], w["lon"].to_numpy()[first])])
-        uv = np.column_stack([w["u"].to_numpy(), w["v"].to_numpy()])   # time-major, grid in the same order
-        ctx["wind"] = {"t0": float(times[0]), "step": float(times[1] - times[0]), "n": len(times),
-                       "xy": b64(xy.ravel()), "uv": b64(uv.ravel())}
+        ctx["wind"] = wind_block(g.venue, wind_path)
     return ctx
+
+
+def wind_block(venue, wind_path: Path) -> dict:
+    """The venue's rows of the wind table: the grid in venue ENU, and (u, v) per time, time-major."""
+    w = read_table(wind_path)
+    w = w.filter(pc.equal(w["venue"], venue.name))
+    t = w["t"].cast(pa.int64()).to_numpy() - int((sc.T0 - datetime(1970, 1, 1)).total_seconds())
+    times = np.unique(t)
+    first = t == times[0]
+    xy = np.array([venue.enu(a, o)[:2] for a, o in zip(w["lat"].to_numpy()[first], w["lon"].to_numpy()[first])])
+    uv = np.column_stack([w["u"].to_numpy(), w["v"].to_numpy()])
+    return {"t0": float(times[0]), "step": float(times[1] - times[0]), "n": len(times),
+            "xy": b64(xy.ravel()), "uv": b64(uv.ravel())}
+
+
+def fire_context(w, table, rows: Rows, name, wind_path: Path, fuel_path: Path) -> tuple[dict, list]:
+    """The wildfire venue: the fuel map as its ground, the perimeter as a loop through the vertex
+    tracks in replayed ring order, trenches appearing as they are finished, the crews, the wind.
+    Also returns its timeline events."""
+    pose, vid = Pose(rows, w.venue.id), w.venue.id
+    view = FireView(w, SnapRows(table, w.names, vid, tai_ns_from_utc(sc.T0)))
+    vertices = [v for v in w.vertices if len(rows.of(v.id))]
+    order = {v.name: k for k, v in enumerate(vertices)}
+    tracks = [track(name(c), "crew", *on_site(rows, c.id, vid)) for c in w.crews]
+    tracks += [track(name(v), "fire", *on_site(rows, v.id, vid), model="none") for v in vertices]
+    lines = sorted(view.lines, key=lambda l: l[0])
+    ctx = {"id": w.venue.spec.code.lower(), "kind": "site", "layout": "venue", "body": EARTH.name,
+           "name": name(w.venue), "frame": f"{name(w.venue)} ENU",
+           "p": pose.p_km.tolist(), "q": quat_from_matrix(pose.r),
+           "extent": list(sc.FIRE_WIND.extent_m), "reach": FIRE_REACH_KM, "view": FIRE_VIEW_KM,
+           # Ring order over time, as indices into this context's tracks (the crews come first).
+           "rings": [{"t": t, "i": [len(w.crews) + order[n] for n in ring]} for t, ring in view.replay.history],
+           "trenches": {"t": [float(b) for b, _, _ in lines], "p": b64(np.array([[*a, *b] for _, a, b in lines]).ravel())},
+           "tracks": [t for t in tracks if t]}
+    if fuel_path.exists():
+        fuel = fuel_grid(fuel_path, w.venue)
+        ctx["fuel"] = {"step": sc.FUEL_GRID_M, "cols": fuel.shape[1], "f": b64(fuel.ravel())}
+    if wind_path.exists():
+        ctx["wind"] = wind_block(w.venue, wind_path)
+    events = [{"t": wf.IGNITION_S, "label": "wildfire ignition"},
+              {"t": wf.DISPATCH_S, "label": "wildfire: first crew orders"}]
+    if lines:
+        events.append({"t": float(lines[-1][0]), "label": "wildfire: last line finished"})
+    if math.isfinite(view.end):
+        events.append({"t": view.end, "label": "wildfire contained"})
+    return ctx, events
 
 
 def ephemeris(eph: Ephemeris, naif: int, t_s: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -209,8 +253,8 @@ def main():
     p.add_argument("--seed", type=int, default=sc.SEED)
     args = p.parse_args()
 
-    table, names = load(args.path)
-    rows = Rows(table)
+    ledger, names = load(args.path)
+    rows = Rows(ledger)
     client = SolocClient(args.server)
     world = roster(args.seed, client)
     name = lambda e: names.get(e.id, e.name)
@@ -290,8 +334,14 @@ def main():
     g = world.regatta
     if len(rows.of(g.venue.id)):
         contexts.append(venue_context(g, rows, name, args.path.with_name("wind.arrow")))
-
     events = []
+    w = world.wildfire
+    if len(rows.of(w.venue.id)):
+        ctx, fire_events = fire_context(w, ledger, rows, name, args.path.with_name("wind.arrow"),
+                                        args.path.with_name("fuel.arrow"))
+        contexts.append(ctx)
+        events += fire_events
+
     for c in world.spacecraft:
         for key, label in EVENT_LABELS.items():
             if key in c.events:

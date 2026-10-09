@@ -1,6 +1,7 @@
 """Trivial arena policies, to show a strategy swap changes the result.
 
     python run_sim.py --regatta-policy tests.policies:straight_line
+    python run_sim.py --wildfire-policy tests.policies:idle_crews
 """
 
 import numpy as np
@@ -26,3 +27,8 @@ def straight_line(obs: RegattaObservation) -> Command:
     if abs(a) >= NO_GO_DEG + 1:
         return to
     return (twd + np.copysign(NO_GO_DEG + 1, a if a else 1.0)) % 360
+
+
+def idle_crews(obs) -> dict:
+    """Never sends a crew out: the fire burns unchecked."""
+    return {}

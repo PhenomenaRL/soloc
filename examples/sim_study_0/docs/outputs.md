@@ -17,11 +17,13 @@
 | `ships.png` | ship tracks over the land polygons, with every full lane dotted and the canal boxes outlined |
 | `regatta.png` | the race in venue ENU over the water polygons: each boat from the warning to its finish, and the whole race day from the docks; the fleet in one colour, SAIL-10 (the `--regatta-policy` boat) highlighted |
 | `regatta_speed.png` | each boat's stored speed while sailing against the polar bound for the wind at its row, one panel per boat; drops are tacks, gybes and luffs |
+| `wildfire.png` | the fire's perimeter every 2 h over the fuel map, the finished line coloured by when each piece was finished, the crews' tracks and the ICP |
+| `wildfire_crews.png` | each crew's distance to the nearest spreading vertex over time, one panel per crew, against the 30 m rule and the 40 m escape distance |
 
 ## 3D viewer
 
 `python -m tools.export_viewer out/sim_study_0.arrow` turns a saved ledger into one standalone
-HTML file, `out/sim_study_0_3d.html` (~47 MB). The tracks, the body ephemerides, the Earth
+HTML file, `out/sim_study_0_3d.html` (~55 MB). The tracks, the body ephemerides, the Earth
 coastlines and three.js are inlined into `tools/viewer_template.html`, so the page opens offline by double-click
 in any WebGL browser. Building it needs a running server.
 
@@ -43,6 +45,15 @@ It is one scene, nested the way the ledger's frames are:
     outside it
 
   "Go to" puts the camera 4 km away. The boats show within 12 km.
+- **The wildfire venue:** sits on Earth the same way. It shows:
+  - the fuel map as its ground (grey, darker burns faster; the river in blue)
+  - the fire's perimeter as a red loop through its vertices, in the ring order replayed from
+    the rows
+  - the finished line, appearing piece by piece
+  - the crews
+  - the wind arrows
+
+  "Go to" puts the camera 2.5 km away. The crews show within 15 km.
 
 Body positions and orientations come from the server: a zero offset in each body frame is
 exchanged to ICRF at 5 min steps over the window. That is the same resolution the ledger does.
@@ -62,8 +73,9 @@ a facility (a craft on its pad or landed) are composed through the facility's st
 Every entity is a small model with its body axes (x red, y green, z blue) at its interpolated
 pose; models keep a constant size on screen. The controls:
 - a time slider with ticks at the launches, burns, hand-offs, touchdowns, boardings and
-  disembarks, at Parker's perihelion, and at the regatta's marks laid, warning, gun, first and
-  last finish and marks lifted
+  disembarks, at Parker's perihelion, at the regatta's marks laid, warning, gun, first and last
+  finish and marks lifted, and at the wildfire's ignition, first orders, last line finished and
+  containment
 - play at 5 s/s up to 3 h/s
 - trails from 15 min to the whole track
 - labels, a hover readout (position in the entity's own frame), and a clickable legend that
@@ -78,8 +90,15 @@ rows are 10 m apart, so straight lines between samples cut the corners.
 
 `run_sim.py` also samples each venue's analytic wind (`sim/wind.py`) onto a 250 m grid every
 minute over the venue's window, an Arrow IPC file with columns `venue`, `t` (UTC), `lat`, `lon`,
-`u` and `v` (m/s east and north, the way the air moves). For the regatta that is 164,346 rows,
-about 9.5 MB. It is a side table, not ledger rows.
+`u` and `v` (m/s east and north, the way the air moves). The regatta's field is sampled every
+minute and the wildfire's every 10 min, 383,237 rows (~24 MB) in all. It is a side table, not
+ledger rows.
+
+## Fuel: out/fuel.arrow
+
+The wildfire's fuel map (`sim/fuel.py`) on a 50 m grid over the venue: `venue`, `lat`, `lon`,
+`class` (river, riparian, corridor, slash, conifer) and `r0_factor`, the multiplier on the
+no-wind spread rate. That is 16,761 rows (~0.8 MB).
 
 ## Situation snapshots: tools/snapshot_sim.py
 
@@ -95,7 +114,14 @@ to `out/snapshots/`. Each PNG has three panels:
 ```bash
 python -m tools.snapshot_sim out/sim_study_0.arrow --scenario regatta --at 2026-09-05T17:20:00
 python -m tools.snapshot_sim out/sim_study_0.arrow --scenario regatta --every 10m   # 13:00–18:00 ADT
+python -m tools.snapshot_sim out/sim_study_0.arrow --scenario wildfire --every 2h   # ignition to contained
 ```
+
+For the wildfire, the panels are:
+- the fuel map, the burning area and the finished line
+- the crews with 30 min tails
+- the burnt area, the vertices still spreading, the km of line, the wind at the ICP, and each
+  crew's distance to the nearest spreading front
 
 ## Rows: tools/view_sim.py
 

@@ -167,6 +167,7 @@ class Regatta:
         self.policies = {b.name: tactician for b in self.boats}
         if policy is not None:
             self.policies[self.boats[-1].name] = policy
+        self.memory = {b.name: {} for b in self.boats}
         self.dnf: set[str] = set()
         self.done_s: float | None = None
         self.t_s: int | None = None
@@ -249,7 +250,7 @@ class Regatta:
         for b in racers:
             r = self.referees[b.name]
             obs = RegattaObservation(
-                t_s=t_s, decision_s=sc.DECISION_S, me=b.name, boats=boats, marks=marks, next_mark=r.next_mark,
+                t_s=t_s, decision_s=sc.DECISION_S, memory=self.memory[b.name], me=b.name, boats=boats, marks=marks, next_mark=r.next_mark,
                 legs_done=max(r.leg, 0), legs=c.legs, started=r.start_s is not None, ocs=r.ocs,
                 gun_s=GUN_S, time_limit_s=TIME_LIMIT_S, course_axis_deg=sc.COURSE_AXIS_DEG,
                 line=(self.rc.name, "MARK-PIN"), gate=("MARK-GATE-1", "MARK-GATE-2"),

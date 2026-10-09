@@ -1,10 +1,13 @@
 """Situation pictures of an arena scenario at chosen instants, drawn from a saved ledger and
 `out/wind.arrow`: what a decision maker sees. One PNG per instant into `out/snapshots/`.
 
-Each entity is drawn at its latest row at or before the instant; boats trail their last 5 min.
+Each entity is drawn at its latest row at or before the instant; boats trail their last 5 min,
+crews their last 30. The fire's perimeter is rebuilt from its vertex rows (`FireReplay`) and
+drawn over the fuel map from `out/fuel.arrow`.
 
     python -m tools.snapshot_sim out/sim_study_0.arrow --scenario regatta --at 2026-09-05T17:20:00
     python -m tools.snapshot_sim out/sim_study_0.arrow --scenario regatta --every 10m
+    python -m tools.snapshot_sim out/sim_study_0.arrow --scenario wildfire --every 2h
 """
 
 import argparse
@@ -22,6 +25,7 @@ import pyarrow.compute as pc
 
 from sim import scenario as sc
 from sim.models import regatta as rg
+from sim.models import wildfire as wf
 from sim.wind import read_table
 from soloc_client import CENTURY_NS, id_bytes, matches, positions, sts_field, tai_ns_from_utc
 from tools.plot_sim import INK_MUTED, MARK, SERIES, TRACK, WATER, style
@@ -45,6 +49,7 @@ class Rows:
         self.heading = (90 - np.degrees(2 * np.arctan2(q[:, 3], q[:, 0]))) % 360
         v = table.column("velocity").combine_chunks().flatten().to_numpy().reshape(-1, 3)
         self.speed = np.hypot(v[:, 0], v[:, 1])
+        self.length = np.array([d[0] if d else np.nan for d in table.column("dimensions").to_pylist()])
         self.index = {}
         for n in np.unique(self.names):
             k = np.flatnonzero(self.names == n)
@@ -53,6 +58,55 @@ class Rows:
     def upto(self, name: str, t_s: float) -> np.ndarray:
         k = self.index.get(name, np.array([], np.int64))
         return k[self.t_s[k] <= t_s]
+
+
+class FireView:
+    """The wildfire as stored: the replayed perimeter, and each trench as `(born, a, b)`."""
+
+    def __init__(self, w: wf.Wildfire, rows: Rows):
+        vertex = np.array([n.startswith("FIRE-V") for n in rows.names])
+        self.replay = wf.FireReplay(rows.t_s[vertex], rows.names[vertex], rows.pos[vertex])
+        self.lines = []
+        for tr in w.trenches:
+            k = rows.index.get(tr.name)
+            if k is None:
+                continue
+            j = k[0]
+            h = np.radians(rows.heading[j])
+            half = rows.length[j] / 2 * np.array([np.sin(h), np.cos(h)])
+            self.lines.append((rows.t_s[j], rows.pos[j] - half, rows.pos[j] + half))
+        self.end = max(self.replay.stop.values())     # inf if never contained
+
+    def perimeter(self, t_s: float) -> np.ndarray:
+        ring = self.replay.ring_at(t_s)
+        return self.replay.at(ring, t_s) if ring else np.empty((0, 2))
+
+    def area_ha(self, t_s: float) -> float:
+        xy = self.perimeter(t_s)
+        return float(abs(np.dot(xy[:, 0], np.roll(xy[:, 1], -1)) - np.dot(xy[:, 1], np.roll(xy[:, 0], -1))) / 2e4)
+
+    def moving(self, t_s: float) -> np.ndarray:
+        names = [n for n in self.replay.ring_at(t_s) if self.replay.moving(n, t_s)]
+        return self.replay.at(names, t_s) if names else np.empty((0, 2))
+
+
+def fuel_grid(path: Path, venue) -> np.ndarray:
+    """The venue's `r0_factor` on the fuel grid, north-major, as `(rows, cols)`."""
+    table = read_table(path)
+    table = table.filter(pc.equal(table["venue"], venue.name))
+    e0, e1, n0, n1 = sc.FIRE_WIND.extent_m
+    cols = len(np.arange(e0, e1 + 1e-6, sc.FUEL_GRID_M))
+    return table["r0_factor"].to_numpy().reshape(-1, cols)
+
+
+def draw_fuel(ax, fuel: np.ndarray):
+    """Fuel as grey lightness by R0 factor (darker burns faster); the river (0) as water."""
+    e0, e1, n0, n1 = sc.FIRE_WIND.extent_m
+    h = sc.FUEL_GRID_M / 2
+    grey = np.clip(1 - fuel / 2.4, 0, 1)
+    rgb = np.dstack([grey * 0.92 + 0.05] * 3)
+    rgb[fuel == 0] = matplotlib.colors.to_rgb(WATER)
+    ax.imshow(rgb, origin="lower", extent=(e0 - h, e1 + h, n0 - h, n1 + h), interpolation="nearest", zorder=0)
 
 
 def wind_at(table: pa.Table, venue, t_s: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -153,6 +207,81 @@ def draw_regatta(g: rg.Regatta, rows: Rows, wind: pa.Table, t_s: float, out_dir:
     return path
 
 
+FIRE_RED = "#e34948"                 # the status "critical" red: the fire is a hazard, not a series
+PDT = timedelta(hours=-7)
+
+
+def draw_wildfire(w: wf.Wildfire, rows: Rows, fire: FireView, fuel: np.ndarray, wind: pa.Table,
+                  t_s: float, out_dir: Path) -> Path:
+    fig, (whole, near, panel) = plt.subplots(1, 3, figsize=(17, 6.5), layout="constrained",
+                                             gridspec_kw={"width_ratios": [1, 1.6, 0.9]})
+    xy, u, v = wind_at(wind, w.venue, t_s)
+    ring = fire.perimeter(t_s)
+    for ax in (whole, near):
+        draw_fuel(ax, fuel)
+        if len(xy):
+            ax.quiver(xy[:, 0], xy[:, 1], u, v, color=INK_MUTED, alpha=0.5, width=0.003,
+                      scale=50 if ax is whole else 35)
+        if len(ring):
+            ax.fill(ring[:, 0], ring[:, 1], color=FIRE_RED, alpha=0.25, linewidth=0)
+            ax.plot(*np.vstack([ring, ring[:1]]).T, color=FIRE_RED, linewidth=1.2)
+        for born, a, b in fire.lines:
+            if born <= t_s:
+                ax.plot([a[0], b[0]], [a[1], b[1]], color="#3d3c37", linewidth=2.0, solid_capstyle="butt")
+        ax.plot(*sc.ICP_M, "^", color="#3d3c37", markersize=7)
+        for c in w.crews:
+            k = rows.upto(c.name, t_s)
+            if not len(k):
+                continue
+            tail = k[rows.t_s[k] >= t_s - 1800]
+            ax.plot(rows.pos[tail, 0], rows.pos[tail, 1], "-", color=TRACK, linewidth=0.6)
+            ax.plot(*rows.pos[k[-1]], "s", color=TRACK, markersize=5 if ax is near else 3)
+            if ax is near:
+                ax.annotate(c.name.split("-")[1], rows.pos[k[-1]], fontsize=6, xytext=(3, 3),
+                            textcoords="offset points")
+        ax.set_aspect("equal")
+        style(ax)
+    e0, e1, n0, n1 = sc.FIRE_WIND.extent_m
+    whole.set_xlim(e0, e1)
+    whole.set_ylim(n0, n1)
+    whole.set_title(f"{w.venue.name}, venue ENU (m); grey = fuel (darker burns faster)", fontsize=9)
+    pts = np.vstack([ring if len(ring) else np.zeros((1, 2)), *[np.array([a, b]) for _, a, b in fire.lines], [sc.ICP_M]])
+    lo, hi = pts.min(0) - 250, pts.max(0) + 250
+    near.set_xlim(lo[0], hi[0])
+    near.set_ylim(lo[1], hi[1])
+    near.set_title("fire (red), finished line (dark), crews with 30 min tails (blue ■), ICP ▲", fontsize=9)
+
+    when = sc.T0 + timedelta(seconds=t_s)
+    since = t_s - wf.IGNITION_S
+    line_km = sum(float(np.linalg.norm(b - a)) for born, a, b in fire.lines if born <= t_s) / 1000
+    moving = fire.moving(t_s)
+    lines = [f"{when:%Y-%m-%d %H:%M:%S} UTC", f"{when + PDT:%H:%M:%S} PDT",
+             f"ignition {sc.FIRE_IGNITION + PDT:%m-%d %H:%M} PDT" + (f", +{timedelta(seconds=round(since))}" if since >= 0 else ""),
+             "",
+             f"burnt     {fire.area_ha(t_s):8.1f} ha",
+             f"perimeter {len(ring):5d} vertices, {len(moving)} spreading",
+             f"line      {line_km:8.2f} km finished",
+             ("contained " + f"{timedelta(seconds=round(fire.end - wf.IGNITION_S))} after ignition"
+              if t_s >= fire.end else "not contained"),
+             ""]
+    if len(xy):
+        k = int(np.argmin(np.linalg.norm(xy - np.array(sc.ICP_M), axis=1)))
+        lines.append(f"wind at ICP {np.degrees(np.arctan2(-u[k], -v[k])) % 360:5.1f}° {np.hypot(u[k], v[k]):4.1f} m/s")
+        lines.append("")
+    for c in w.crews:
+        k = rows.upto(c.name, t_s)
+        if len(k):
+            p = rows.pos[k[-1]]
+            gap = f"{np.linalg.norm(moving - p, axis=1).min():7.0f} m" if len(moving) else "   none"
+            lines.append(f"{c.name:8s} {rows.speed[k[-1]]:4.2f} m/s, nearest spreading front {gap}")
+    panel.axis("off")
+    panel.text(0, 1, "\n".join(lines), va="top", family="monospace", fontsize=8)
+    path = out_dir / f"wildfire_{when:%Y%m%dT%H%M%S}.png"
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+    return path
+
+
 def parse_every(text: str) -> int:
     m = re.fullmatch(r"(\d+)([smh]?)", text)
     if not m:
@@ -160,7 +289,7 @@ def parse_every(text: str) -> int:
     return int(m[1]) * {"": 1, "s": 1, "m": 60, "h": 3600}[m[2]]
 
 
-SCENARIOS = {"regatta": (rg.ON_S, rg.OFF_S)}
+SCENARIOS = {"regatta": (rg.ON_S, rg.OFF_S), "wildfire": (wf.IGNITION_S, None)}
 
 
 def main():
@@ -169,7 +298,8 @@ def main():
     p.add_argument("--scenario", choices=sorted(SCENARIOS), required=True)
     when = p.add_mutually_exclusive_group(required=True)
     when.add_argument("--at", type=datetime.fromisoformat, help="UTC, e.g. 2026-09-05T17:20:00")
-    when.add_argument("--every", type=parse_every, help="over the scenario's window, e.g. 10m")
+    when.add_argument("--every", type=parse_every,
+                      help="over the scenario's window (the wildfire's: ignition to contained), e.g. 10m")
     p.add_argument("--wind", default=None, help="wind table (default: wind.arrow beside FILE)")
     p.add_argument("--out", default="out/snapshots")
     args = p.parse_args()
@@ -177,14 +307,24 @@ def main():
     path = Path(args.path)
     table, names = load(path)
     wind = read_table(Path(args.wind) if args.wind else path.with_name("wind.arrow"))
-    g = rg.Regatta(sc.SEED)
-    rows = Rows(table, names, g.venue.id, tai_ns_from_utc(sc.T0))
+    t0_ns = tai_ns_from_utc(sc.T0)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    on, off = SCENARIOS[args.scenario]
+    if args.scenario == "regatta":
+        g = rg.Regatta(sc.SEED)
+        rows = Rows(table, names, g.venue.id, t0_ns)
+        draw = lambda t_s: draw_regatta(g, rows, wind, t_s, out_dir)
+        on, off = SCENARIOS["regatta"]
+    else:
+        w = wf.Wildfire(sc.SEED)
+        rows = Rows(table, names, w.venue.id, t0_ns)
+        fire = FireView(w, rows)
+        fuel = fuel_grid(path.with_name("fuel.arrow"), w.venue)
+        draw = lambda t_s: draw_wildfire(w, rows, fire, fuel, wind, t_s, out_dir)
+        on, off = wf.IGNITION_S, int(min(fire.end, sc.DURATION_S))
     times = [sc.seconds(args.at)] if args.at else range(on, off + 1, args.every)
     for t_s in times:
-        print(draw_regatta(g, rows, wind, t_s, out_dir))
+        print(draw(t_s))
 
 
 if __name__ == "__main__":

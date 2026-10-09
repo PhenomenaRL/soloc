@@ -78,7 +78,7 @@
   <section><h2>Legend (click to hide)</h2><div id="legend"></div></section>
   <section><h2>Body axes</h2>
     <div class="axes"><span><b style="color:#ff5a4f">x</b> red</span><span><b style="color:#4fd16b">y</b> green</span><span><b style="color:#5a8bff">z</b> blue</span></div>
-    <div class="note">Aircraft and ships: x forward, z down. Robots and sailboats: x forward, z up. Spacecraft: LVLH, z to nadir (on a Sun-centred path, z to the Sun). Facilities: east, north, up.</div>
+    <div class="note">Aircraft and ships: x forward, z down. Robots, sailboats and fire crews: x forward, z up. Spacecraft: LVLH, z to nadir (on a Sun-centred path, z to the Sun). Facilities: east, north, up.</div>
   </section>
   <section><h2>View</h2>
     <div class="row">Camera turns with body <input type="checkbox" id="corotate" checked></div>
@@ -124,7 +124,10 @@ const CATS = {
   logistics:  { label: "Logistics robots",    color: "#e66767" },
   sailboat:   { label: "Sailboats",           color: "#e9e8e2" },
   marker:     { label: "Marks and met buoys", color: "#a8a79f" },
+  crew:       { label: "Fire crews",          color: "#e9e8e2" },
+  fire:       { label: "Fire perimeter",      color: "#e34948" },   // the status "critical" red: a hazard
 };
+const FIRE_LINE = 0xd6d4cc;
 // How close the camera must be before a context's vehicles, trails and labels show.
 const BODY_REACH = 30;        // × body radius
 const SITE_REACH_KM = 3;
@@ -237,7 +240,9 @@ function bodyAt(b, T, pos, quat) {
 function box(sx, sy, sz, mat, x = 0, y = 0, z = 0) { const m = new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz), mat); m.position.set(x, y, z); return m; }
 function makeModel(cat, shape = cat) {
   const g = new THREE.Group(), mat = new THREE.MeshLambertMaterial({ color: CATS[cat].color });
-  if (shape === "sailboat") g.add(box(0.8, 0.26, 0.1, mat), box(0.03, 0.03, 1.1, mat, 0.08, 0, 0.55), box(0.42, 0.015, 0.85, mat, -0.14, 0, 0.55));
+  if (shape === "none") return g;                  // a fire vertex: only its place on the perimeter loop
+  if (shape === "crew") g.add(box(0.5, 0.5, 0.18, mat, 0, 0, 0.09), box(0.12, 0.12, 0.5, mat, 0.15, 0.15, 0.3));
+  else if (shape === "sailboat") g.add(box(0.8, 0.26, 0.1, mat), box(0.03, 0.03, 1.1, mat, 0.08, 0, 0.55), box(0.42, 0.015, 0.85, mat, -0.14, 0, 0.55));
   else if (shape === "motorboat") g.add(box(0.95, 0.34, 0.14, mat), box(0.36, 0.26, 0.22, mat, -0.05, 0, 0.18));
   else if (shape === "mark") g.add(box(0.3, 0.3, 0.6, mat, 0, 0, 0.3));
   else if (shape === "buoy") g.add(box(0.5, 0.5, 0.25, mat, 0, 0, 0.12), box(0.05, 0.05, 0.8, mat, 0, 0, 0.6));
@@ -265,13 +270,48 @@ function underlay(layers) {
 function buildVenueLayout(ctx) {
   const s = ctx.def, [e0, e1, n0, n1] = s.extent, grp = ctx.group, layers = [];
   const add = o => { grp.add(o); layers.push(o); return o; };
-  add(new THREE.Mesh(new THREE.PlaneGeometry(e1 - e0, n1 - n0), new THREE.MeshLambertMaterial({ color: "#26262b" })))
-    .position.set((e0 + e1) / 2, (n0 + n1) / 2, 0);
+  if (s.fuel) {
+    // Fuel as grey lightness by R0 factor (darker burns faster), the river (0) as water.
+    const f = f32(s.fuel.f), cols = s.fuel.cols, rows = f.length / cols, px = new Uint8Array(f.length * 4);
+    for (let i = 0; i < f.length; i++) {
+      const g = f[i] === 0 ? [29, 58, 82] : Array(3).fill(Math.round(255 * (0.08 + 0.45 * Math.max(0, 1 - f[i] / 2.4))));
+      px.set([...g, 255], 4 * i);
+    }
+    const tex = new THREE.DataTexture(px, cols, rows, THREE.RGBAFormat);
+    tex.magFilter = THREE.NearestFilter; tex.needsUpdate = true;
+    const h = s.fuel.step / 2;
+    add(new THREE.Mesh(new THREE.PlaneGeometry(e1 - e0 + 2 * h, n1 - n0 + 2 * h), new THREE.MeshLambertMaterial({ map: tex })))
+      .position.set((e0 + e1) / 2, (n0 + n1) / 2, 0);
+  } else {
+    add(new THREE.Mesh(new THREE.PlaneGeometry(e1 - e0, n1 - n0), new THREE.MeshLambertMaterial({ color: "#26262b" })))
+      .position.set((e0 + e1) / 2, (n0 + n1) / 2, 0);
+  }
   const waterMat = new THREE.MeshLambertMaterial({ color: "#1d3a52" });
-  for (const ring of s.water) add(new THREE.Mesh(new THREE.ShapeGeometry(new THREE.Shape(ring.map(([x, y]) => new THREE.Vector2(x, y)))), waterMat));
-  const line = add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(s.line.map(([x, y]) => new THREE.Vector3(x, y, 0))),
-    new THREE.LineDashedMaterial({ color: 0xa8a79f, dashSize: 12, gapSize: 8 })));
-  line.computeLineDistances();
+  for (const ring of s.water || []) add(new THREE.Mesh(new THREE.ShapeGeometry(new THREE.Shape(ring.map(([x, y]) => new THREE.Vector2(x, y)))), waterMat));
+  if (s.line) {
+    const line = add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(s.line.map(([x, y]) => new THREE.Vector3(x, y, 0))),
+      new THREE.LineDashedMaterial({ color: 0xa8a79f, dashSize: 12, gapSize: 8 })));
+    line.computeLineDistances();
+  }
+  if (s.trenches) {
+    // Finished line, sorted by when each piece was finished: drawn up to the time shown.
+    const p = f32(s.trenches.p), n = p.length / 4, pos = new Float32Array(n * 6);
+    for (let i = 0; i < n; i++) pos.set([p[4 * i], p[4 * i + 1], 0, p[4 * i + 2], p[4 * i + 3], 0], 6 * i);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    ctx.trenches = { t: s.trenches.t, lines: new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: FIRE_LINE })) };
+    ctx.trenches.lines.frustumCulled = false; ctx.trenches.lines.renderOrder = 19;
+    grp.add(ctx.trenches.lines);
+  }
+  if (s.rings) {
+    const most = Math.max(...s.rings.map(r => r.i.length));
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(most * 3), 3));
+    ctx.perimeter = { rings: s.rings, t: s.rings.map(r => r.t),
+                      loop: new THREE.LineLoop(g, new THREE.LineBasicMaterial({ color: CATS.fire.color })) };
+    ctx.perimeter.loop.frustumCulled = false; ctx.perimeter.loop.renderOrder = 21;
+    grp.add(ctx.perimeter.loop);
+  }
   if (s.wind) {
     // One arrow per grid point (shaft and two barbs), rewritten when the wind table's minute changes.
     const w = s.wind;
@@ -282,6 +322,24 @@ function buildVenueLayout(ctx) {
     ctx.wind.lines.frustumCulled = false;
   }
   underlay(layers);
+}
+function updateFire(ctx, T, near) {
+  if (ctx.trenches) {
+    ctx.trenches.lines.geometry.setDrawRange(0, 2 * upper(ctx.trenches.t, T));
+    ctx.trenches.lines.visible = near;
+  }
+  const f = ctx.perimeter;
+  if (!f) return;
+  const k = upper(f.t, T) - 1, P = f.loop.geometry.attributes.position.array;
+  let n = 0;
+  if (k >= 0) for (const i of f.rings[k].i) {
+    const e = ctx.tracks[i];
+    if (!e.active) continue;
+    P[3 * n] = e.local.x; P[3 * n + 1] = e.local.y; P[3 * n + 2] = 0.5; n++;
+  }
+  f.loop.geometry.setDrawRange(0, n);
+  f.loop.geometry.attributes.position.needsUpdate = true;
+  f.loop.visible = near && n > 2 && !state.hidden.has("fire");
 }
 const WIND_M_PER_M_S = 35;
 function updateWind(ctx, T) {
@@ -325,7 +383,7 @@ function buildSiteLayout(ctx) {
 const contexts = [], entities = [];
 for (const c of DATA.contexts) {
   const body = bodyByName[c.body];
-  const ctx = { def: c, kind: c.kind, id: c.id, name: c.name, body, entities: [] };
+  const ctx = { def: c, kind: c.kind, id: c.id, name: c.name, body, entities: [], tracks: [] };
   if (c.kind === "site") {
     ctx.group = new THREE.Group();
     ctx.p = new THREE.Vector3(...c.p);
@@ -343,8 +401,10 @@ for (const c of DATA.contexts) {
   }
   for (const tr of c.tracks) {
     const e = { name: tr.name, cat: tr.cat, ctx, t: f32(tr.t), p: (tr.wide ? f64 : f32)(tr.p), q: f32(tr.q),
-                model: makeModel(tr.cat, tr.model), local: V(), active: false };
-    if (c.kind === "site") {
+                model: makeModel(tr.cat, tr.model), local: V(), active: false, quiet: tr.model === "none" };
+    if (e.quiet) {
+      ctx.group.add(e.model);
+    } else if (c.kind === "site") {
       e.line = trailLine(e.p, tr.cat); ctx.group.add(e.line, e.model);
     } else if (c.kind === "inertial") {
       // Non-rotating axes centred on the body; positions are doubles (float32 is ~16 km at
@@ -364,14 +424,14 @@ for (const c of DATA.contexts) {
       e.line = trailLine(e.p, tr.cat); e.lineInertial = trailLine(pin, tr.cat);
       ctx.fixedTrails.add(e.line); ctx.inertialTrails.add(e.lineInertial); body.fixed.add(e.model);
     }
-    ctx.entities.push(e); entities.push(e);
+    ctx.entities.push(e); ctx.tracks.push(e); entities.push(e);
   }
   contexts.push(ctx);
 }
 // A craft that changes frame has one track per context, under one name. Following it follows
 // whichever track is live.
 const byName = {};
-for (const e of entities) if (!e.static) (byName[e.name] ||= []).push(e);
+for (const e of entities) if (!e.static && !e.quiet) (byName[e.name] ||= []).push(e);
 function pickEntity(name, prev) { return byName[name].find(e => e.active) || prev || byName[name][0]; }
 
 // ---- state, focus, camera -------------------------------------------------------------------
@@ -511,7 +571,7 @@ function update() {
       const hidden = state.hidden.has(e.cat);
       // A site's facility shows from as far as its body's vehicles do; its robots only up close.
       const visibleHere = e.static ? ctxNearBody(ctx) : near;
-      e.model.visible = e.active && !hidden && visibleHere;
+      e.model.visible = e.active && !hidden && visibleHere && !e.quiet;
       if (!e.static) {
         const [a, n] = trailRange(e, T);
         for (const l of [e.line, e.lineInertial]) if (l) { l.geometry.setDrawRange(a, n); l.visible = !hidden && near && n > 1; }
@@ -525,6 +585,7 @@ function update() {
     }
     if (ctx.kind === "site") ctx.group.visible = ctxNearBody(ctx);
     if (ctx.wind) updateWind(ctx, T);
+    if (ctx.perimeter || ctx.trenches) updateFire(ctx, T, near);
   }
   updateLabels();
   const dt = new Date(T0 + T * 1000);

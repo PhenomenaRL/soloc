@@ -386,6 +386,9 @@ def ship_name(i: int) -> str:
 
 # -- wind: an analytic field per venue (sim/wind.py) ---------------------------------------------
 
+WIND_GRID_M = 250.0                  # out/wind.arrow defaults: grid spacing and time step
+WIND_TABLE_S = 60
+
 
 @dataclass(frozen=True)
 class WindSpec:
@@ -405,10 +408,8 @@ class WindSpec:
     on: datetime
     off: datetime
     extent_m: tuple[float, float, float, float]
-
-
-WIND_GRID_M = 250.0                  # out/wind.arrow: grid spacing and time step
-WIND_TABLE_S = 60
+    grid_m: float = WIND_GRID_M
+    table_s: int = WIND_TABLE_S
 
 
 # -- regatta: Bedford Basin, Halifax. Children report venue ENU metres about the course centre --
@@ -505,3 +506,92 @@ BASIN_WATER = (
 
 def boat_name(i: int) -> str:
     return f"SAIL-{i + 1:02d}"
+
+
+# -- wildfire: Squamish Valley, BC. Children report venue ENU metres about the ignition point --
+
+FIRE_VENUE = FacilitySpec("Squamish Valley fire", "SQF", EARTH, 49.8078, -123.1969)
+FIRE_IGNITION = datetime(2026, 9, 3, 21)       # 14:00 PDT
+FIRE_DISPATCH_AFTER_S = 3600                   # the first orders to the crews
+FIRE_STEP_S = 60                     # spread step; moving vertices report on it
+FIRE_IDLE_CADENCE_S = 600            # stopped vertices and finished trenches
+CREW_CADENCE_S = 30                  # from ignition on
+CREW_IDLE_CADENCE_S = 3600           # at the ICP before it
+FIRE_DECISION_S = 300
+FIRE_TIMESCALE = "TAI"
+CREW_TIMESCALE = "GPST"
+
+FIRE_WIND = WindSpec("Squamish Valley fire", tws_m_s=3.5, twd_deg=160.0, build_m_s_h=0.0,
+                     shift_deg=20.0, shift_period_s=3 * 3600.0, puffs=4, puff_radius_m=800.0,
+                     puff_gain=0.3, on=FIRE_IGNITION, off=T_END,
+                     extent_m=(-3000.0, 2500.0, -2500.0, 5000.0), table_s=600)
+
+# Huygens spread along each vertex's outward normal, from a wind-aligned ellipse: head rate
+# R0 · fuel · (1 + WIND_GAIN · U), length-to-breadth 1 + LB_PER_M_S · U, U the wind speed (m/s).
+R0_M_MIN = 0.5
+WIND_GAIN = 1.0
+LB_PER_M_S = 0.3
+IGNITION_RADIUS_M = 20.0
+VERTICES = 48                        # on the ignition circle
+VERTEX_GAP_M = 60.0                  # a new vertex spawns midway once neighbours are this far apart
+VERTEX_CAP = 240
+
+CREWS = 12
+CREW_MASS_KG = 2000.0                # 20 people with tools
+CREW_DIMENSIONS_M = (10.0, 10.0, 2.0)
+WALK_M_S = 1.2
+DIG_M_H = 100.0
+SAFE_M = 30.0                        # a crew never moves within this of a moving vertex
+ESCAPE_M = 40.0                      # and drops its work and walks away inside this
+ICP_M = (1286.0, -1532.0)            # 2 km down-valley, on the same bank
+TRENCH_M = 50.0                      # a trench entity per this much finished line
+TRENCH_WIDTH_M = 1.0
+TRENCH_DEPTH_M = 0.5
+TRENCH_CAP = 620                     # 6 crews digging the whole window
+
+# Fuel zones, by precedence: the river and its riparian band (distance to the centreline), the
+# power-line corridor, a slash cutblock (venue ENU box), conifer elsewhere.
+FUEL_FACTORS = {"river": 0.0, "riparian": 0.5, "corridor": 0.3, "slash": 1.8, "conifer": 1.0}
+RIVER_HALF_WIDTH_M = 60.0
+RIPARIAN_M = 250.0
+CORRIDOR_HALF_WIDTH_M = 40.0
+SLASH_M = (-300.0, 300.0, 1100.0, 1500.0)
+FUEL_GRID_M = 50.0                   # out/fuel.arrow
+
+# (lat, lon) centrelines simplified to ~20 m from OpenStreetMap: the Squamish River, and the
+# power line (way 161389488) that passes the ignition point.
+SQUAMISH_RIVER = (
+    (49.86582, -123.25151), (49.86466, -123.25227), (49.86392, -123.25171), (49.86332, -123.25077),
+    (49.86276, -123.24806), (49.86333, -123.24352), (49.86452, -123.24165), (49.86552, -123.23919),
+    (49.86481, -123.23686), (49.86388, -123.23627), (49.86223, -123.23637), (49.85979, -123.23823),
+    (49.85844, -123.23987), (49.85757, -123.24176), (49.85637, -123.24751), (49.85387, -123.24667),
+    (49.85254, -123.24473), (49.84917, -123.24254), (49.84644, -123.23941), (49.84551, -123.23725),
+    (49.84435, -123.23131), (49.84354, -123.22486), (49.84273, -123.22311), (49.84126, -123.22166),
+    (49.83964, -123.22184), (49.83702, -123.22470), (49.83406, -123.22600), (49.82823, -123.22742),
+    (49.82472, -123.22585), (49.82172, -123.22536), (49.82101, -123.22431), (49.82016, -123.22112),
+    (49.81898, -123.21857), (49.81711, -123.21609), (49.81586, -123.21585), (49.81462, -123.21700),
+    (49.81335, -123.21912), (49.81147, -123.21915), (49.80688, -123.21478), (49.80328, -123.21426),
+    (49.80144, -123.21313), (49.79898, -123.20722), (49.79636, -123.20389), (49.79488, -123.20091),
+    (49.79309, -123.19277), (49.79109, -123.19033), (49.78954, -123.18933), (49.78713, -123.18671),
+    (49.78193, -123.18281), (49.77962, -123.18134), (49.77831, -123.18109), (49.77776, -123.18041),
+    (49.77630, -123.17834), (49.77569, -123.17612), (49.77552, -123.17163), (49.77517, -123.17037),
+    (49.77437, -123.16988), (49.77347, -123.16767), (49.77290, -123.16713), (49.77106, -123.16696),
+    (49.77021, -123.16703), (49.76934, -123.16790), (49.76847, -123.16792),
+)
+POWER_LINE = (
+    (49.85774, -123.23075), (49.85090, -123.22661), (49.84716, -123.22373), (49.83643, -123.21363),
+    (49.82958, -123.20802), (49.81715, -123.20609), (49.80995, -123.19930), (49.79868, -123.17341),
+    (49.79692, -123.16549), (49.79279, -123.16122), (49.79158, -123.16120),
+)
+
+
+def crew_name(i: int) -> str:
+    return f"CREW-{i + 1}"
+
+
+def vertex_name(i: int) -> str:
+    return f"FIRE-V{i + 1:03d}"
+
+
+def trench_name(i: int) -> str:
+    return f"LINE-{i + 1:03d}"

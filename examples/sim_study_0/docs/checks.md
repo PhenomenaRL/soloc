@@ -13,10 +13,10 @@ was recorded under a small `memory_limit` or the server's limit evicted part of 
 
 | Check | What it confirms |
 |---|---|
-| roster | `current_state` holds every facility, spacecraft, probe, robot, crawler, aircraft, ship, regatta entity and body, and nothing else; the regatta marks are absent, since they were lifted hours before the window ends |
+| roster | `current_state` holds every facility, spacecraft, probe, robot, crawler, aircraft, ship, regatta and wildfire entity, every fire vertex and trench that was born, and every body, and nothing else; the regatta marks are absent, since they were lifted hours before the window ends |
 | names | the `.names.arrow` sibling reloaded a name for every sim entity |
 | units / timescale | only `km`/`m` stored, every row normalised to TAI |
-| schedule | each entity's stored epochs are exactly its model's schedule |
+| schedule | each entity's stored epochs are exactly its model's schedule (fire vertices and trenches, whose schedules the run decides, are checked with the wildfire instead) |
 | zero-order hold | every row framed on a spacecraft shares its epoch with a row of that spacecraft |
 | robot frames | every robot row is framed on its own facility |
 | site area | every stored robot position inside the site square, at z = 0 |
@@ -39,6 +39,12 @@ was recorded under a small `memory_limit` or the server's limit evicted part of 
 | polar | while sailing, every row's speed is at most the polar speed for the wind at its position and time (`sim/wind.py`), along its heading |
 | docks | outside race day the boats and RC-BOAT sit at rest in their berths, and all are back by 18:00 ADT |
 | RC boat, marks | RC-BOAT holds the line's starboard end from the warning to the last finish; marks and buoys never move |
+| fire frame | every crew, vertex and trench row is framed on the fire venue at z = 0 |
+| fire replay | the perimeter is rebuilt from the vertex rows (`FireReplay`), with every spawned vertex born midway between two ring neighbours |
+| trenches | static, at most 50 m × 1 m × 0.5 m |
+| spread | every step of a spreading vertex is no faster than the head rate for the wind and fuel where it started, and none crosses a trench finished before it |
+| crew safety | no crew row inside the burnt perimeter or within 30 m of a spreading vertex; no crew faster than 1.2 m/s |
+| contained | replayed from the ledger, every vertex has stopped by the window's end |
 
 Resolving rows through the ledger at historical epochs scans for the parent's pose once per
 `(frame, epoch)`. The resolution checks therefore run on a few epochs, and the per-row checks

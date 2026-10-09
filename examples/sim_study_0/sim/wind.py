@@ -59,6 +59,13 @@ class Wind:
         return -tws * np.sin(d), -tws * np.cos(d)
 
 
+def grid(extent_m, step_m: float) -> tuple[np.ndarray, np.ndarray]:
+    """Flat `(east, north)` of a grid over `(east lo, hi, north lo, hi)`, north-major."""
+    e0, e1, n0, n1 = extent_m
+    east, north = np.meshgrid(np.arange(e0, e1 + 1e-6, step_m), np.arange(n0, n1 + 1e-6, step_m))
+    return east.ravel(), north.ravel()
+
+
 WIND_SCHEMA = pa.schema([
     ("venue", pa.string()),
     ("t", pa.timestamp("s", tz="UTC")),
@@ -70,16 +77,13 @@ WIND_SCHEMA = pa.schema([
 
 
 def write_table(path: Path, winds: list[Wind]) -> int:
-    """Every field on a `WIND_GRID_M` grid every `WIND_TABLE_S` over its `[on, off]`. Returns
-    the row count."""
+    """Every field on its `grid_m` grid every `table_s` over its `[on, off]`. Returns the row
+    count."""
     batches = []
     for w in winds:
-        e0, e1, n0, n1 = w.spec.extent_m
-        east, north = np.meshgrid(np.arange(e0, e1 + 1e-6, sc.WIND_GRID_M),
-                                  np.arange(n0, n1 + 1e-6, sc.WIND_GRID_M))
-        east, north = east.ravel(), north.ravel()
+        east, north = grid(w.spec.extent_m, w.spec.grid_m)
         lat, lon = w.venue.geodetic(east, north)
-        for t_s in range(w.on_s, w.off_s + 1, sc.WIND_TABLE_S):
+        for t_s in range(w.on_s, w.off_s + 1, w.spec.table_s):
             u, v = w.uv(east, north, t_s)
             t = np.datetime64(sc.T0, "s") + np.timedelta64(t_s, "s")
             batches.append(pa.record_batch([

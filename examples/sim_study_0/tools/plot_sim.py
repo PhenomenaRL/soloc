@@ -4,6 +4,7 @@ Reloads the file into the server first, so it can run right after run_sim.py.
 """
 
 import argparse
+import math
 from datetime import timedelta
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from sim.ephemeris import Ephemeris
 from sim.geo import EARTH, GCRF, MARS, MOON, SUN, GreatCircle, fixed_to_geodetic
 from sim.land import CANALS, outlines
 from sim.models import regatta as rg
+from sim.models import wildfire as wf
 from sim.models.sailboat import polar
 from sim.roster import roster
 from soloc_client import (CENTURY_NS, SolocClient, id_bytes, matches, positions, sts_field,
@@ -488,6 +490,101 @@ def plot_regatta_speed(g, table: pa.Table, out_dir: Path) -> Path:
     return path
 
 
+def fire_rows(w, table: pa.Table):
+    # Imported here: snapshot_sim imports this module's style.
+    from tools.snapshot_sim import FireView, Rows
+    rows = Rows(table, w.names, w.venue.id, tai_ns_from_utc(sc.T0))
+    return rows, FireView(w, rows)
+
+
+def plot_wildfire(w, table: pa.Table, fuel_path: Path, out_dir: Path) -> Path:
+    """The fire's growth as stored: the perimeter every 2 h from ignition (darker = later) over
+    the fuel map, the finished line coloured by when each piece was finished, the crews' tracks."""
+    from tools.snapshot_sim import FIRE_RED, draw_fuel, fuel_grid
+    rows, fire = fire_rows(w, table)
+    end = min(fire.end, sc.DURATION_S)
+    fig, ax = plt.subplots(figsize=(11, 9), layout="constrained")
+    draw_fuel(ax, fuel_grid(fuel_path, w.venue))
+    hours = np.arange(2, (end - wf.IGNITION_S) / 3600 + 1e-9, 2.0)
+    reds = matplotlib.cm.ScalarMappable(matplotlib.colors.Normalize(-hours[-1] * 0.3, hours[-1]),
+                                        matplotlib.colors.LinearSegmentedColormap.from_list("fire", ["#ffffff", FIRE_RED, "#7a1515"]))
+    for h in hours:
+        ring = fire.perimeter(wf.IGNITION_S + h * 3600)
+        ax.plot(*np.vstack([ring, ring[:1]]).T, color=reds.to_rgba(h), linewidth=1.0)
+    fig.colorbar(reds, ax=ax, shrink=0.6, label="perimeter (hours after ignition)",
+                 boundaries=np.linspace(0, hours[-1], 50), ticks=hours[1::2])
+    for c in w.crews:
+        k = rows.index.get(c.name, np.array([], int))
+        k = k[(rows.t_s[k] >= wf.IGNITION_S) & (rows.t_s[k] <= end)]
+        ax.plot(rows.pos[k, 0], rows.pos[k, 1], color=INK_MUTED, linewidth=0.5, alpha=0.7)
+    if fire.lines:
+        born = np.array([b for b, _, _ in fire.lines])
+        segs = [np.array([a, b]) for _, a, b in fire.lines]
+        lc = matplotlib.collections.LineCollection(segs, cmap="Blues", linewidths=2.5,
+                                                   norm=matplotlib.colors.Normalize((born.min() - wf.IGNITION_S) / 3600 - 1,
+                                                                                    (born.max() - wf.IGNITION_S) / 3600))
+        lc.set_array((born - wf.IGNITION_S) / 3600)
+        ax.add_collection(lc)
+        fig.colorbar(lc, ax=ax, shrink=0.6, label="line finished (hours after ignition)")
+    ax.plot(*sc.ICP_M, "^", color="#3d3c37", markersize=8)
+    ax.annotate("ICP", sc.ICP_M, xytext=(6, -3), textcoords="offset points", fontsize=8)
+    ring = fire.perimeter(end)
+    pts = np.vstack([ring, *[np.array([a, b]) for _, a, b in fire.lines], [sc.ICP_M]])
+    lo, hi = pts.min(0) - 200, pts.max(0) + 200
+    ax.set_xlim(lo[0], hi[0])
+    ax.set_ylim(lo[1], hi[1])
+    ax.set_aspect("equal")
+    ax.set_xlabel("east (m)", fontsize=8)
+    ax.set_ylabel("north (m)", fontsize=8)
+    style(ax)
+    state = (f"contained {timedelta(seconds=round(fire.end - wf.IGNITION_S))} after ignition"
+             if math.isfinite(fire.end) else "not contained")
+    ax.set_title(f"{w.venue.name}: {state}, {fire.area_ha(end):.1f} ha\nperimeter every 2 h (red), finished "
+                 "line (blue), crew tracks (grey); fuel in grey by R0 factor (darker burns faster), river in light blue",
+                 fontsize=10)
+    path = out_dir / "wildfire.png"
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path
+
+
+def plot_wildfire_crews(w, table: pa.Table, out_dir: Path) -> Path:
+    """Each crew's distance to the nearest spreading vertex while any spreads, one panel each,
+    against the rule's 30 m and the 40 m at which a crew walks away."""
+    rows, fire = fire_rows(w, table)
+    end = min(fire.end, sc.DURATION_S)
+    ks = {c.name: rows.index[c.name] for c in w.crews}
+    ticks = np.unique(np.concatenate([rows.t_s[k] for k in ks.values()]))
+    ticks = ticks[(ticks >= wf.IGNITION_S) & (ticks < end)]
+    dist = {n: [] for n in ks}
+    for t in ticks:
+        moving = fire.moving(t)
+        for n, k in ks.items():
+            j = k[np.searchsorted(rows.t_s[k], t, side="right") - 1]
+            dist[n].append(np.linalg.norm(moving - rows.pos[j], axis=1).min() if len(moving) else np.nan)
+    cols = 4
+    fig, axes = plt.subplots(len(ks) // cols, cols, figsize=(16, 2.6 * len(ks) // cols), sharex=True,
+                             sharey=True, layout="constrained")
+    for ax, (n, d) in zip(axes.flat, dist.items()):
+        h = (ticks - wf.IGNITION_S) / 3600
+        ax.plot(h, d, color=TRACK, linewidth=0.9)
+        ax.axhline(sc.SAFE_M, color=MARK, linewidth=0.8, linestyle="--")
+        ax.axhline(sc.ESCAPE_M, color=INK_MUTED, linewidth=0.8, linestyle=":")
+        ax.set_yscale("log")
+        ax.set_title(f"{n}, closest {np.nanmin(d):.0f} m", fontsize=9)
+        style(ax)
+    for ax in axes[-1]:
+        ax.set_xlabel("hours after ignition", fontsize=8)
+    for ax in axes[:, 0]:
+        ax.set_ylabel("to nearest front (m)", fontsize=8)
+    fig.suptitle(f"Wildfire crews: distance to the nearest spreading vertex (orange dashed = the {sc.SAFE_M:.0f} m rule, "
+                 f"grey dotted = {sc.ESCAPE_M:.0f} m, where a crew walks away)", fontsize=11)
+    path = out_dir / "wildfire_crews.png"
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("path")
@@ -538,6 +635,10 @@ def main():
     if present & {b.id for b in g.boats}:
         print(plot_regatta(g, rows, out_dir))
         print(plot_regatta_speed(g, rows, out_dir))
+    w = world.wildfire
+    if present & {c.id for c in w.crews}:
+        print(plot_wildfire(w, rows, path.with_name("fuel.arrow"), out_dir))
+        print(plot_wildfire_crews(w, rows, out_dir))
 
 
 if __name__ == "__main__":

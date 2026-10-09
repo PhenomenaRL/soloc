@@ -11,6 +11,7 @@ from sim.models.aircraft import aircraft
 from sim.models.facility import Facility
 from sim.models.probe import Probe
 from sim.models.regatta import Regatta
+from sim.models.wildfire import Wildfire
 from sim.models.robot import CargoRobot, Crawler, Robot
 from sim.models.ship import ship
 from sim.models.spacecraft import Spacecraft, lander, launcher, moonshot, orbiter, transfer
@@ -29,22 +30,26 @@ class Roster:
     aircraft: list[Track]
     ships: list[Track]
     regatta: Regatta
+    wildfire: Wildfire
 
     @property
     def entities(self) -> list:
         """Parents before their children, so a tick's rows are appended in that order."""
         return [*self.facilities, *self.spacecraft, *self.probes, *self.robots, *self.crawlers,
-                *self.cargo, *self.aircraft, *self.ships, *self.regatta.entities]
+                *self.cargo, *self.aircraft, *self.ships, *self.regatta.entities,
+                *self.wildfire.entities]
 
     @property
     def arenas(self) -> list:
         """Groups the driver hands decision ticks to (`decide_at`, `decide`)."""
-        return [self.regatta]
+        return [self.regatta, self.wildfire]
 
 
-def roster(seed: int, client: SolocClient, regatta_policy: Callable | None = None) -> Roster:
+def roster(seed: int, client: SolocClient, regatta_policy: Callable | None = None,
+           wildfire_policy: Callable | None = None) -> Roster:
     """The client is for the kernels only (body ephemerides); the ledger is not read. The
-    policy drives the last regatta boat (default: the tactician the others use)."""
+    regatta policy drives the last boat (default: the tactician the others use), the wildfire
+    policy the incident commander."""
     ephemeris = Ephemeris(client)
     facilities = [Facility(spec) for spec in sc.FACILITIES]
     site = {f.name: f for f in facilities}
@@ -88,4 +93,4 @@ def roster(seed: int, client: SolocClient, regatta_policy: Callable | None = Non
 
     probes = [Probe(s, ephemeris) for s in sc.PROBES]
     return Roster(facilities, spacecraft, probes, robots, crawlers, cargo, planes, ships,
-                  Regatta(seed, regatta_policy))
+                  Regatta(seed, regatta_policy), Wildfire(seed, wildfire_policy))

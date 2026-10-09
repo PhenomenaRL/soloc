@@ -2,13 +2,18 @@
 
 The window is 2026-09-01T00:00 → 2026-09-06T00:00 UTC. The driver (`run_sim.py`) ticks a 5 s
 grid, asks every entity whether it is due, and appends one batch per 10 min of sim time (721
-appends), plus one before every regatta decision tick. Each `do_put` is `Ledger::append` (validation, TAI normalisation, topology and cycle
+appends), plus one before every arena decision tick. Each `do_put` is `Ledger::append` (validation, TAI normalisation, topology and cycle
 checks on every batch), `append_snapshot` adds the celestial bodies from the kernels, and
 `save_ledger` is `Ledger::save_ipc`.
 
-A full run prints `121 entities, 1,221,722 entity rows + 484 snapshot rows` and the regatta's
-finishing order, and writes `out/sim_study_0.arrow` plus its `out/sim_study_0.arrow.names.arrow`
-name registry and the `out/wind.arrow` side table.
+A full run (~85 s) prints `265 entities, 1,361,302 entity rows + 484 snapshot rows` and a result
+line per arena. It writes these files:
+- `out/sim_study_0.arrow`
+- its `out/sim_study_0.arrow.names.arrow` name registry
+- the `out/wind.arrow` and `out/fuel.arrow` side tables
+
+The wildfire's vertices and trenches come from fixed pools of 240 and 620 names, so the run
+registers 996 names; 131 of them get rows.
 
 `sim/scenario.py` holds the roster and every schedule (times, orbits, airports, lanes); the
 models live in `sim/models/`.
@@ -31,6 +36,10 @@ models live in `sim/models/`.
 | 10 sailboats, RC-BOAT | Bedford Basin | m | GPST | 5 s on race day (09-05 13:00–18:00 ADT), else 1 h | leave the Bedford Basin Yacht Club docks one a minute from 13:00 ADT, motor through Bedford Bay to the start area, race a 3-lap windward-leeward (1.2 km beat, gun 14:00 ADT) under a strategy each, then motor home. RC-BOAT anchors at the line's starboard end |
 | 4 marks | Bedford Basin | m | TAI | 1 min while laid (13:30–17:30 ADT) | windward mark, a 2-mark leeward gate and the start pin; no rows outside that window |
 | 3 met buoys | Bedford Basin | m | TAI | as the boats | moored; the wind field itself is in `out/wind.arrow` |
+| Squamish Valley fire | IAU_EARTH | km | TAI | 1 h | the wildfire venue, a facility whose ENU frame sits at the ignition point, east of the Squamish River, BC |
+| 12 crews | Squamish Valley fire | m | GPST | 30 s from ignition (09-03 14:00 PDT), else 1 h | wait at the ICP 2 km down-valley; from 1 h after ignition walk and dig line (100 m/h) where the incident commander sends them |
+| fire vertices (90 of 240) | Squamish Valley fire | m | TAI | 1 min while spreading, then 10 min | the perimeter: 48 on a 20 m ignition circle, more born midway as the front stretches; each stops for good at finished line, the river, or burnt ground |
+| trenches (41 of 620) | Squamish Valley fire | m | TAI | 10 min once finished | one per 50 m of finished line: pose at the midpoint along the line, `dimensions` 50 × 1 × 0.5 m |
 | 4 bodies | ICRF | km | TAI | 1 h | `append_snapshot` of Sun, Earth, Moon, Mars |
 
 - **Frame tree.** The deepest chain is 3 hops: CRAWLER-04 rides the landed LUNA-1, which sits
@@ -59,9 +68,14 @@ models live in `sim/models/`.
 - **Other columns.** Every sim row carries velocity (m/s, in its parent frame), and every row
   except a facility's also carries `mass_kg` and `dimensions` (m). Apart from Parker's,
   `source_id` is `sim.soloc/kinematic_sim_v1` and `estimate_type` is `SIMULATED`.
-- **Arena.** The regatta's boats are stepped online. Every 10 s from the warning signal, the
-  driver flushes its buffer and each boat's strategy reads the fleet and the marks back through
-  `current_state` and returns a heading. See [arena.md](arena.md).
+- **Arenas.** The regatta's boats and the wildfire's crews are stepped online. On each decision
+  tick, the driver flushes its buffer and the strategy reads its pieces back through
+  `current_state`. The regatta decides every 10 s from the warning signal, the fire every 5 min
+  from 1 h after ignition. The default commander has the fire contained 20.5 h after ignition,
+  at 18.7 ha and 1.8 km of line. See [arena.md](arena.md).
+- **Run-dependent schedules.** Fire vertices and trenches are born (and vertices stop) when the
+  run says so. `check_sim` checks their rows against the replayed fire instead of a fixed
+  schedule.
 - **Aiming.** Every command builds the roster with kernel reads through the server, so the Moon
   flight and the Mars transfer are aimed at where the bodies really are.
 
@@ -91,5 +105,11 @@ that already covers the window) after changing `T0` or `T_END`.
   costing sailing time. There is no current, leeway, heel, acceleration or collision, and boats
   do not affect each other. Natural Earth does not resolve Bedford Basin, so the water check uses
   `scenario.BASIN_WATER`, simplified from OpenStreetMap.
+- **The fire** spreads on flat ground over hand-drawn fuel zones (`sim/fuel.py`): the river from
+  OpenStreetMap buffered 60 m (non-burnable), a riparian band to 250 m (×0.5), a power-line
+  corridor (×0.3), a slash cutblock (×1.8) and conifer elsewhere. The perimeter is a ring of
+  points moving along their normals (Huygens), with no spotting, crowning, slope or burnout. A
+  pocket of fuel left inside the line (here, the low-fuel corridor) keeps the fire "spreading"
+  long after the line is closed, which is why containment takes ~20 h.
 - **The venue plane.** Regatta rows sit at z = 0 on the venue's ENU plane, which rises above the
   sea away from its origin: about 1.1 m at the docks, 3.8 km out.
