@@ -629,6 +629,35 @@ RING_DIMENSIONS_M = {"inner": (0.015, 0.0306, 0.0306), "outer": (0.015, 0.052, 0
 SHAFT_DIMENSIONS_M = (0.40, 0.025, 0.025)
 ROTOR_DIMENSIONS_M = (0.06, 0.12, 0.12)
 
+# Bearing dynamics (sim/models/bearing.py): Hertz contacts on a rigid shaft in the stator frame.
+GROOVE_CONFORMITY = 0.52             # race groove radius / ball diameter, both races
+STEEL_E_PA, STEEL_NU = 208e9, 0.3
+STATION_DAMPING_NS_M = 1000.0        # viscous, per bearing station and axis (ζ ≈ 3 %)
+BELT_PULL_N = (0.0, 300.0, 0.0)      # stator frame: toward the belt
+BELT_PULL_AT_M = 0.20                # the shaft's +x end, where the pulley coupling sits
+GRAVITY_M_S2 = 9.81
+CAPTURES = tuple(datetime(2026, 9, 2, h, m) for h, m in
+                 ((4, 15), (5, 15), (6, 15), (7, 15), (8, 45), (9, 45), (10, 45), (11, 45)))
+CAPTURE_S = 10
+CAPTURE_HZ = 5000                    # shaft rows in a capture
+CAPTURE_STEP_S = 20e-6               # RK4 step, and the truth table's rate
+CAPTURE_SETTLE_S = 0.2               # integrated before each capture from equilibrium
+
+
+@dataclass(frozen=True)
+class Wear:
+    ball_sigma_m: float              # ball-diameter scatter
+    clearance_m: float               # diametral clearance c_r
+    slip: float                      # mean cage and ball-spin slip
+    wander_deg: float                # ball pocket wander amplitude
+    spall: tuple[int, int] | None = None   # (bearing, ball), 1-based
+
+
+WEAR = (Wear(0.1e-6, 10e-6, 0.005, 0.05),
+        Wear(2e-6, 20e-6, 0.02, 0.5),
+        Wear(2e-6, 20e-6, 0.02, 0.5, spall=(2, 1)))   # one per line
+SPALL_M = (1.5e-3, 20e-6)            # length along the ball's surface, depth
+
 
 def line_name(k: int) -> str:
     return f"STY-L{k + 1}"

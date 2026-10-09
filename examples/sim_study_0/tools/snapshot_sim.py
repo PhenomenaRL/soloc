@@ -430,7 +430,8 @@ def main():
 
     path = Path(args.path)
     table, names = load(path)
-    wind = read_table(Path(args.wind) if args.wind else path.with_name("wind.arrow"))
+    wind = None if args.scenario == "factory" else read_table(
+        Path(args.wind) if args.wind else path.with_name("wind.arrow"))
     t0_ns = tai_ns_from_utc(sc.T0)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)

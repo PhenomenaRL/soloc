@@ -62,6 +62,7 @@ Connecting fetches the server's schema into `client.schema`.
 | `buffer()` | a new `RowBuffer` on the server's schema |
 | `put(batch)` | appends a batch, sent in chunks of `PUT_CHUNK_ROWS` (65,536) rows so no message nears the server's 64 MiB limit; raises if the server rejects it |
 | `query_all()` | every stored row |
+| `is_empty()` | whether the ledger holds no rows |
 | `current_state(entity_ids=None, not_before_tai_ns=None)` | the latest row of each entity, or of the ones listed; rows older than `not_before_tai_ns` (J2000 TAI ns) are dropped, by default those over an hour older than the newest row |
 | `exchange(table, target_frame, units="km")` | the same rows re-expressed in `target_frame`; nothing is stored |
 | `snapshot(body_ids, tai_ns)` | appends the kernels' state of each body at that epoch, as rows under ICRF |

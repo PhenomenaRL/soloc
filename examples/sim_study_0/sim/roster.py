@@ -19,6 +19,10 @@ from sim.models.spacecraft import Spacecraft, lander, launcher, moonshot, orbite
 from sim.models.track import Track
 from soloc_client import SolocClient
 
+# The units `run_sim.py --scenario` runs on their own, in the order the parts are merged.
+GROUPS = ("space", "aircraft", "ships", "regatta", "wildfire", "factory")
+ARENAS = ("regatta", "wildfire")
+
 
 @dataclass
 class Roster:
@@ -35,16 +39,22 @@ class Roster:
     factory: Factory
 
     @property
+    def groups(self) -> dict[str, list]:
+        """Each of `GROUPS` and its entities. The space fleets share hosts, so they run as one."""
+        return {"space": [*self.facilities, *self.spacecraft, *self.probes, *self.robots,
+                          *self.crawlers, *self.cargo],
+                "aircraft": self.aircraft, "ships": self.ships, "regatta": self.regatta.entities,
+                "wildfire": self.wildfire.entities, "factory": self.factory.entities}
+
+    @property
     def entities(self) -> list:
         """Parents before their children, so a tick's rows are appended in that order."""
-        return [*self.facilities, *self.spacecraft, *self.probes, *self.robots, *self.crawlers,
-                *self.cargo, *self.aircraft, *self.ships, *self.regatta.entities,
-                *self.wildfire.entities, *self.factory.entities]
+        return [e for members in self.groups.values() for e in members]
 
     @property
     def arenas(self) -> list:
         """Groups the driver hands decision ticks to (`decide_at`, `decide`)."""
-        return [self.regatta, self.wildfire]
+        return [getattr(self, g) for g in ARENAS]
 
 
 def roster(seed: int, client: SolocClient, regatta_policy: Callable | None = None,

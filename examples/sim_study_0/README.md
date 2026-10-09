@@ -21,7 +21,7 @@ to use it on its own).
 | `sim/` | the simulation itself: `scenario.py` (roster and schedules), `roster.py`, `models/`, geometry, ephemerides |
 | `tools/` | inspect a saved ledger: plots, a row viewer, the frame tree, a standalone 3D viewer |
 | `tests/` | `smoke_test.py`, the server contract the sim relies on |
-| `docs/` | [scenario](docs/scenario.md), [arena](docs/arena.md), [checks](docs/checks.md), [outputs](docs/outputs.md), [client quickstart](docs/client_quickstart.md), [client reference](docs/client_reference.md), [orbits](docs/orbits.md), [memory limit](docs/memory_limit.md) |
+| `docs/` | [scenario](docs/scenario.md), [arena](docs/arena.md), [checks](docs/checks.md), [outputs](docs/outputs.md), [client quickstart](docs/client_quickstart.md), [client reference](docs/client_reference.md), [orbits](docs/orbits.md), [bearing dynamics](docs/bearing_dynamics.md), [memory limit](docs/memory_limit.md) |
 | `data/`, `out/` | downloads and results (gitignored) |
 
 ## Setup (once)
@@ -47,11 +47,19 @@ Terminal 2, the client:
 
 ```bash
 source .venv/bin/activate
-python run_sim.py                          # ~140 s → out/sim_study_0.arrow (~1.2 GB)
-python check_sim.py out/sim_study_0.arrow  # PASS/FAIL table; expect 91/91
+python run_sim.py                          # ~6.5 min → out/sim_study_0.arrow (~1.8 GB)
+python check_sim.py out/sim_study_0.arrow  # PASS/FAIL table; expect 95/95
 ```
 
-`run_sim.py` refuses a non-empty ledger, so restart `serve.sh` before each run. The server runs
+To develop one scenario without rerunning the rest, run it alone and merge the parts
+([docs/scenario.md](docs/scenario.md#separate-runs)):
+
+```bash
+python run_sim.py --scenario factory       # → out/factory/sim_study_0.arrow; restart serve.sh per group
+python -m tools.merge_sim                  # every out/<group>/ → out/sim_study_0.arrow
+```
+
+`run_sim.py` and `tools.merge_sim` refuse a non-empty ledger, so restart `serve.sh` before each run. The server runs
 with a 2 GB memory limit from `config.toml`, which holds the whole sim; see
 [docs/memory_limit.md](docs/memory_limit.md) to run it with a smaller one.
 
@@ -65,9 +73,12 @@ Run every command from `examples/sim_study_0/` with the venv active. The ones in
 | `./fetch_data.sh` | – | downloads kernels, land polygons and three.js into `data/` |
 | `python -m sim.fetch_horizons` | – | downloads Horizons tables into `data/`; rerun after changing the window |
 | `./serve.sh` | – | runs `soloc-server` with the kernels in `data/` and `config.toml` (`SOLOC_CONFIG=FILE` to use another) |
-| `python run_sim.py` | empty | generates `out/sim_study_0.arrow`, `out/wind.arrow` and `out/fuel.arrow` (`--out` to change); `--regatta-policy MOD:FN` / `--wildfire-policy MOD:FN` swap a strategy in |
+| `python run_sim.py` | empty | generates `out/sim_study_0.arrow` and its side tables `out/wind.arrow`, `out/fuel.arrow` and `out/bearing_truth.arrow` (`--out` to change); `--regatta-policy MOD:FN` / `--wildfire-policy MOD:FN` swap a strategy in; `--scenario GROUP` runs one group into `out/GROUP/` |
+| `python -m tools.merge_sim [GROUP...]` | empty | merges the parts in `out/*/` into `out/sim_study_0.arrow` with its wind and fuel tables |
+| `python -m tests.compare_ledgers A B` | none | checks two saved ledgers hold identical rows and names |
 | `python check_sim.py FILE` | any | loads `FILE` and prints the checks in [docs/checks.md](docs/checks.md) |
 | `python -m tools.plot_sim FILE` | any | PNGs into `out/plots/`, ~4 min |
+| `python -m tools.bearing_eval FILE` | any | the bearing dynamics evaluation (fidelity, detection, cost) and 3 PNGs into `out/plots/`; see [docs/bearing_dynamics.md](docs/bearing_dynamics.md) |
 | `python -m tools.export_viewer FILE` | any | standalone 3D viewer → `out/sim_study_0_3d.html` |
 | `python -m tools.view_sim FILE` | none | prints rows decoded; `--summary`, `--entity NAME`, `--tail`, `--limit N`, `--schema` |
 | `python -m tools.snapshot_sim FILE --scenario regatta\|wildfire\|factory` | none | situation PNGs into `out/snapshots/`; `--at UTC` or `--every 10m` |

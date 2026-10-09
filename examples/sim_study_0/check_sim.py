@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 from matplotlib.path import Path as MplPath
 
 from sim import scenario as sc
@@ -20,6 +21,7 @@ from sim.ephemeris import Ephemeris
 from sim.geo import EARTH, GCRF, ICRF, SUN, fixed_to_geodetic, geodetic_to_fixed
 from sim.land import CANALS, in_canal, in_rings, on_land
 from sim.models import regatta as rg
+from sim.models import bearing as bm
 from sim.models import factory as fm
 from sim.models import wildfire as wf
 from sim.models.robot import HULL_REACH_M
@@ -113,7 +115,8 @@ def main():
     present = set(d.index)
     fleets = {name: {e.id for e in members if e.id in present} for name, members in fleet_models.items()}
     fleets["bodies"] = {i for i in body_by_id if i in present}
-    print(f"      {d.rows.num_rows:,} rows; fleets present: "
+    groups = [g for g, members in world.groups.items() if any(e.id in present for e in members)]
+    print(f"      {d.rows.num_rows:,} rows; groups present: {', '.join(groups)}; fleets present: "
           + ", ".join(f"{k} {len(v)}" for k, v in fleets.items() if v))
 
     # A ledger run under a small memory_limit keeps only a recent window. Every check below
@@ -215,7 +218,7 @@ def main():
     if fleets["wildfire"]:
         check_wildfire(d, w)
     if fleets["factory"]:
-        check_factory(d, fac)
+        check_factory(d, fac, path.with_name("bearing_truth.arrow"))
 
     print(f"\n{results.count(True)}/{len(results)} passed")
     sys.exit(0 if all(results) else 1)
@@ -479,7 +482,7 @@ def check_wildfire(d: Data, w):
 # -- factory ----------------------------------------------------------------------------------
 
 
-def check_factory(d: Data, fac):
+def check_factory(d: Data, fac, truth_path: Path):
     parts = [p for p in fac.parts if p.id in d.index]
     wrong = sum(int((~matches(d.frames[d.index[p.id]], p.parent_id)).sum()) for p in parts)
     for b in fac.boxes:
@@ -493,36 +496,111 @@ def check_factory(d: Data, fac):
     check(f"factory rows framed on their parts' parents ({chain + 1} hops from a ball to IAU_EARTH)",
           wrong == 0, f"{len(parts)} parts, {len(fac.boxes)} boxes, {wrong} rows off")
 
-    # Static parts hold their pose; rotating parts turn by exactly spin × the shaft's angle, with
-    # angular_velocity = spin × its speed.
+    # Parts without a model hold their pose. Cages turn by their slipped ratio × the shaft's angle.
     moved, spin_err, w_err, worst_step = 0, 0.0, 0.0, 0.0
     ks = [d.index[p.id][np.argsort(d.t_ns[d.index[p.id]])] for p in parts]
     sub = d.rows.take(pa.array(np.concatenate(ks)))        # one take: it costs ~1 s on the whole ledger
     q_all = sts_field(sub, "quaternion").flatten().to_numpy().reshape(-1, 4)
     w_all = sub.column("angular_velocity").combine_chunks().flatten().to_numpy().reshape(-1, 3)
     starts = np.cumsum([0] + [len(k) for k in ks])
-    for p, k, lo, hi in zip(parts, ks, starts[:-1], starts[1:]):
+    rows_of = {p.id: (k, lo, hi) for p, k, lo, hi in zip(parts, ks, starts[:-1], starts[1:])}
+    models = {l["name"]: l["model"] for l in fac.lines}
+    for p, (k, lo, hi) in rows_of.items():
+        p = by_id[p]
         q, w = q_all[lo:hi], w_all[lo:hi]
-        moved += int(np.ptp(d.pos[k], axis=0).max() > 0)
-        if not p.rotating:
-            moved += int(np.ptp(q, axis=0).max() > 0)
+        if p.model is None:
+            moved += int(np.ptp(d.pos[k], axis=0).max() > 0) + int(np.ptp(q, axis=0).max() > 0)
             continue
         t = (d.t_ns[k] - d.t0_ns) / 1e9
-        want = p.spin * fm.angle(t)
-        got = 2 * np.arctan2(q[:, 1], q[:, 0])
-        spin_err = max(spin_err, float(np.abs(wrap180(np.degrees(got - want))).max()))
-        w_err = max(w_err, float(np.abs(w[:, 0] - p.spin * fm.omega(t)).max()))
-        burst = (t >= fm.BURST_S[0]) & (t < fm.BURST_S[1])
-        worst_step = max(worst_step, float(np.abs(np.diff(want[burst])).max(initial=0.0)))
-    check("rigid parts hold their pose; rotating parts turn by spin × the shaft's angle, with that spin in angular_velocity",
+        if "CAGE" in p.name:
+            m = models[p.name.rsplit("-", 1)[0]]
+            ratio = fm.CAGE_RATIO * (1 - m.cage_slip[int(p.name[-1]) - 1])
+            want = ratio * fm.angle(t)
+            got = 2 * np.arctan2(q[:, 1], q[:, 0])
+            spin_err = max(spin_err, float(np.abs(wrap180(np.degrees(got - want))).max()))
+            w_err = max(w_err, float(np.abs(w[:, 0] - ratio * fm.omega(t)).max()))
+        if "BALL" in p.name:
+            want = 2 * np.arctan2(q[:, 1], q[:, 0])
+            burst = (t >= fm.BURST_S[0]) & (t < fm.BURST_S[1])
+            worst_step = max(worst_step, float(np.abs(wrap180(np.degrees(np.diff(want[burst])))).max(initial=0.0)))
+    check("parts without a model hold their pose; cages turn by their slipped ratio × the shaft's angle",
           moved == 0 and spin_err <= 1e-6 and w_err <= 1e-12,
-          f"{moved} moved, max angle error {spin_err:.1e}°, max ω error {w_err:.1e} rad/s")
-    nyquist = math.pi
-    check(f"no aliasing in the {sc.BURST_HZ} Hz burst: every row-to-row turn well under half a turn",
+          f"{moved} moved, max cage angle error {spin_err:.1e}°, max ω error {w_err:.1e} rad/s, "
+          f"cage slip {', '.join(f'{m.cage_slip.mean():.2%}' for m in models.values())}")
+    nyquist = 180.0
+    check(f"no aliasing in the {sc.BURST_HZ} Hz burst: every ball's row-to-row turn well under half a turn",
           worst_step < nyquist / 4,
-          f"fastest step {np.degrees(worst_step):.1f}° per {1000 // sc.BURST_HZ} ms (ball spin), "
-          f"limit {np.degrees(nyquist):.0f}°; at the {sc.PART_CADENCE_S} s cadence a ball turns "
+          f"fastest step {worst_step:.1f}° per {1000 // sc.BURST_HZ} ms (ball spin), "
+          f"limit {nyquist:.0f}°; at the {sc.PART_CADENCE_S} s cadence a ball turns "
           f"{abs(fm.BALL_RATIO) * sc.SHAFT_HZ * sc.PART_CADENCE_S:.1f} turns between rows")
+
+    # The model's rows: a seeded sample recomputed through each part's model must match exactly;
+    # the physics must stay in its bounds; the shaft captures must match the truth table.
+    rng = np.random.default_rng(0)
+    modelled = [p for p in parts if p.model is not None]
+    pos_err = quat_err = 0.0
+    sampled = 0
+    for p in rng.choice(modelled, size=min(200, len(modelled)), replace=False):
+        k, lo, _ = rows_of[p.id]
+        t = (d.t_ns[k] - d.t0_ns) / 1e9
+        quasi = np.flatnonzero([not p.capturing(s) for s in t])    # captures: against the truth table
+        for i in rng.choice(quasi, size=min(15, len(quasi)), replace=False):
+            row = p.row(t[i])
+            pos_err = max(pos_err, float(np.abs(d.pos[k[i]] - row.position).max()))
+            quat_err = max(quat_err, float(np.abs(q_all[lo + i] - row.quaternion).max()))
+            sampled += 1
+    check(f"modelled rows (shaft, cages, balls) equal the model recomputed at their epochs ({sampled:,} sampled)",
+          pos_err <= 1e-12 and quat_err <= 1e-12, f"max position error {pos_err:.1e} m, quaternion {quat_err:.1e}")
+
+    wander_out, shaft_out, worst = 0, 0, 0.0
+    for l in fac.lines:
+        m = l["model"]
+        eps = m.wander_at(m.phi)[0]
+        wander_out += int((np.abs(eps) > np.radians(m.wear.wander_deg) + 1e-12).sum())
+        bound = (m.half_clearance + np.abs(m.dd).max() + (sc.SPALL_M[1] if m.wear.spall else 0.0)
+                 + (np.linalg.norm(m.load, axis=-1).max() / bm.K) ** (2 / 3))
+        k, _, _ = rows_of[l["shaft"].id]
+        r = np.linalg.norm(d.pos[k, 1:], axis=1)
+        worst = max(worst, float((r / bound).max()))
+        shaft_out += int((r > bound).sum())
+    check("balls wander within their pocket amplitude; shafts stay within clearance + deflection",
+          wander_out == 0 and shaft_out == 0,
+          f"{wander_out} wander, {shaft_out} shaft rows out; shaft peak {worst:.0%} of its bound")
+
+    caps = [p for p in parts if p.captures]
+    spacing = bad = 0
+    err = acc_err = 0.0
+    truth = pa.ipc.open_file(pa.memory_map(str(truth_path))).read_all() if truth_path.exists() else None
+    step_ns, decimate = round(sc.CAPTURE_STEP_S * 1e9), round(1 / (sc.CAPTURE_HZ * sc.CAPTURE_STEP_S))
+    acc_col = sub.column("acceleration").combine_chunks()
+    acc_all = pc.fill_null(acc_col, pa.scalar([math.nan] * 3, acc_col.type)).flatten().to_numpy().reshape(-1, 3)
+    for p in caps:
+        k, lo, _ = rows_of[p.id]
+        line = p.name.rsplit("-", 1)[0]
+        if truth is not None:
+            mine = truth.filter(pc.equal(truth["line"], line))
+            t_truth = mine["t_ns"].to_numpy()
+        for start in p.captures:
+            t = d.t_ns[k] - d.t0_ns
+            win = (t >= start * 10**9) & (t < (start + sc.CAPTURE_S) * 10**9)
+            got = t[win]
+            spacing += int(len(got) != sc.CAPTURE_S * sc.CAPTURE_HZ or np.any(np.diff(got) != fm.CAPTURE_NS))
+            if truth is None:
+                continue
+            idx = np.searchsorted(t_truth, got)
+            if np.any(t_truth[np.minimum(idx, len(t_truth) - 1)] != got):
+                bad += 1
+                continue
+            y, z = mine["y"].to_numpy()[idx], mine["z"].to_numpy()[idx]
+            err = max(err, float(np.abs(d.pos[k[win], 1] - y).max()), float(np.abs(d.pos[k[win], 2] - z).max()))
+            a = acc_all[lo:lo + len(k)][win]
+            acc_err = max(acc_err, float(np.abs(a[:, 1] - mine["acc_y"].to_numpy()[idx]).max()))
+    check(f"{len(sc.CAPTURES)} shaft captures per line, each {sc.CAPTURE_S} s at exactly {sc.CAPTURE_HZ} Hz",
+          spacing == 0, f"{len(caps)} shafts, {spacing} captures off")
+    check(f"capture rows equal {truth_path.name} at their epochs (every {decimate}th {step_ns // 1000} µs step)",
+          truth is not None and bad == 0 and err <= 1e-12 and acc_err <= 1e-12,
+          "no truth table beside the ledger" if truth is None else
+          f"{bad} captures unmatched, max position error {err:.1e} m, acceleration {acc_err:.1e} m/s²")
 
     # Bearing geometry, resolved through the ledger: the rings fix the shaft axis, and every ball
     # centre sits on the pitch circle, touching both raceways.

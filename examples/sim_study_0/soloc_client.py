@@ -248,6 +248,9 @@ class SolocClient:
         """Every stored row, unlike `current_state`, which keeps only the latest per entity."""
         return self._get({"query_type": "filter"})
 
+    def is_empty(self) -> bool:
+        return self.query_all().num_rows == 0
+
     def current_state(self, entity_ids: list[bytes] | None = None,
                       not_before_tai_ns: int | None = None) -> pa.Table:
         """`not_before_tai_ns` (J2000 TAI ns) drops older rows; the server's default keeps the

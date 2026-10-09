@@ -6,15 +6,17 @@ appends), plus one before every arena decision tick. Each `do_put` is `Ledger::a
 checks on every batch), `append_snapshot` adds the celestial bodies from the kernels, and
 `save_ledger` is `Ledger::save_ipc`.
 
-A full run (~140 s) prints `1703 entities, 2,383,724 entity rows + 484 snapshot rows` and a
+A full run (~6.5 min) prints `1703 entities, 3,583,676 entity rows + 484 snapshot rows` and a
 result line per arena and for the factory. It writes these files:
 - `out/sim_study_0.arrow`
 - its `out/sim_study_0.arrow.names.arrow` name registry
-- the `out/wind.arrow` and `out/fuel.arrow` side tables
+- the `out/wind.arrow`, `out/fuel.arrow` and `out/bearing_truth.arrow` side tables
 
 The wildfire's vertices and trenches come from fixed pools of 240 and 620 names, so the run
-registers 2,434 names; 1,703 of them get rows. The ledger holds about 1.2 GB in the server, of
-the 2 GB `memory_limit`, and the factory's 20 Hz burst accounts for 684,000 of its rows. Batches
+registers 2,434 names; 1,703 of them get rows. The ledger holds about 1.77 GB in the server, of
+the 2 GB `memory_limit`. The factory's 20 Hz burst accounts for 684,000 of its rows and its
+shaft captures for 1,200,000; the bearing truth table, `out/bearing_truth.arrow` (12M rows,
+~2.3 GB), sits beside it. Batches
 go to the server in chunks of 65,536 rows (`PUT_CHUNK_ROWS`), so the burst stays under the 64 MiB
 message limit.
 
@@ -45,7 +47,7 @@ models live in `sim/models/`.
 | trenches (41 of 620) | Squamish Valley fire | m | TAI | 10 min once finished | one per 50 m of finished line: pose at the midpoint along the line, `dimensions` 50 × 1 × 0.5 m |
 | Steyr plant | IAU_EARTH | km | TAI | 1 h | the factory, a facility on an industrial parcel in Steyr, Upper Austria; 3 conveyor lines 15 m apart |
 | lines, machines A/B/C, stators, outer rings, rotors, inner rings | the plant, the line, Machine B, the stator, the shaft | m | TAI | 1 h | each part fixed in its parent's frame. Machine B is a 10 m belt; its gearmotor (the stator) sits at the drive pulley with its x along the pulley axle; two 6205-size bearings sit 0.15 m either side of the shaft's centre |
-| 3 shafts, 6 cages, 48 balls | the stator, an outer ring, a cage | m | TAI | 5 s in the shift (09-02 06:00–14:00 CEST), 20 Hz in the burst (08:00–08:10), else 1 h | the shaft turns at 60 rpm with 10 s ramps and a break 10:00–10:30. Each cage turns at 0.397 × the shaft (23.8 rpm), and each ball spins in its cage at −2.32 × the shaft (139 rpm): rolling-bearing kinematics, pure rolling, 0° contact. The quaternion turns about x, and the spin is in `angular_velocity` |
+| 3 shafts, 6 cages, 48 balls | the stator, an outer ring, a cage | m | TAI | 5 s in the shift (09-02 06:00–14:00 CEST), 20 Hz in the burst (08:00–08:10), else 1 h; shafts also 5 kHz in eight 10 s captures | the shaft turns at 60 rpm with 10 s ramps and a break 10:00–10:30. Poses come from the bearing dynamics ([bearing_dynamics.md](bearing_dynamics.md)): the shaft's µm displacement and tilt in its stator, each cage at 0.397 × the shaft less its slip, each ball on its pocket's wandered angle, seated on the outer race when loaded, spinning at −2.32 × the shaft less its slip. The spin is in `angular_velocity`; shaft capture rows carry `acceleration`, ball rows their contact load over their mass |
 | 1,350 boxes | Machine B, then Machine C | m | TAI | 5 s while on the belt | one spawned every 60 s per running line; it rides the 10 m belt at the pulley's turn × 0.1 m (0.63 m/s, 16 s) and its last row is on Machine C; 450 per line |
 | 4 bodies | ICRF | km | TAI | 1 h | `append_snapshot` of Sun, Earth, Moon, Mars |
 
@@ -95,6 +97,39 @@ models live in `sim/models/`.
 `sim/fetch_horizons.py` reads the window from `sim/scenario.py`; run it again (it skips a table
 that already covers the window) after changing `T0` or `T_END`.
 
+## Separate runs
+
+The roster splits into six groups (`GROUPS` in `sim/roster.py`) that share no rows except
+the body snapshots: `space` (the facilities, spacecraft, probes, robots, crawlers and cargo,
+which ride on one another), `aircraft`, `ships`, `regatta`, `wildfire` and `factory`.
+`python run_sim.py --scenario GROUP` runs one group on a fresh server into
+`out/GROUP/sim_study_0.arrow`. Its wind and fuel tables go beside it when the group has
+them, so every tool works on a part as it does on the full ledger, and `check_sim` runs the
+checks for the fleets the part holds.
+
+`python -m tools.merge_sim` then puts every part through an empty server, in group order, so
+`Ledger::append` validates each row again. It saves `out/sim_study_0.arrow` and concatenates
+the side tables. Every part writes the hourly Sun, Earth, Moon and Mars snapshots. The merge
+keeps one copy of an entity found in several parts, and fails if the copies differ in any
+column. It also fails if the saved file holds fewer rows than it sent, which a
+`memory_limit` eviction would cause. To change one scenario, rerun only its group and merge
+again.
+
+| Group | Entities | Rows | Run |
+|---|---|---|---|
+| space | 72 | 952,583 | 33 s |
+| aircraft | 10 | 72,010 | 5 s |
+| ships | 20 | 144,020 | 12 s |
+| regatta | 19 | 53,109 | 4 s |
+| wildfire | 144 | 139,580 | 13 s |
+| factory | 1,438 | 2,222,374 | 319 s (~140 s of it integrating the bearing captures) |
+
+Each part also holds the 484 snapshot rows. The merge takes about 45 s, most of it copying the
+12M-row bearing truth table. Merging the six
+parts reproduces the monolithic run row for row (`python -m tests.compare_ledgers A B`),
+names and side tables included. That holds because each group's rows depend only on the
+seed and on the group's own entities.
+
 ## Simplifications
 
 - **Orbits** are two-body Kepler in each body's IAU frame frozen at T0, spun about the IAU z axis
@@ -124,8 +159,10 @@ that already covers the window) after changing `T0` or `T_END`.
   points moving along their normals (Huygens), with no spotting, crowning, slope or burnout. A
   pocket of fuel left inside the line (here, the low-fuel corridor) keeps the fire "spreading"
   long after the line is closed, which is why containment takes ~20 h.
-- **The factory** is kinematics only: a rigid tree with no slip, clearance, load or wear, and
-  every line identical. The three lines run the same shift and produce the same 450 boxes. The
-  plant site is an unnamed industrial parcel on OpenStreetMap.
+- **The factory** drives its shaft at a prescribed speed (a stiff drive), so the bearings never
+  slow the belt, and the three lines run the same shift and produce the same 450 boxes. The
+  bearing model is a lumped one with a rigid housing; see
+  [bearing_dynamics.md](bearing_dynamics.md#simplifications). The plant site is an unnamed
+  industrial parcel on OpenStreetMap.
 - **The venue plane.** Regatta rows sit at z = 0 on the venue's ENU plane, which rises above the
   sea away from its origin: about 1.1 m at the docks, 3.8 km out.

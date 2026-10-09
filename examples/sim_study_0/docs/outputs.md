@@ -20,8 +20,17 @@
 | `wildfire.png` | the fire's perimeter every 2 h over the fuel map, the finished line coloured by when each piece was finished, the crews' tracks and the ICP |
 | `wildfire_crews.png` | each crew's distance to the nearest spreading vertex over time, one panel per crew, against the 30 m rule and the 40 m escape distance |
 | `factory_boxes.png` | per line, boxes spawned and delivered over the shift, and the belt speed from the shaft's stored `angular_velocity` (start, break, stop) |
-| `factory_bearing.png` | the 20 Hz burst: the shaft's, a cage's and a ball's stored angles (unwrapped) against the analytic kinematics; and bearing 1's balls resolved through the ledger to IAU_EARTH, seen along the shaft |
-| `factory_bearing_analysis.png` | line 1 bearing 1: shaft/cage/ball speeds and their ratios, the defect frequencies (FTF, BPFO, BPFI, BSF), burst orientation with speed taken from the quaternion against the stored `angular_velocity`, and cumulative revolutions and ball passes |
+| `factory_bearing.png` | the 20 Hz burst: the shaft's, a cage's and a ball's stored angles (unwrapped) against the bearing model's slipped ratios; and bearing 1's balls resolved through the ledger to IAU_EARTH, seen along the shaft |
+| `factory_bearing_analysis.png` | line 1 bearing 1: shaft/cage/ball speeds and their ratios against pure rolling (the gap is the slip), the defect frequencies (FTF, BPFO, BPFI, BSF), burst orientation with speed taken from the quaternion against the stored `angular_velocity`, and cumulative revolutions and ball passes |
+
+`python -m tools.bearing_eval out/sim_study_0.arrow` (~1 min) prints the bearing evaluation
+([bearing_dynamics.md](bearing_dynamics.md)) and writes three more:
+
+| File | Shows |
+|---|---|
+| `bearing_orbit.png` | each shaft's centre in its stator in µm, one panel per line on one scale: the 08:15 CEST capture's orbit over every quasi-static row of the shift |
+| `bearing_capture.png` | the first 3 s of that capture's stored acceleration per line, each on its own scale, with L3's spalled-ball race contacts dotted |
+| `bearing_envelope.png` | envelope spectra (200–2000 Hz band) of the stored captures, averaged over all eight per line, with FTF, BSF, BPFO, 2×BSF and BPFI marked |
 
 ## 3D viewer
 

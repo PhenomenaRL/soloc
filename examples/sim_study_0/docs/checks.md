@@ -46,8 +46,12 @@ was recorded under a small `memory_limit` or the server's limit evicted part of 
 | crew safety | no crew row inside the burnt perimeter or within 30 m of a spreading vertex; no crew faster than 1.2 m/s |
 | contained | replayed from the ledger, every vertex has stopped by the window's end |
 | factory frames | every part row is framed on its designed parent; every box is on Machine B, then on Machine C for its last row |
-| part kinematics | static parts never move; rotating parts' quaternions turn by spin × the shaft's angle (to 1e-6°), with spin × the shaft's speed in `angular_velocity` |
-| no aliasing | in the 20 Hz burst, no part turns more than a quarter of the half-turn limit between rows (the balls turn 42°) |
+| part kinematics | parts without a bearing model never move; cages turn by their slipped ratio × the shaft's angle (to 1e-6°), with that speed in `angular_velocity` |
+| no aliasing | in the 20 Hz burst, no ball turns more than a quarter of the half-turn limit between rows (42°) |
+| bearing model rows | a seeded sample of shaft, cage and ball rows equals the model recomputed at their epochs |
+| bearing bounds | every ball's pocket wander stays within its amplitude; every shaft row stays within c_r/2 + its largest ball oversize + spall depth + the deflection under its whole load on one ball |
+| captures | each shaft has 8 captures of 10 s at exactly 5 kHz |
+| captures vs truth | every capture row equals `bearing_truth.arrow` at its epoch (every 10th 20 µs step) |
 | bearing geometry | 64 burst ball rows resolved through 7 frames to IAU_EARTH sit on the pitch circle at ±0.15 m along the shaft axis (fixed by the outer rings), so they touch both raceways (µm) |
 | boxes | every box sits at the pulley's turn × 0.1 m along the belt and is handed to Machine C: 450 per line |
 | roster (factory) | `current_state` holds the 88 plant parts and none of the 1,350 boxes, which were all off the belts by 14:00 CEST |

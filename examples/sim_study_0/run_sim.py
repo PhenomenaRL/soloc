@@ -13,18 +13,22 @@ from pathlib import Path
 import pyarrow.flight as fl
 
 from sim import scenario as sc
-from sim.roster import roster
+from sim.roster import ARENAS, GROUPS, roster
 from sim.strategies import load
 from sim.fuel import write_table as write_fuel
+from sim.models.bearing import write_table as write_truth
 from sim.wind import write_table
 from soloc_client import KIND_ABSTRACT, KIND_SOLOC, SolocClient, registry_ipc, tai_ns_from_utc
 
 
 class Sim:
-    def __init__(self, client: SolocClient, seed: int, regatta_policy=None, wildfire_policy=None):
+    def __init__(self, client: SolocClient, seed: int, regatta_policy=None, wildfire_policy=None,
+                 groups=GROUPS):
         self.client = client
         self.world = roster(seed, client, regatta_policy, wildfire_policy)
-        self.entities = self.world.entities
+        self.groups = groups
+        self.entities = [e for g in groups for e in self.world.groups[g]]
+        self.arenas = [getattr(self.world, g) for g in ARENAS if g in groups]
         # An entity with `samples(t_s) -> [(offset_ns, row)]` may report several rows per tick.
         self.sub = [getattr(e, "samples", None) for e in self.entities]
         self.t0_ns = tai_ns_from_utc(sc.T0)
@@ -71,7 +75,7 @@ class Sim:
     def run(self):
         self.register_names()
         for t_s in range(0, sc.DURATION_S + 1, sc.BASE_TICK_S):
-            deciding = [a for a in self.world.arenas if a.decide_at(t_s)]
+            deciding = [a for a in self.arenas if a.decide_at(t_s)]
             if deciding:
                 self.flush(t_s - sc.BASE_TICK_S)
                 for arena in deciding:
@@ -85,20 +89,26 @@ class Sim:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--server", default="grpc://localhost:50051")
-    p.add_argument("--out", default="out/sim_study_0.arrow")
+    p.add_argument("--scenario", choices=GROUPS,
+                   help="run one group alone into out/SCENARIO/ (default: all of them, one ledger)")
+    p.add_argument("--out", help="default out/sim_study_0.arrow, or out/SCENARIO/sim_study_0.arrow")
     p.add_argument("--seed", type=int, default=sc.SEED)
     p.add_argument("--regatta-policy", metavar="MOD:FN",
                    help="strategy for the last regatta boat (see docs/arena.md)")
     p.add_argument("--wildfire-policy", metavar="MOD:FN",
                    help="the wildfire's incident commander (see docs/arena.md)")
     args = p.parse_args()
+    groups = (args.scenario,) if args.scenario else GROUPS
+    for g, spec in zip(ARENAS, (args.regatta_policy, args.wildfire_policy)):
+        if spec and g not in groups:
+            p.error(f"--{g}-policy needs the {g} scenario")
 
     policies = [load(spec) if spec else None for spec in (args.regatta_policy, args.wildfire_policy)]
     client = SolocClient(args.server)
-    if client.query_all().num_rows:
+    if not client.is_empty():
         sys.exit("ledger is not empty; restart serve.sh first")
 
-    sim = Sim(client, args.seed, *policies)
+    sim = Sim(client, args.seed, *policies, groups=groups)
     started = time.monotonic()
     try:
         sim.run()
@@ -107,20 +117,27 @@ def main():
         sys.exit(f"append failed: {e}")
 
     # The server resolves the path from its own working directory, so send it absolute.
-    out = Path(args.out).resolve()
+    default = f"out/{args.scenario}/sim_study_0.arrow" if args.scenario else "out/sim_study_0.arrow"
+    out = Path(args.out or default).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     print(client.action("save_ledger", {"path": str(out)}))
-    wind_path = out.with_name("wind.arrow")
-    n = write_table(wind_path, [a.wind for a in sim.world.arenas])
-    print(f"{n:,} wind samples → {wind_path}")
-    fuel_path = out.with_name("fuel.arrow")
-    n = write_fuel(fuel_path, [sim.world.wildfire.fuel])
-    print(f"{n:,} fuel cells → {fuel_path}")
+    if sim.arenas:
+        wind_path = out.with_name("wind.arrow")
+        n = write_table(wind_path, [a.wind for a in sim.arenas])
+        print(f"{n:,} wind samples → {wind_path}")
+    if "wildfire" in groups:
+        fuel_path = out.with_name("fuel.arrow")
+        n = write_fuel(fuel_path, [sim.world.wildfire.fuel])
+        print(f"{n:,} fuel cells → {fuel_path}")
     print(f"{len(sim.seen)} entities, {sim.rows:,} entity rows + {sim.snapshots} snapshot rows "
           f"in {time.monotonic() - started:.0f} s")
-    for arena in sim.world.arenas:
+    for arena in sim.arenas:
         print(arena.result())
-    print(sim.world.factory.result())
+    if "factory" in groups:
+        truth_path = out.with_name("bearing_truth.arrow")
+        n = write_truth(truth_path, sim.world.factory.captures)
+        print(f"{n:,} bearing steps → {truth_path}")
+        print(sim.world.factory.result())
 
 
 if __name__ == "__main__":

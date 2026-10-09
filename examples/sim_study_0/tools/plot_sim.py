@@ -628,9 +628,20 @@ def plot_factory_boxes(fac, table: pa.Table, out_dir: Path) -> Path:
     return path
 
 
+def spin_ratio(line: dict, part) -> float:
+    """A part's turn per shaft radian in the bearing model: pure rolling less its slip."""
+    m = line["model"]
+    for kb, bear in enumerate(line["bearings"]):
+        if part is bear["cage"]:
+            return fm.CAGE_RATIO * (1 - m.cage_slip[kb])
+        if part in bear["balls"]:
+            return fm.BALL_RATIO * (1 - m.spin_slip[kb, bear["balls"].index(part)])
+    return part.spin
+
+
 def plot_factory_bearing(fac, client: SolocClient, table: pa.Table, out_dir: Path) -> Path:
-    """The burst on line 1: the shaft's, a cage's and a ball's stored angles against the analytic
-    ones over its first 2 s (left), and bearing 1's balls resolved through the ledger to
+    """The burst on line 1: the shaft's, a cage's and a ball's stored angles against the model's
+    slipped ratios over its first 2 s (left), and bearing 1's balls resolved through the ledger to
     IAU_EARTH at one burst instant, seen along the shaft (right)."""
     from tools.snapshot_sim import factory_rows
     rows = factory_rows(fac, table)
@@ -645,16 +656,17 @@ def plot_factory_bearing(fac, client: SolocClient, table: pa.Table, out_dir: Pat
         k = rows.index[part.name]
         k = k[(rows.t_s[k] >= t0) & (rows.t_s[k] <= t0 + 2)]
         stored = np.unwrap(rows.turn[k])
-        want = part.spin * (fm.angle(rows.t_s[k]) - fm.angle(t0))
+        ratio = spin_ratio(line, part)
+        want = ratio * (fm.angle(rows.t_s[k]) - fm.angle(t0))
         stored = stored - stored[0] + want[0]
-        turns.plot(fine - t0, part.spin * (fm.angle(fine) - fm.angle(t0)) / (2 * np.pi), color=colour,
-                   linewidth=0.8, label=f"{label}: spin × shaft angle")
+        turns.plot(fine - t0, ratio * (fm.angle(fine) - fm.angle(t0)) / (2 * np.pi), color=colour,
+                   linewidth=0.8, label=f"{label}: {ratio:.4f} × shaft angle")
         turns.plot(rows.t_s[k] - t0, stored / (2 * np.pi), "o", color=colour, markersize=3,
                    label=f"{label}: stored, unwrapped at {sc.BURST_HZ} Hz")
     turns.set_xlabel(f"seconds from the burst's start ({sc.BURST[0]:%H:%M} UTC)", fontsize=8)
     turns.set_ylabel("turns", fontsize=8)
     turns.legend(fontsize=7)
-    turns.set_title("burst rows against the rolling-bearing kinematics (0° contact, pure rolling)", fontsize=10)
+    turns.set_title("burst rows against the bearing model (0° contact, rolling less each part's slip)", fontsize=10)
     style(turns)
 
     when = t0 + 7 * fm.SUB_NS / 1e9
@@ -700,7 +712,8 @@ def plot_factory_bearing_analysis(fac, table: pa.Table, out_dir: Path) -> Path:
     bear = line["bearings"][0]
     k = {"shaft": rows.index[line["shaft"].name], "cage": rows.index[bear["cage"].name],
          "ball": rows.index[bear["balls"][0].name]}
-    t = rows.t_s[k["shaft"]]
+    t = rows.t_s[k["cage"]]
+    k["shaft"] = k["shaft"][np.isin(rows.t_s[k["shaft"]], t)]     # without its captures
     assert all(np.array_equal(rows.t_s[v], t) for v in k.values())
     w = {key: rows.spin[v] for key, v in k.items()}                 # rad/s about x
     window = (t >= fm.SHIFT_S[0] - 600) & (t <= fm.SHIFT_S[1] + 600)
@@ -726,8 +739,8 @@ def plot_factory_bearing_analysis(fac, table: pa.Table, out_dir: Path) -> Path:
         ratios.axhline(want, color=colours[key], linestyle="--", linewidth=0.8,
                        label=f"{key}: pure rolling {want:.4f}")
     ratios.set_ylabel("speed ratio", fontsize=8)
-    ratios.set_title(f"ratios to the shaft while it turns (> 5% of {sc.SHAFT_HZ * 60:.0f} rpm): slip would "
-                     f"pull the cage off its line\nmax |stored − pure rolling| {max(spread):.1e}", fontsize=10)
+    ratios.set_title(f"ratios to the shaft while it turns (> 5% of {sc.SHAFT_HZ * 60:.0f} rpm): the model's "
+                     f"slip pulls them off pure rolling\nmax |stored − pure rolling| {max(spread):.1e}", fontsize=10)
 
     f_s, ftf = w["shaft"] / (2 * np.pi), w["cage"] / (2 * np.pi)
     bands = (("FTF (cage)", ftf, SERIES[1]), ("BSF", np.abs(w["ball"]) / (2 * np.pi), SERIES[2]),
@@ -743,18 +756,19 @@ def plot_factory_bearing_analysis(fac, table: pa.Table, out_dir: Path) -> Path:
 
     cum = lambda y: np.concatenate([[0.0], np.cumsum(np.diff(t) * (y[1:] + y[:-1]) / 2)]) / (2 * np.pi)
     turns = fm.angle(t) / (2 * np.pi)
+    cage = spin_ratio(line, bear["cage"])
     err = []
     for label, got, want, colour in (
             ("shaft revolutions", cum(w["shaft"]), turns, SERIES[0]),
-            ("outer-race ball passes", sc.BALLS * cum(w["cage"]), sc.BALLS * fm.CAGE_RATIO * turns, SERIES[3]),
+            ("outer-race ball passes", sc.BALLS * cum(w["cage"]), sc.BALLS * cage * turns, SERIES[3]),
             ("inner-race ball passes", sc.BALLS * cum(w["shaft"] - w["cage"]),
-             sc.BALLS * (1 - fm.CAGE_RATIO) * turns, SERIES[4])):
+             sc.BALLS * (1 - cage) * turns, SERIES[4])):
         err.append(np.max(np.abs(got - want)))
         cycles.plot(h, got[window] / 1000, color=colour, linewidth=1.2, label=f"{label}: {got[-1]:,.0f}")
         cycles.plot(h, want[window] / 1000, color=INK_MUTED, linewidth=0.6, linestyle="--")
     cycles.set_ylabel("thousands", fontsize=8)
-    cycles.set_title(f"cumulative cycles, stored speed integrated (trapezoid) against the analytic angle "
-                     f"(grey dashed)\nmax |difference| {max(err):.1e} cycles", fontsize=10)
+    cycles.set_title(f"cumulative cycles from the stored speed (trapezoid) against the model's\nslipped angle "
+                     f"(grey dashed): max |difference| {max(err):.1e} cycles", fontsize=10)
 
     for ax in (speeds, ratios, freqs, cycles):
         ax.set_xlim(h[0], h[-1])
@@ -787,7 +801,7 @@ def plot_factory_bearing_analysis(fac, table: pa.Table, out_dir: Path) -> Path:
         ax.set_xlabel(f"seconds from the burst's start ({sc.BURST[0]:%H:%M} UTC)", fontsize=8)
         ax.legend(fontsize=7)
         style(ax)
-    fig.suptitle(f"{line['name']} bearing 1 (6205-size deep-groove ball bearing): kinematics from the stored rows",
+    fig.suptitle(f"{line['name']} bearing 1 (6205-size deep-groove ball bearing): the model's kinematics from the stored rows",
                  fontsize=11)
     path = out_dir / "factory_bearing_analysis.png"
     fig.savefig(path, dpi=120)
