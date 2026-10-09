@@ -5,6 +5,7 @@ Reloads the file into the server first, so it can run right after run_sim.py.
 
 import argparse
 import math
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from sim import scenario as sc
 from sim.ephemeris import Ephemeris
 from sim.geo import EARTH, GCRF, MARS, MOON, SUN, GreatCircle, fixed_to_geodetic
 from sim.land import CANALS, outlines
+from sim.models import arm as am
 from sim.models import factory as fm
 from sim.models import regatta as rg
 from sim.models import wildfire as wf
@@ -809,6 +811,161 @@ def plot_factory_bearing_analysis(fac, table: pa.Table, out_dir: Path) -> Path:
     return path
 
 
+def episode_s(t_s):
+    """Seconds since the arm's episode starts (08:00 CEST, 2026-09-03)."""
+    return np.asarray(t_s) - am.EPISODE_S0
+
+
+def held_spans(arm, rows) -> list[tuple[float, float]]:
+    """Per box, from its stored rows: the first epoch on the gripper and the first on PALLET-B."""
+    spans = []
+    for b in arm.boxes:
+        k = rows.index[b.name]
+        on_g, on_b = matches(rows.frames[k], b.gripper_id), matches(rows.frames[k], b.b_id)
+        spans.append((float(rows.t_s[k][on_g][0]), float(rows.t_s[k][on_b][0])))
+    return spans
+
+
+def plot_arm_joints(arm, table: pa.Table, out_dir: Path) -> Path:
+    """The six joint angles decoded from each link's stored quaternion (soloc stores a pose per
+    link, not a joint value), and the stored joint speeds against the transfer limit, with each
+    grasp and release marked."""
+    from tools.snapshot_sim import arm_rows
+    rows = arm_rows(arm, table)
+    lo, hi = arm.motion.ticks_s
+    fig, (ang, spd) = plt.subplots(2, 1, figsize=(14, 7.5), sharex=True, layout="constrained")
+    for link, colour in zip(arm.links, (*SERIES, "#3d3c37")):
+        k = rows.index[link.name]
+        k = k[(rows.t_s[k] >= lo) & (rows.t_s[k] < hi)]
+        t = episode_s(rows.t_s[k])
+        ang.plot(t, np.degrees(np.unwrap(link.angle(rows.quat[k]))), color=colour, linewidth=1.0,
+                 label=f"q{link.k + 1}")
+        w = rows.table.take(pa.array(k)).column("angular_velocity").combine_chunks().flatten().to_numpy()
+        spd.plot(t, np.degrees(w.reshape(-1, 3)[:, 2]), color=colour, linewidth=0.8, label=f"q{link.k + 1}")
+    for g, r in held_spans(arm, rows):
+        for ax in (ang, spd):
+            ax.axvline(episode_s(g), color=SERIES[2], linewidth=0.5, alpha=0.5)
+            ax.axvline(episode_s(r), color=MARK, linewidth=0.5, alpha=0.5, linestyle="--")
+    limit = math.degrees(sc.JOINT_SPEED)
+    spd.axhspan(limit, limit * 1.15, color=GRID)
+    spd.axhspan(-limit * 1.15, -limit, color=GRID)
+    ang.set_ylabel("joint angle (°)", fontsize=8)
+    ang.legend(fontsize=7, ncols=6)
+    ang.set_title(f"{sc.ARM_NAME}: joint angles decoded from the {sc.ARM_HZ} Hz link quaternions (the DH origin "
+                  "taken off); green = grasp, dashed orange = release", fontsize=10)
+    spd.set_ylabel("joint speed (°/s)", fontsize=8)
+    spd.set_xlabel("seconds from 08:00 CEST, 2026-09-03", fontsize=8)
+    spd.set_title(f"stored angular_velocity z per link; shaded beyond the ±{limit:.0f}°/s transfer limit. The base "
+                  "swings 180° between the pallets; the vertical legs barely move the wrist", fontsize=10)
+    for ax in (ang, spd):
+        style(ax)
+    path = out_dir / "arm_joints.png"
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path
+
+
+def plot_arm_tcp(arm, client: SolocClient, table: pa.Table, out_dir: Path) -> Path:
+    """The tip's path in the cell, from above and from the east: dense from the stored link rows
+    composed here, with a marker every 3 s resolved by soloc (L6 rows exchanged through 7 frames to
+    IAU_EARTH, then into the cell). Picks and places are coloured by box."""
+    from tools.snapshot_sim import arm_frames, arm_rows, arm_tip
+    rows = arm_rows(arm, table)
+    lo, hi = arm.motion.ticks_s
+    k6 = rows.index[arm.links[-1].name]
+    k6 = k6[(rows.t_s[k6] >= lo) & (rows.t_s[k6] < hi)]
+    t = rows.t_s[k6]
+    tip = arm_tip(arm, arm_frames(arm, rows, t))
+    held = np.zeros(len(t), bool)
+    spans = held_spans(arm, rows)
+    for g, r in spans:
+        held |= (t >= g) & (t < r)
+    every = k6[::3 * sc.ARM_HZ]
+    started = time.monotonic()
+    soloc = arm.in_cell(client, rows.table.take(pa.array(every)), [0.0, 0.0, am.D[5] + sc.TOOL_M])
+    per_row = (time.monotonic() - started) / len(every)
+    gap = float(np.abs(soloc - tip[::3 * sc.ARM_HZ]).max())
+    picks = arm_tip(arm, arm_frames(arm, rows, [g for g, _ in spans]))
+    places = arm_tip(arm, arm_frames(arm, rows, [r for _, r in spans]))
+    colours = plt.cm.viridis(np.linspace(0, 1, len(spans)))
+    fig, (top, side) = plt.subplots(1, 2, figsize=(15, 7), layout="constrained", gridspec_kw={"width_ratios": [1, 1.3]})
+    lx, ly, lz = sc.PALLET_DIMENSIONS_M
+    for ax, (i, j) in ((top, (0, 1)), (side, (1, 2))):
+        for pallet in arm.pallets:
+            x, y, _ = pallet.offset
+            ax.add_patch(plt.Rectangle(((x - lx / 2, y - ly / 2), (y - ly / 2, 0.0))[ax is side],
+                                       (lx, ly)[ax is side], (ly, lz)[ax is side], color=BODY_FILL))
+        ax.plot(np.where(held, np.nan, tip[:, i]), np.where(held, np.nan, tip[:, j]), color=TRACK, linewidth=0.5,
+                alpha=0.6, label="tip, empty (stored rows composed here)")
+        ax.plot(np.where(held, tip[:, i], np.nan), np.where(held, tip[:, j], np.nan), color=MARK, linewidth=0.5,
+                alpha=0.8, label="tip, carrying")
+        ax.scatter(picks[:, i], picks[:, j], color=colours, marker="o", s=18, zorder=3, label="grasp (by box)")
+        ax.scatter(places[:, i], places[:, j], color=colours, marker="s", s=18, zorder=3, label="release (by box)")
+        ax.plot(soloc[:, i], soloc[:, j], "+", color="#3d3c37", markersize=5, label="resolved by soloc, every 3 s")
+        ax.plot([0.0], [0.0 if ax is top else sc.PEDESTAL_M], "^", color="#3d3c37", markersize=8)
+        ax.set_aspect("equal")
+        style(ax)
+    top.set_xlim(-1.0, 1.2)
+    top.set_ylim(-1.3, 1.3)
+    top.set_title("from above, cell ENU (m): pallet A north, B south", fontsize=10)
+    side.set_xlim(-1.4, 1.4)
+    side.set_ylim(0, 1.4)
+    side.legend(fontsize=7, loc="upper center", ncols=2)
+    side.set_title(f"from the east (north → right, up): {len(spans)} picks; soloc vs local composition "
+                   f"{gap * 1e9:.1f} nm at {len(every)} epochs, {per_row * 1000:.0f} ms/row", fontsize=10)
+    path = out_dir / "arm_tcp.png"
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path
+
+
+def plot_arm_boxes(arm, client: SolocClient, table: pa.Table, out_dir: Path) -> Path:
+    """Per box, its parent frame over the episode (top), and its height in the cell (bottom): dense
+    from its stored rows composed here (through the gripper while held), with soloc's answer at its
+    last row on A, its grasp, mid-carry and its first row on B."""
+    from tools.snapshot_sim import arm_frames, arm_rows
+    rows = arm_rows(arm, table)
+    lo, hi = arm.motion.ticks_s
+    spans = held_spans(arm, rows)
+    colours = plt.cm.viridis(np.linspace(0, 1, len(spans)))
+    fig, (lanes, height) = plt.subplots(2, 1, figsize=(14, 8), sharex=True, layout="constrained",
+                                        gridspec_kw={"height_ratios": [1, 1.2]})
+    pick, local = [], []
+    for n, (b, (g, r), colour) in enumerate(zip(arm.boxes, spans, colours)):
+        lanes.broken_barh([(0, episode_s(g)), (episode_s(g), r - g), (episode_s(r), hi - r)], (n - 0.4, 0.8),
+                          color=[SERIES[0], MARK, SERIES[2]])
+        k = rows.index[b.name]
+        t = rows.t_s[k]
+        on_a, held = k[t < g], k[(t >= g) & (t < r)]
+        z_a = rows.pos3[on_a[-1], 2]
+        p, rot = arm_frames(arm, rows, rows.t_s[held])[arm.gripper.name]
+        z_held = (p + rot @ am.HELD_M)[:, 2]
+        z_b = rows.pos3[k[t >= r][0], 2]
+        height.plot([0, episode_s(g)], [z_a, z_a], color=colour, linewidth=0.8)
+        height.plot(episode_s(rows.t_s[held]), z_held, color=colour, linewidth=0.8)
+        height.plot([episode_s(r), hi - am.EPISODE_S0], [z_b, z_b], color=colour, linewidth=0.8)
+        pick += [on_a[-1], held[0], held[len(held) // 2], k[t >= r][0]]
+        local += [z_a, z_held[0], z_held[len(held) // 2], z_b]
+    soloc = arm.in_cell(client, rows.table.take(pa.array(pick)), [0.0, 0.0, 0.0])[:, 2]
+    gap = float(np.abs(soloc - np.array(local)).max())
+    height.plot(episode_s(rows.t_s[pick]).clip(0), soloc, "+", color="#3d3c37", markersize=5,
+                label="resolved by soloc: last row on A, grasp, mid-carry, first row on B")
+    lanes.set_yticks(range(0, len(spans), 4), [arm.boxes[n].name for n in range(0, len(spans), 4)], fontsize=7)
+    lanes.set_title("parent frame per box from its stored rows: PALLET-A (blue) → the gripper (orange) → "
+                    "PALLET-B (green); each change is a reparent in soloc's topology", fontsize=10)
+    height.set_ylabel("box centre height in the cell (m)", fontsize=8)
+    height.set_xlabel("seconds from 08:00 CEST, 2026-09-03", fontsize=8)
+    height.legend(fontsize=7)
+    height.set_title(f"height through the reparents (the last row on A is the 08:00 hourly one; "
+                     f"soloc vs local composition {gap * 1e9:.1f} nm)", fontsize=10)
+    for ax in (lanes, height):
+        style(ax)
+    path = out_dir / "arm_boxes.png"
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("path")
@@ -868,6 +1025,11 @@ def main():
         print(plot_factory_boxes(fac, rows, out_dir))
         print(plot_factory_bearing(fac, client, rows, out_dir))
         print(plot_factory_bearing_analysis(fac, rows, out_dir))
+    arm = world.arm
+    if present & {l.id for l in arm.links}:
+        print(plot_arm_joints(arm, rows, out_dir))
+        print(plot_arm_tcp(arm, client, rows, out_dir))
+        print(plot_arm_boxes(arm, client, rows, out_dir))
 
 
 if __name__ == "__main__":

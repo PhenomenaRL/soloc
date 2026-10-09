@@ -128,6 +128,7 @@ const CATS = {
   fire:       { label: "Fire perimeter",      color: "#e34948" },   // the status "critical" red: a hazard
   box:        { label: "Boxes",               color: "#e9e8e2" },
   part:       { label: "Drive and bearing parts", color: "#a8a79f" },
+  arm:        { label: "Robot arm cell",      color: "#d6d4cc" },
 };
 const FIRE_LINE = 0xd6d4cc;
 // How close the camera must be before a context's vehicles, trails and labels show.
@@ -261,6 +262,20 @@ function makeModel(cat, shape = cat) {
   else g.add(box(0.55, 0.38, 0.2, mat), box(0.12, 0.3, 0.12, mat, 0.22, 0, 0.14));
   g.add(new THREE.AxesHelper(1));
   // Drawn after site ground layers, so a model is never cut by the ground it stands on.
+  g.traverse(o => { o.renderOrder = 20; });
+  return g;
+}
+function solidModel(tr, cat) {
+  // True size in the context's metres: a bar from the origin along `seg` (an arm link, to its
+  // child's joint), or a box of size `solid.s` centred at `solid.c`.
+  const g = new THREE.Group(), mat = new THREE.MeshLambertMaterial({ color: CATS[cat].color });
+  if (tr.seg) {
+    const v = new THREE.Vector3(...tr.seg), n = v.length(), w = tr.width;
+    const bar = box(Math.max(n, w), w, w, mat);
+    bar.position.copy(v).multiplyScalar(0.5);
+    if (n > 0) bar.quaternion.setFromUnitVectors(new THREE.Vector3(1, 0, 0), v.clone().normalize());
+    g.add(bar, new THREE.Mesh(new THREE.SphereGeometry(w * 0.7, 16, 12), new THREE.MeshLambertMaterial({ color: "#3d3c37" })));
+  } else g.add(box(...tr.solid.s, mat, ...tr.solid.c));
   g.traverse(o => { o.renderOrder = 20; });
   return g;
 }
@@ -422,9 +437,10 @@ for (const c of DATA.contexts) {
     body.fixed.add(ctx.fixedTrails); body.inertial.add(ctx.inertialTrails);
   }
   for (const tr of c.tracks) {
+    const trueSize = !!(tr.seg || tr.solid);
     const e = { name: tr.name, cat: tr.cat, ctx, t: f32(tr.t), p: (tr.wide ? f64 : f32)(tr.p), q: f32(tr.q),
-                model: makeModel(tr.cat, tr.model), local: V(), active: false, quiet: tr.model === "none",
-                parent: tr.parent, w: tr.w ? f32(tr.w) : null };
+                model: trueSize ? solidModel(tr, tr.cat) : makeModel(tr.cat, tr.model), trueSize, local: V(),
+                active: false, quiet: tr.model === "none", parent: tr.parent, w: tr.w ? f32(tr.w) : null };
     if (e.quiet || e.parent !== undefined) {
       // A part in its parent's frame: the page composes its place, so no trail of its own.
       ctx.group.add(e.model);
@@ -630,7 +646,7 @@ function update() {
       if (e.model.visible) {
         e.model.position.copy(e.local);
         const d = e.rel ? tmp.copy(e.rel).sub(camRel).length() : tmp.copy(e.icrf).sub(target).sub(camRel).length();
-        e.model.scale.setScalar(d * kSize / (ctx.kind === "site" ? 1e-3 : 1));
+        e.model.scale.setScalar(e.trueSize ? 1 : d * kSize / (ctx.kind === "site" ? 1e-3 : 1));
       }
     }
     if (ctx.kind === "site") ctx.group.visible = ctxNearBody(ctx);

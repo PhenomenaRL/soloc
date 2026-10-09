@@ -7,6 +7,7 @@ Loading replaces the server's in-memory ledger, so this can run right after run_
 import argparse
 import math
 import sys
+import time
 from collections import Counter
 from datetime import timedelta
 from pathlib import Path
@@ -20,6 +21,7 @@ from sim import scenario as sc
 from sim.ephemeris import Ephemeris
 from sim.geo import EARTH, GCRF, ICRF, SUN, fixed_to_geodetic, geodetic_to_fixed
 from sim.land import CANALS, in_canal, in_rings, on_land
+from sim.models import arm as am
 from sim.models import regatta as rg
 from sim.models import bearing as bm
 from sim.models import factory as fm
@@ -108,7 +110,8 @@ def main():
                     "cargo": world.cargo, "aircraft": world.aircraft, "ships": world.ships,
                     "regatta": [g.venue, g.rc, *g.boats, *g.buoys], "marks": g.marks,
                     "wildfire": [w.venue, *w.crews], "fire": [*w.vertices, *w.trenches],
-                    "factory": [fac.plant, *fac.parts], "boxes": fac.boxes}
+                    "factory": [fac.plant, *fac.parts], "boxes": fac.boxes,
+                    "arm": [world.arm.cell, *world.arm.parts], "cell boxes": world.arm.boxes}
     by_id = {e.id: e for e in world.entities}
 
     d = Data(client)
@@ -207,7 +210,7 @@ def main():
         check_cargo(d, world)
     if fleets["probes"]:
         check_probes(d, world)
-    if fleets["spacecraft"] or fleets["crawlers"]:
+    if fleets["spacecraft"] or fleets["crawlers"] or fleets["cell boxes"]:
         check_topology(d, world)
     if fleets["aircraft"]:
         check_aircraft(d, fleets["aircraft"])
@@ -219,6 +222,8 @@ def main():
         check_wildfire(d, w)
     if fleets["factory"]:
         check_factory(d, fac, path.with_name("bearing_truth.arrow"))
+    if fleets["arm"]:
+        check_arm(d, world.arm, path.with_name("arm_truth.arrow"))
 
     print(f"\n{results.count(True)}/{len(results)} passed")
     sys.exit(0 if all(results) else 1)
@@ -642,6 +647,125 @@ def check_factory(d: Data, fac, truth_path: Path):
           f"({', '.join(f'{n} {c}' for n, c in delivered.items())}), max position error {err:.1e} m")
 
 
+# -- arm --------------------------------------------------------------------------------------
+
+
+def check_arm(d: Data, arm, truth_path: Path):
+    m = arm.motion
+    t_grid = m.t_ns
+    hops = len(arm.links) + 4                         # box → gripper → L6 … L1 → base → cell → IAU_EARTH
+    parts = [p for p in arm.parts if p.id in d.index]
+    wrong = sum(int((~matches(d.frames[d.index[p.id]], p.parent_id)).sum()) for p in parts)
+    for b in arm.boxes:
+        k = d.of(b.id)
+        k = k[np.argsort(d.t_ns[k])]
+        t = d.t_ns[k] - d.t0_ns
+        stage = np.where(t < t_grid[b.held[0]], 0, np.where(t < t_grid[b.held[1]], 1, 2))
+        frames = (b.a_id, b.gripper_id, b.b_id)
+        want = np.array([b.slot_a, am.HELD_M, b.slot_b])[stage]
+        wrong += sum(d.frames[i] != frames[s] for i, s in zip(k, stage))
+        wrong += int((np.abs(d.pos[k] - want).max(axis=1) > 0).sum())
+        wrong += int((stage == 1).sum() != b.held[1] - b.held[0])
+    check(f"arm rows framed on their parents; each box on PALLET-A, on the gripper exactly while held, then on "
+          f"PALLET-B ({hops} hops from a held box to IAU_EARTH)", wrong == 0,
+          f"{len(parts)} parts, {len(arm.boxes)} boxes, {wrong} rows off")
+
+    # Links: the stored rows against the model; the joint angle decoded from each quaternion
+    # (the DH origin's rotation taken off) against the truth table.
+    truth = pa.ipc.open_file(pa.memory_map(str(truth_path))).read_all() if truth_path.exists() else None
+    q_truth = truth["q"].combine_chunks().flatten().to_numpy().reshape(-1, 6) if truth is not None else m.q
+    quat_err = q_err = w_err = 0.0
+    decoded, qd = np.zeros((len(t_grid), 6)), np.zeros((len(t_grid), 6))
+    for link in arm.links:
+        k = d.index[link.id]
+        k = k[np.argsort(d.t_ns[k])]
+        t = d.t_ns[k] - d.t0_ns
+        i = (t - t_grid[0]) // am.SAMPLE_NS
+        inside = (t >= t_grid[0]) & (i < len(t_grid))
+        q_model = np.where(inside, m.q[np.clip(i, 0, len(t_grid) - 1), link.k], am.Q_PARK[link.k])
+        sub = d.rows.take(pa.array(k))
+        q_row = sts_field(sub, "quaternion").flatten().to_numpy().reshape(-1, 4)
+        w = sub.column("angular_velocity").combine_chunks().flatten().to_numpy().reshape(-1, 3)
+        quat_err = max(quat_err, float(np.abs(q_row - link.quaternion(q_model)).max()),
+                       float(np.abs(d.pos[k] - link.offset).max()))
+        angle = link.angle(q_row)
+        decoded[i[inside], link.k] = angle[inside]
+        qd[i[inside], link.k] = w[inside, 2]
+        q_err = max(q_err, float(np.abs(bm.wrap(angle[inside] - q_truth[i[inside], link.k])).max()))
+        qd_model = np.where(inside, m.qd[np.clip(i, 0, len(t_grid) - 1), link.k], 0.0)
+        w_err = max(w_err, float(np.abs(w[:, 2] - qd_model).max()))
+    check(f"link rows equal the model; joint angles decoded from the quaternions equal "
+          f"{truth_path.name if truth is not None else 'the model'}",
+          quat_err <= 1e-12 and q_err <= 1e-9 and w_err <= 1e-12,
+          f"max row error {quat_err:.1e}, decoded angle error {q_err:.1e} rad, joint speed error {w_err:.1e} rad/s")
+
+    # Joint limits and the IK branch, from the decoded angles and the stored joint speeds.
+    q = np.unwrap(decoded, axis=0)
+    speed = np.abs(np.diff(q, axis=0)).max(axis=0) * sc.ARM_HZ
+    accel = np.abs(np.diff(qd, axis=0)).max() * sc.ARM_HZ
+    flips = int((q[:, 2] <= 0).sum() + (q[:, 4] >= 0).sum())
+    check(f"joints within {math.degrees(sc.JOINT_SPEED):.0f}°/s and {math.degrees(sc.JOINT_ACCEL):.0f}°/s²; the IK "
+          "branch (elbow up, wrist down) never flips",
+          np.abs(qd).max() <= sc.JOINT_SPEED * (1 + 1e-9) and accel <= sc.JOINT_ACCEL and flips == 0,
+          f"peak {math.degrees(np.abs(qd).max()):.1f}°/s stored, {math.degrees(speed.max()):.1f}°/s between rows, "
+          f"{math.degrees(accel):.1f}°/s², {flips} branch flips")
+
+    # 125 Hz: complete and exactly spaced for every link through the episode and every box while held.
+    gaps = 0
+    for e in (*arm.links, *arm.boxes):
+        t = np.sort(d.t_ns[d.index[e.id]] - d.t0_ns)
+        lo, hi = (0, len(t_grid) - 1) if e in arm.links else e.held
+        got = t[(t >= t_grid[lo]) & (t <= t_grid[hi])]
+        gaps += int(len(got) != hi - lo + 1 or np.any(np.diff(got) != am.SAMPLE_NS))
+    check(f"{sc.ARM_HZ} Hz rows complete and exactly spaced: links through the episode, boxes while held",
+          gaps == 0, f"{len(t_grid):,} samples per link, {gaps} entities off")
+
+    # The tip composed by soloc: L6 rows exchanged to IAU_EARTH (7 frames), carried to the tip by
+    # its stored orientation, and taken into the cell's ENU against the model's FK.
+    def through(idx, offset_m):
+        return arm.in_cell(d.client, d.rows.take(pa.array(idx)), offset_m)
+
+    l6 = arm.links[-1]
+    k6 = d.index[l6.id]
+    row_at = dict(zip((d.t_ns[k6] - d.t0_ns).tolist(), k6.tolist()))
+    pick = np.sort(np.random.default_rng(0).choice(len(t_grid), size=100, replace=False))
+    started = time.monotonic()
+    tip = through([row_at[int(t_grid[i])] for i in pick], [0.0, 0.0, am.D[5] + sc.TOOL_M])
+    per_row = (time.monotonic() - started) / len(pick)
+    err = float(np.abs(tip - arm.tip[pick]).max())
+    check(f"the tip composed by soloc (L6 rows → {EARTH.frame} → cell ENU) equals the model's FK "
+          f"({len(pick)} sampled epochs)", err <= 1e-6,
+          f"max error {err * 1e9:.1f} nm; exchange {per_row * 1000:.0f} ms/row")
+
+    # Reparenting: a box's place must not jump when it is grasped or released. Compare, through
+    # soloc, its last row on A with its first on the gripper, and its first on B with where the
+    # gripper holds it at that epoch (from L6's row then).
+    idx, held_at = [], []
+    for b in arm.boxes:
+        k = d.of(b.id)
+        t = d.t_ns[k] - d.t0_ns
+        g, r = (int(t_grid[i]) for i in b.held)
+        idx += [int(k[t < g][np.argmax(t[t < g])]), int(k[t == g][0]), int(k[t == r][0])]
+        held_at.append(row_at[r])
+    boxes = through(idx, [0.0, 0.0, 0.0]).reshape(-1, 3, 3)
+    held = through(held_at, [0.0, 0.0, am.D[5] + sc.TOOL_M + am.H / 2])
+    grasp = float(np.linalg.norm(boxes[:, 1] - boxes[:, 0], axis=1).max())
+    release = float(np.linalg.norm(boxes[:, 2] - held, axis=1).max())
+    check("no box moves when it is grasped (PALLET-A → gripper) or released (gripper → PALLET-B), through soloc",
+          grasp <= 1e-6 and release <= 1e-6,
+          f"{len(arm.boxes)} boxes, max jump {grasp * 1e9:.1f} nm at grasp, {release * 1e9:.1f} nm at release")
+
+    state = d.client.current_state([b.id for b in arm.boxes] + [l.id for l in arm.links])
+    ids = id_bytes(state.column("entity_id"))
+    frames = id_bytes(sts_field(state, "frame_id"))
+    q_now = sts_field(state, "quaternion").flatten().to_numpy().reshape(-1, 4)
+    on_b = sum(f == arm.boxes[0].b_id for i, f in zip(ids, frames) if i in {b.id for b in arm.boxes})
+    links = {l.id: l for l in arm.links}
+    park = max(float(np.abs(q - links[i].quaternion(am.Q_PARK[links[i].k])).max()) for i, q in zip(ids, q_now) if i in links)
+    check("current_state: every box on PALLET-B and the arm parked",
+          on_b == len(arm.boxes) and park <= 1e-12, f"{on_b} of {len(arm.boxes)} on B, park error {park:.1e}")
+
+
 # -- robots -----------------------------------------------------------------------------------
 
 
@@ -1019,9 +1143,14 @@ def check_topology(d: Data, world):
         expected[(c.id, c.ship.id, c.destination.id, s_ns(c.t_off))] = "disembark"
     for b in world.factory.boxes:
         expected[(b.id, b.b_id, b.c_id, s_ns(b.end_s))] = "box handover"
+    for b in world.arm.boxes:
+        g, r = (d.t0_ns + int(b.motion.t_ns[i]) for i in b.held)
+        expected[(b.id, b.a_id, b.gripper_id, g)] = "grasp"
+        expected[(b.id, b.gripper_id, b.b_id, r)] = "release"
     kinds = Counter(kind for e, kind in expected.items() if e[0] in d.index)
     expected = {e for e in expected if e[0] in d.index}
-    check("parent changes are exactly the launches, hand-offs, landings, boardings, disembarks and box handovers",
+    check("parent changes are exactly the launches, hand-offs, landings, boardings, disembarks, box handovers, "
+          "grasps and releases",
           changes == expected,
           ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
           + ("" if changes == expected else

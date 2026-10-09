@@ -13,7 +13,7 @@ was recorded under a small `memory_limit` or the server's limit evicted part of 
 
 | Check | What it confirms |
 |---|---|
-| roster | `current_state` holds every facility, spacecraft, probe, robot, crawler, aircraft, ship, regatta and wildfire entity, every fire vertex and trench that was born, and every body, and nothing else; the regatta marks are absent, since they were lifted hours before the window ends |
+| roster | `current_state` holds every facility, spacecraft, probe, robot, crawler, aircraft, ship, regatta, wildfire and arm-cell entity, every fire vertex and trench that was born, and every body, and nothing else; the regatta marks are absent, since they were lifted hours before the window ends |
 | names | the `.names.arrow` sibling reloaded a name for every sim entity |
 | units / timescale | only `km`/`m` stored, every row normalised to TAI |
 | schedule | each entity's stored epochs are exactly its model's schedule (fire vertices and trenches, whose schedules the run decides, are checked with the wildfire instead) |
@@ -31,7 +31,7 @@ was recorded under a small `memory_limit` or the server's limit evicted part of 
 | Parker Solar Probe | the stored rows equal the Horizons table; its distance from the Sun agrees with the Sun's snapshot rows; perihelion falls inside the window at 9.8–9.9 solar radii |
 | crawlers | on the hull in the stored frame, and within hull reach of the host once both are resolved to the host's frame |
 | disembark | the crawler is framed on the facility afterwards, at ground level inside the site |
-| topology | the parent changes are exactly the 1,360 that the models predict: the 10 vehicle phase changes and 1,350 box handovers |
+| topology | the parent changes are exactly the 1,408 that the models predict: the 10 vehicle phase changes, 1,350 factory box handovers, and 24 grasps and 24 releases in the arm cell |
 | aircraft | every row between the lowest field and cruise altitude; at rest only on an airfield; 900 km/h (±1%) ground speed at cruise altitude |
 | ships | at sea level; 22-40 km/h (±1%) under way; at rest only at a berth; every row on water |
 | regatta frame | every boat, mark and buoy row is framed on the venue at z = 0, and sits on water (`scenario.BASIN_WATER`); 6 boat rows resolved to IAU_EARTH land on the venue's ENU plane |
@@ -55,9 +55,16 @@ was recorded under a small `memory_limit` or the server's limit evicted part of 
 | bearing geometry | 64 burst ball rows resolved through 7 frames to IAU_EARTH sit on the pitch circle at ±0.15 m along the shaft axis (fixed by the outer rings), so they touch both raceways (µm) |
 | boxes | every box sits at the pulley's turn × 0.1 m along the belt and is handed to Machine C: 450 per line |
 | roster (factory) | `current_state` holds the 88 plant parts and none of the 1,350 boxes, which were all off the belts by 14:00 CEST |
+| arm frames | every arm part row is framed on its designed parent; each cell box is on PALLET-A at its slot, on the gripper at the held pose for exactly its held samples, then on PALLET-B at its slot |
+| link rows | every link row equals the model (DH origin · Rz(q)), and the joint angle decoded from each quaternion equals `arm_truth.arrow` |
+| joint limits | stored joint speeds within 90°/s and accelerations within 180°/s²; elbow up and wrist down throughout |
+| 125 Hz | each link's episode rows and each box's held rows are complete and exactly 8 ms apart |
+| arm FK | the tip from 100 sampled L6 rows exchanged through 7 frames to IAU_EARTH, then into cell ENU, equals the model's forward kinematics (nm) |
+| reparents | through soloc, no box moves at its grasp (last row on A vs first on the gripper) or its release (first row on B vs the gripper's hold at that epoch) |
+| roster (arm) | `current_state` holds the 11 arm parts and the 24 cell boxes, every box on PALLET-B and the arm parked |
 
-Rotating factory parts have rows at sub-second epochs in the burst, so their schedule is checked
-to the nanosecond against `Part.epochs_ns`.
+Rotating factory parts have rows at sub-second epochs in the burst, and arm links and held boxes
+at 125 Hz, so their schedules are checked to the nanosecond against `epochs_ns`.
 
 Resolving rows through the ledger at historical epochs scans for the parent's pose once per
 `(frame, epoch)`. The resolution checks therefore run on a few epochs, and the per-row checks

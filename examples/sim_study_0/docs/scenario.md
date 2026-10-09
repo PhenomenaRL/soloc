@@ -6,14 +6,15 @@ appends), plus one before every arena decision tick. Each `do_put` is `Ledger::a
 checks on every batch), `append_snapshot` adds the celestial bodies from the kernels, and
 `save_ledger` is `Ledger::save_ipc`.
 
-A full run (~6.5 min) prints `1703 entities, 3,583,676 entity rows + 484 snapshot rows` and a
-result line per arena and for the factory. It writes these files:
+A full run (~7.5 min) prints `1738 entities, 3,872,178 entity rows + 484 snapshot rows` and a
+result line per arena, for the factory and for the arm. It writes these files:
 - `out/sim_study_0.arrow`
 - its `out/sim_study_0.arrow.names.arrow` name registry
-- the `out/wind.arrow`, `out/fuel.arrow` and `out/bearing_truth.arrow` side tables
+- the `out/wind.arrow`, `out/fuel.arrow`, `out/bearing_truth.arrow` and `out/arm_truth.arrow`
+  side tables
 
 The wildfire's vertices and trenches come from fixed pools of 240 and 620 names, so the run
-registers 2,434 names; 1,703 of them get rows. The ledger holds about 1.77 GB in the server, of
+registers 2,469 names; 1,738 of them get rows. The ledger holds about 1.90 GB in the server, of
 the 2 GB `memory_limit`. The factory's 20 Hz burst accounts for 684,000 of its rows and its
 shaft captures for 1,200,000; the bearing truth table, `out/bearing_truth.arrow` (12M rows,
 ~2.3 GB), sits beside it. Batches
@@ -49,9 +50,14 @@ models live in `sim/models/`.
 | lines, machines A/B/C, stators, outer rings, rotors, inner rings | the plant, the line, Machine B, the stator, the shaft | m | TAI | 1 h | each part fixed in its parent's frame. Machine B is a 10 m belt; its gearmotor (the stator) sits at the drive pulley with its x along the pulley axle; two 6205-size bearings sit 0.15 m either side of the shaft's centre |
 | 3 shafts, 6 cages, 48 balls | the stator, an outer ring, a cage | m | TAI | 5 s in the shift (09-02 06:00–14:00 CEST), 20 Hz in the burst (08:00–08:10), else 1 h; shafts also 5 kHz in eight 10 s captures | the shaft turns at 60 rpm with 10 s ramps and a break 10:00–10:30. Poses come from the bearing dynamics ([bearing_dynamics.md](bearing_dynamics.md)): the shaft's µm displacement and tilt in its stator, each cage at 0.397 × the shaft less its slip, each ball on its pocket's wandered angle, seated on the outer race when loaded, spinning at −2.32 × the shaft less its slip. The spin is in `angular_velocity`; shaft capture rows carry `acceleration`, ball rows their contact load over their mass |
 | 1,350 boxes | Machine B, then Machine C | m | TAI | 5 s while on the belt | one spawned every 60 s per running line; it rides the 10 m belt at the pulley's turn × 0.1 m (0.63 m/s, 16 s) and its last row is on Machine C; 450 per line |
+| Odense cell | IAU_EARTH | km | TAI | 1 h | the arm cell, a facility on an industrial parcel in Odense, Denmark |
+| ARM-1-BASE, PALLET-A, PALLET-B, ARM-1-GRIPPER | the cell; ARM-1-L6 for the gripper | m | TAI | 1 h | the arm's 0.6 m pedestal at the cell origin; Euro pallets 0.75 m north and south, B turned 180° so its slots mirror A's; the vacuum gripper on the flange |
+| ARM-1-L1 … ARM-1-L6 | the base, then each link its predecessor | m | TAI | 125 Hz from 09-03 06:00 UTC (08:00 CEST) for 350 s, else 1 h | a UR10e-class 6-DOF arm (standard DH) as a tf tree: each link's row is its joint's fixed DH origin turned by Rz(q), with q̇ in `angular_velocity` z. Straight vertical legs at 0.25 m/s (closed-form IK per sample), quintic joint transfers within 90°/s and 180°/s², 0.3 s vacuum dwells |
+| 24 cell boxes | PALLET-A, then ARM-1-GRIPPER, then PALLET-B | m | TAI | 125 Hz while held, else 1 h | a 4-layer stack of 0.3 × 0.2 × 0.15 m, 4 kg boxes, unstacked from A's top and stacked onto B from the bottom: 24 grasps and 24 releases, one every 14.5 s; the joint truth is in `out/arm_truth.arrow` |
 | 4 bodies | ICRF | km | TAI | 1 h | `append_snapshot` of Sun, Earth, Moon, Mars |
 
-- **Frame tree.** The deepest chain is 7 hops, a factory ball to IAU_EARTH; among the vehicles
+- **Frame tree.** The deepest chain is 10 hops, a held cell box (gripper → L6 … L1 → base →
+  cell) to IAU_EARTH; a factory ball is 7; among the vehicles
   it is 3, CRAWLER-04 riding the landed LUNA-1 on Shackleton Base on IAU_MOON. Astro frames are
   roots that the kernels resolve.
   The bodies also appear as entities under ICRF; their ids are the IAU frames' ids, but frame
@@ -60,9 +66,10 @@ models live in `sim/models/`.
   on the solar-system barycentre), both with J2000 axes. soloc has no Sun-centred inertial
   frame, so a Sun-centred path is stored as the Sun's barycentric position plus the
   heliocentric one.
-- **Parent changes.** Exactly 1,360. There are 10 for vehicles: three launches, SELENE-1's two
-  hand-offs between frames in flight, two landings, CARGO-01 boarding, and two disembarks. The
-  other 1,350 are box handovers from Machine B to Machine C.
+- **Parent changes.** Exactly 1,408. There are 10 for vehicles: three launches, SELENE-1's two
+  hand-offs between frames in flight, two landings, CARGO-01 boarding, and two disembarks.
+  1,350 are factory box handovers from Machine B to Machine C, and 48 are the arm cell's boxes,
+  each grasped off PALLET-A and released onto PALLET-B.
 - **The factory tree.** A ball resolves through 7 frames to IAU_EARTH: ball → cage → outer ring
   → stator → Machine B → line → plant → IAU_EARTH. At the 5 s cadence a ball spins 11.6 turns
   between rows, so its quaternion alone aliases the motion; `angular_velocity` carries the spin,
@@ -99,9 +106,9 @@ that already covers the window) after changing `T0` or `T_END`.
 
 ## Separate runs
 
-The roster splits into six groups (`GROUPS` in `sim/roster.py`) that share no rows except
+The roster splits into seven groups (`GROUPS` in `sim/roster.py`) that share no rows except
 the body snapshots: `space` (the facilities, spacecraft, probes, robots, crawlers and cargo,
-which ride on one another), `aircraft`, `ships`, `regatta`, `wildfire` and `factory`.
+which ride on one another), `aircraft`, `ships`, `regatta`, `wildfire`, `factory` and `arm`.
 `python run_sim.py --scenario GROUP` runs one group on a fresh server into
 `out/GROUP/sim_study_0.arrow`. Its wind and fuel tables go beside it when the group has
 them, so every tool works on a part as it does on the full ledger, and `check_sim` runs the
@@ -123,9 +130,10 @@ again.
 | regatta | 19 | 53,109 | 4 s |
 | wildfire | 144 | 139,580 | 13 s |
 | factory | 1,438 | 2,222,374 | 319 s (~140 s of it integrating the bearing captures) |
+| arm | 35 | 288,502 | 11 s |
 
 Each part also holds the 484 snapshot rows. The merge takes about 45 s, most of it copying the
-12M-row bearing truth table. Merging the six
+12M-row bearing truth table. Merging the seven
 parts reproduces the monolithic run row for row (`python -m tests.compare_ledgers A B`),
 names and side tables included. That holds because each group's rows depend only on the
 seed and on the group's own entities.

@@ -2,7 +2,7 @@
 soloc-server, so `Ledger::append` re-validates every row. Parts go in in `GROUPS` order. An
 entity found in several parts (every run writes the body snapshots) is kept from the first,
 and the merge fails if a later copy differs in any column. The parts' side tables (wind, fuel,
-bearing truth) are concatenated beside the output.
+bearing and arm truth) are concatenated beside the output.
 
     python -m tools.merge_sim                  # every out/<group>/ that exists
     python -m tools.merge_sim space factory    # just those
@@ -16,6 +16,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from sim.fuel import FUEL_SCHEMA
+from sim.models.arm import TRUTH_SCHEMA as ARM_TRUTH_SCHEMA
 from sim.models.bearing import TRUTH_SCHEMA
 from sim.roster import GROUPS
 from sim.wind import WIND_SCHEMA
@@ -24,7 +25,7 @@ from soloc_client import SolocClient
 PART = "sim_study_0.arrow"
 # Each side table, and the column no two parts may share a value of.
 SIDE_TABLES = {"wind.arrow": (WIND_SCHEMA, "venue"), "fuel.arrow": (FUEL_SCHEMA, "venue"),
-               "bearing_truth.arrow": (TRUTH_SCHEMA, "line")}
+               "bearing_truth.arrow": (TRUTH_SCHEMA, "line"), "arm_truth.arrow": (ARM_TRUTH_SCHEMA, "arm")}
 
 
 def read(path: Path) -> pa.Table:

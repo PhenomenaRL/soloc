@@ -16,6 +16,7 @@ from sim import scenario as sc
 from sim.roster import ARENAS, GROUPS, roster
 from sim.strategies import load
 from sim.fuel import write_table as write_fuel
+from sim.models.arm import write_table as write_arm_truth
 from sim.models.bearing import write_table as write_truth
 from sim.wind import write_table
 from soloc_client import KIND_ABSTRACT, KIND_SOLOC, SolocClient, registry_ipc, tai_ns_from_utc
@@ -138,6 +139,11 @@ def main():
         n = write_truth(truth_path, sim.world.factory.captures)
         print(f"{n:,} bearing steps → {truth_path}")
         print(sim.world.factory.result())
+    if "arm" in groups:
+        truth_path = out.with_name("arm_truth.arrow")
+        n = write_arm_truth(truth_path, sim.world.arm)
+        print(f"{n:,} arm samples → {truth_path}")
+        print(sim.world.arm.result())
 
 
 if __name__ == "__main__":

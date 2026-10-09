@@ -35,12 +35,13 @@ from sim import scenario as sc
 from sim.ephemeris import Ephemeris
 from sim.geo import EARTH, GCRF, ICRF, MARS, MOON, SUN, quat_from_matrix
 from sim.land import outlines
+from sim.models import arm as am
 from sim.models import factory as fm
 from sim.models import regatta as rg
 from sim.models import wildfire as wf
 from sim.roster import roster
 from sim.wind import read_table
-from tools.snapshot_sim import FireView, factory_rows, fuel_grid
+from tools.snapshot_sim import FireView, arm_rows, factory_rows, fuel_grid
 from tools.snapshot_sim import Rows as SnapRows
 from soloc_client import CENTURY_NS, SolocClient, astronomical, id_bytes, sts_field, tai_ns_from_utc
 from tools.view_sim import load
@@ -57,6 +58,11 @@ PLANT_REACH_KM = 0.5
 PLANT_VIEW_KM = 0.045
 PLANT_NEAR_KM = 2e-5                # a bearing is 5 cm across: let the camera come within 2 cm
 PLANT_FOLLOW_KM = 3e-4
+ARM_REACH_KM = 0.5
+ARM_VIEW_KM = 0.006
+ARM_NEAR_KM = 2e-4
+ARM_FOLLOW_KM = 0.003
+ARM_VIEW_HZ = 25                    # the links' rows kept in the episode; the page slerps between them
 
 # (name, NAIF id, mean radius km, colour, draw orbit)
 BODIES = (
@@ -255,6 +261,52 @@ def factory_context(fac, table, ledger_rows: Rows, name) -> dict:
             "tracks": tracks}
 
 
+def arm_context(arm, table, ledger_rows: Rows, name) -> dict:
+    """The cell: the arm's parts at true size as tracks in their parents' frames, which the page
+    composes (box → gripper → L6 … L1 → base → cell). Links are thinned to `ARM_VIEW_HZ` in the
+    episode. A box has one track per parent at its stored local pose, from its first row there
+    to its first row on the next."""
+    rows = arm_rows(arm, table)
+    order = {p.id: k for k, p in enumerate(arm.parts)}
+    every = sc.ARM_HZ // ARM_VIEW_HZ
+    child = {**{l.id: n.offset for l, n in zip(arm.links, arm.links[1:])}, arm.links[-1].id: arm.gripper.offset}
+    tracks = []
+    for p in arm.parts:
+        k = rows.index[p.name]
+        tick = np.rint((rows.t_s[k] - am.EPISODE_S0) * sc.ARM_HZ)
+        k = k[~np.array([arm.motion.episode(int(t)) for t in rows.t_s[k] // sc.BASE_TICK_S * sc.BASE_TICK_S])
+              | (tick % every == 0)]
+        tr = track(name(p), "arm", rows.t_s[k], rows.pos3[k], rows.quat[k])
+        tr["parent"] = order.get(p.parent_id, -1)
+        if p.id in child:
+            tr["seg"], tr["width"] = child[p.id], p.dimensions_m[1]
+        else:
+            lz = p.dimensions_m[2]            # the pedestal hangs below the base frame; the rest stand on theirs
+            tr["solid"] = {"s": p.dimensions_m, "c": [0.0, 0.0, -lz / 2 if p is arm.base else lz / 2]}
+        tracks.append(tr)
+    for b in arm.boxes:
+        k = rows.index[b.name]
+        first = np.flatnonzero(np.r_[True, rows.frames[k][1:] != rows.frames[k][:-1]])
+        for n, i in enumerate(first):
+            last = first[n + 1] if n + 1 < len(first) else len(k)
+            j = [k[i], k[last - 1]]
+            t = rows.t_s[j].tolist() + ([float(rows.t_s[k[last]])] if last < len(k) else [])
+            pos, quat = rows.pos3[j], rows.quat[j]
+            if len(t) > 2:
+                pos, quat = np.vstack([pos, pos[-1:]]), np.vstack([quat, quat[-1:]])
+            tr = track(name(b), "box", t, pos, quat)
+            tr["parent"] = order[rows.frames[k[i]]]
+            tr["solid"] = {"s": list(sc.CELL_BOX_DIMENSIONS_M), "c": [0.0, 0.0, 0.0]}
+            tracks.append(tr)
+    pose = Pose(ledger_rows, arm.cell.id)
+    return {"id": arm.cell.spec.code.lower(), "kind": "site", "layout": "plant", "body": EARTH.name,
+            "name": name(arm.cell), "frame": f"{name(arm.cell)} ENU",
+            "p": pose.p_km.tolist(), "q": quat_from_matrix(pose.r),
+            "extent": [-1.6, 1.6, -1.6, 1.6], "machines": [],
+            "reach": ARM_REACH_KM, "view": ARM_VIEW_KM, "near": ARM_NEAR_KM, "follow": ARM_FOLLOW_KM,
+            "tracks": tracks}
+
+
 def fire_context(w, table, rows: Rows, name, wind_path: Path, fuel_path: Path) -> tuple[dict, list]:
     """The wildfire venue: the fuel map as its ground, the perimeter as a loop through the vertex
     tracks in replayed ring order, trenches appearing as they are finished, the crews, the wind.
@@ -410,6 +462,11 @@ def main():
         events += [{"t": float(fm.SHIFT_S[0]), "label": "factory shift starts"},
                    {"t": float(fm.BURST_S[0]), "label": f"factory {sc.BURST_HZ} Hz burst"},
                    {"t": float(fm.SHIFT_S[1]), "label": "factory shift ends"}]
+    arm = world.arm
+    if len(rows.of(arm.cell.id)):
+        contexts.append(arm_context(arm, ledger, rows, name))
+        events += [{"t": float(am.EPISODE_S0), "label": f"{sc.ARM_NAME} starts unstacking PALLET-A"},
+                   {"t": float(arm.motion.end_s), "label": f"{sc.ARM_NAME} parked, PALLET-B stacked"}]
 
     for c in world.spacecraft:
         for key, label in EVENT_LABELS.items():

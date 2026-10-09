@@ -22,6 +22,9 @@
 | `factory_boxes.png` | per line, boxes spawned and delivered over the shift, and the belt speed from the shaft's stored `angular_velocity` (start, break, stop) |
 | `factory_bearing.png` | the 20 Hz burst: the shaft's, a cage's and a ball's stored angles (unwrapped) against the bearing model's slipped ratios; and bearing 1's balls resolved through the ledger to IAU_EARTH, seen along the shaft |
 | `factory_bearing_analysis.png` | line 1 bearing 1: shaft/cage/ball speeds and their ratios against pure rolling (the gap is the slip), the defect frequencies (FTF, BPFO, BPFI, BSF), burst orientation with speed taken from the quaternion against the stored `angular_velocity`, and cumulative revolutions and ball passes |
+| `arm_joints.png` | the six joint angles decoded from the 125 Hz link quaternions, and the stored joint speeds against the ±90°/s limit, with each grasp and release marked |
+| `arm_tcp.png` | the tip's path in the cell from above and from the east, composed from the stored link rows, with soloc's answer every 3 s (L6 rows exchanged through 7 frames, then into the cell) and the grasps and releases coloured by box |
+| `arm_boxes.png` | per box, its parent frame over the episode (PALLET-A, the gripper, PALLET-B), and its height in the cell through both reparents, with soloc's answer at four rows per box |
 
 `python -m tools.bearing_eval out/sim_study_0.arrow` (~1 min) prints the bearing evaluation
 ([bearing_dynamics.md](bearing_dynamics.md)) and writes three more:
@@ -75,6 +78,10 @@ It is one scene, nested the way the ledger's frames are:
   - **Precision:** the scene graph holds positions to about 3 cm at solar-system scale, too
     coarse for a 5 cm bearing. So the plant hangs off the scene root, placed against the camera
     target each frame, which keeps its parts within 0.01 mm of where the ledger puts them.
+- **The Odense cell:** the arm, pallets and boxes at true size. Each link is a bar to its
+  child's joint, composed by the page through its stored parents (gripper → L6 … L1 → base →
+  cell), from the link rows thinned to 25 Hz. A box has one track per parent (PALLET-A, the
+  gripper, PALLET-B), so the reparents show. It hangs off the scene root like the plant.
 
 Body positions and orientations come from the server: a zero offset in each body frame is
 exchanged to ICRF at 5 min steps over the window. That is the same resolution the ledger does.
@@ -92,11 +99,12 @@ a facility (a craft on its pad or landed) are composed through the facility's st
 - Floating-origin rendering keeps it precise from 4 AU down to a metre.
 
 Every entity is a small model with its body axes (x red, y green, z blue) at its interpolated
-pose; models keep a constant size on screen. The controls:
+pose; models keep a constant size on screen, except the arm cell's, which are true size. The
+controls:
 - a time slider with ticks at the launches, burns, hand-offs, touchdowns, boardings and
   disembarks, at Parker's perihelion, at the regatta's marks laid, warning, gun, first and last
   finish and marks lifted, at the wildfire's ignition, first orders, last line finished and
-  containment, and at the factory's shift start, burst and shift end
+  containment, at the factory's shift start, burst and shift end, and at the arm's start and park
 - play at 5 s/s up to 3 h/s
 - trails from 15 min to the whole track
 - labels, a hover readout (position in the entity's own frame), and a clickable legend that
@@ -121,6 +129,14 @@ The wildfire's fuel map (`sim/fuel.py`) on a 50 m grid over the venue: `venue`, 
 `class` (river, riparian, corridor, slash, conifer) and `r0_factor`, the multiplier on the
 no-wind spread rate. That is 16,761 rows (~0.8 MB).
 
+## Arm truth: out/arm_truth.arrow
+
+The arm model's state at every 125 Hz sample of the episode: `arm`, `t_ns` (since T0), `q` and
+`qd` (the six joint angles in rad and speeds in rad/s), `tip` (cell ENU, m, from the model's
+forward kinematics) and `box` (the box held, else null). That is 43,750 rows (~6 MB). The ledger
+stores link poses, not joint values, so `check_sim` decodes q from the link quaternions and
+compares it with this table.
+
 ## Situation snapshots: tools/snapshot_sim.py
 
 `tools.snapshot_sim` draws an arena as a decision maker would see it at an instant. It reads the
@@ -137,7 +153,15 @@ python -m tools.snapshot_sim out/sim_study_0.arrow --scenario regatta --at 2026-
 python -m tools.snapshot_sim out/sim_study_0.arrow --scenario regatta --every 10m   # 13:00–18:00 ADT
 python -m tools.snapshot_sim out/sim_study_0.arrow --scenario wildfire --every 2h   # ignition to contained
 python -m tools.snapshot_sim out/sim_study_0.arrow --scenario factory --at 2026-09-02T06:00:16.350
+python -m tools.snapshot_sim out/sim_study_0.arrow --scenario arm --at 2026-09-03T06:00:07
 ```
+
+For the arm, the panels are:
+- the cell from above and from the east: the arm as a stick through its joint origins, composed
+  from each part's latest stored row, the tip's last 5 s, and every box where its latest row puts
+  it (the held one in orange)
+- the stats: the six joint angles decoded from the link quaternions, the tip, the box held and
+  the counts on each pallet
 
 For the factory, the panels are:
 - the plant floor with the boxes on the belts

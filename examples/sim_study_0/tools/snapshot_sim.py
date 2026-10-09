@@ -9,9 +9,11 @@ drawn over the fuel map from `out/fuel.arrow`.
     python -m tools.snapshot_sim out/sim_study_0.arrow --scenario regatta --every 10m
     python -m tools.snapshot_sim out/sim_study_0.arrow --scenario wildfire --every 2h
     python -m tools.snapshot_sim out/sim_study_0.arrow --scenario factory --at 2026-09-02T06:00:01.350
+    python -m tools.snapshot_sim out/sim_study_0.arrow --scenario arm --at 2026-09-03T06:00:07.500
 """
 
 import argparse
+import math
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -25,6 +27,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from sim import scenario as sc
+from sim.models import arm as am
 from sim.models import factory as fm
 from sim.models import regatta as rg
 from sim.models import wildfire as wf
@@ -405,6 +408,107 @@ def draw_factory(fac: fm.Factory, rows: Rows, t_s: float, out_dir: Path) -> Path
     return path
 
 
+def arm_rows(arm: am.Arm, table: pa.Table) -> Rows:
+    """Every row framed in the cell or on one of the arm's parts."""
+    return Rows(table, arm.names, {arm.cell.id, *(p.id for p in arm.parts)}, tai_ns_from_utc(sc.T0))
+
+
+def quat_matrices(q) -> np.ndarray:
+    """Rotation matrices `(..., 3, 3)` of quaternions `(..., 4)`, scalar first."""
+    w, x, y, z = np.moveaxis(np.asarray(q, float), -1, 0)
+    return np.stack([np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], -1),
+                     np.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], -1),
+                     np.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1)], -2)
+
+
+def arm_frames(arm: am.Arm, rows: Rows, t_s) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """`(position (n, 3), rotation (n, 3, 3))` in cell ENU of the base, the links and the gripper
+    at times `t_s`, composed here from each one's latest stored row (the zero-order hold soloc
+    uses)."""
+    t_s = np.atleast_1d(np.asarray(t_s, float))
+    p, r = np.zeros((len(t_s), 3)), np.tile(np.eye(3), (len(t_s), 1, 1))
+    out = {}
+    for part in (arm.base, *arm.links, arm.gripper):
+        k = rows.index[part.name]
+        j = k[np.searchsorted(rows.t_s[k], t_s, side="right") - 1]
+        p = p + np.einsum("nij,nj->ni", r, rows.pos3[j])
+        r = r @ quat_matrices(rows.quat[j])
+        out[part.name] = (p, r)
+    return out
+
+
+def arm_tip(arm: am.Arm, frames: dict) -> np.ndarray:
+    p, r = frames[arm.gripper.name]
+    return p + r[..., :, 2] * sc.TOOL_M
+
+
+def boxes_on(arm: am.Arm, rows: Rows, t_s: float, frames: dict) -> list[tuple[np.ndarray, str]]:
+    """Each box's centre in cell ENU at `t_s` and where it sits: "A", "held" or "B"."""
+    out = []
+    for b in arm.boxes:
+        k = rows.upto(b.name, t_s)[-1]
+        f, local = rows.frames[k], rows.pos3[k]
+        if f == b.gripper_id:
+            p, r = frames[arm.gripper.name]
+            out.append((p[0] + r[0] @ local, "held"))
+        else:
+            pallet = arm.pallets[0] if f == b.a_id else arm.pallets[1]
+            yaw = 1.0 if pallet is arm.pallets[0] else -1.0      # B is turned 180°
+            out.append((np.array(pallet.offset) + local * [yaw, yaw, 1.0], "A" if yaw > 0 else "B"))
+    return out
+
+
+def draw_arm(arm: am.Arm, rows: Rows, t_s: float, out_dir: Path) -> Path:
+    """Top and side views of the cell at `t_s`: the arm as a stick through its joint origins, the
+    tip's last 5 s, and the boxes where their latest rows put them."""
+    fig = plt.figure(figsize=(16, 7.5), layout="constrained")
+    grid = fig.add_gridspec(1, 3, width_ratios=[1.0, 1.25, 0.6])
+    top, side, panel = (fig.add_subplot(grid[0, k]) for k in range(3))
+    frames = arm_frames(arm, rows, t_s)
+    chain = np.array([[0.0, 0.0, 0.0], *(frames[n][0][0] for n in (arm.base.name, *(l.name for l in arm.links),
+                                                                    arm.gripper.name)), arm_tip(arm, frames)[0]])
+    trail_t = np.arange(max(t_s - 5.0, am.EPISODE_S0), t_s, 1 / sc.ARM_HZ)
+    trail = arm_tip(arm, arm_frames(arm, rows, trail_t)) if len(trail_t) else np.zeros((0, 3))
+    wx, wy, h = sc.CELL_BOX_DIMENSIONS_M
+    lx, ly, lz = sc.PALLET_DIMENSIONS_M
+    boxes = boxes_on(arm, rows, t_s, frames)
+    for ax, (i, j), (w, d) in ((top, (0, 1), (wx, wy)), (side, (1, 2), (wy, h))):
+        for pallet in arm.pallets:
+            x, y, _ = pallet.offset
+            ax.add_patch(plt.Rectangle(((x - lx / 2, y - ly / 2), (y - ly / 2, 0.0))[ax is side],
+                                       (lx, ly)[ax is side], (ly, lz)[ax is side], color="#d9d8d2"))
+        for c, where in sorted(boxes, key=lambda b: b[0][0] if ax is side else b[0][2]):
+            ax.add_patch(plt.Rectangle((c[i] - w / 2, c[j] - d / 2), w, d, facecolor=MARK if where == "held" else TRACK,
+                                       edgecolor="#ffffff", linewidth=0.6))
+        ax.plot(trail[:, i], trail[:, j], color=MARK, linewidth=0.8, alpha=0.6)
+        ax.plot(chain[:, i], chain[:, j], "-o", color="#3d3c37", linewidth=2.5, markersize=4)
+        ax.set_aspect("equal")
+        style(ax)
+    top.set_xlim(-1.0, 1.2)
+    top.set_ylim(-1.3, 1.3)
+    top.set_title(f"{arm.cell.name} from above, cell ENU (m):\npallet A north, B south; the tip's last 5 s in orange", fontsize=9)
+    side.set_xlim(-1.4, 1.4)
+    side.set_ylim(0, 1.6)
+    side.set_title("from the east (north → right, up): joint origins base → L1 … L6 → gripper → tip", fontsize=9)
+
+    when = sc.T0 + timedelta(seconds=t_s)
+    q = [link.angle(rows.quat[rows.upto(link.name, t_s)[-1]]) for link in arm.links]
+    held = [b.name for b, (_, where) in zip(arm.boxes, boxes) if where == "held"]
+    lines = [f"{when:%Y-%m-%d %H:%M:%S.%f}"[:-3] + " UTC", f"{when + CEST:%H:%M:%S.%f}"[:-3] + " CEST", "",
+             f"rows: {f'{sc.ARM_HZ} Hz' if arm.motion.episode(int(t_s // sc.BASE_TICK_S * sc.BASE_TICK_S)) else 'hourly'}",
+             "", "joint   angle (from the quaternion)"]
+    lines += [f"q{k + 1}     {math.degrees(v):8.2f}°" for k, v in enumerate(q)]
+    lines += ["", f"tip     {' '.join(f'{v:6.3f}' for v in chain[-1])} m",
+              f"held    {held[0] if held else '-'}",
+              f"on A    {sum(w == 'A' for _, w in boxes)}", f"on B    {sum(w == 'B' for _, w in boxes)}"]
+    panel.axis("off")
+    panel.text(0, 1, "\n".join(lines), va="top", family="monospace", fontsize=8)
+    path = out_dir / f"arm_{when:%Y%m%dT%H%M%S}{f'.{when.microsecond // 1000:03d}' if when.microsecond else ''}.png"
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+    return path
+
+
 def parse_every(text: str) -> int:
     m = re.fullmatch(r"(\d+)([smh]?)", text)
     if not m:
@@ -413,7 +517,8 @@ def parse_every(text: str) -> int:
 
 
 SCENARIOS = {"regatta": (rg.ON_S, rg.OFF_S), "wildfire": (wf.IGNITION_S, None),
-             "factory": (fm.SHIFT_S[0] - 60, fm.SHIFT_S[1] + 60)}
+             "factory": (fm.SHIFT_S[0] - 60, fm.SHIFT_S[1] + 60),
+             "arm": (am.EPISODE_S0, am.EPISODE_S0 + 360)}
 
 
 def main():
@@ -430,7 +535,7 @@ def main():
 
     path = Path(args.path)
     table, names = load(path)
-    wind = None if args.scenario == "factory" else read_table(
+    wind = None if args.scenario in ("factory", "arm") else read_table(
         Path(args.wind) if args.wind else path.with_name("wind.arrow"))
     t0_ns = tai_ns_from_utc(sc.T0)
     out_dir = Path(args.out)
@@ -445,6 +550,11 @@ def main():
         rows = factory_rows(fac, table)
         draw = lambda t_s: draw_factory(fac, rows, t_s, out_dir)
         on, off = SCENARIOS["factory"]
+    elif args.scenario == "arm":
+        arm = am.Arm()
+        rows = arm_rows(arm, table)
+        draw = lambda t_s: draw_arm(arm, rows, t_s, out_dir)
+        on, off = SCENARIOS["arm"]
     else:
         w = wf.Wildfire(sc.SEED)
         rows = Rows(table, names, w.venue.id, t0_ns)

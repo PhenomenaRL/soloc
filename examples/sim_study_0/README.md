@@ -1,8 +1,8 @@
 # sim_study_0
 
-A 5-day simulation of 1,703 entities (sites, robots, spacecraft, aircraft, ships, a sailing
-regatta, a wildfire with its crews, a factory down to its bearing balls, and the real Parker Solar
-Probe) across the Earth, the Moon and Mars, written into a soloc ledger from Python. The regatta and the wildfire are arenas: their boats
+A 5-day simulation of 1,738 entities (sites, robots, spacecraft, aircraft, ships, a sailing
+regatta, a wildfire with its crews, a factory down to its bearing balls, a 6-DOF robot arm
+moving a stack of boxes, and the real Parker Solar Probe) across the Earth, the Moon and Mars, written into a soloc ledger from Python. The regatta and the wildfire are arenas: their boats
 and crews are steered by strategies that read the ledger back as events run
 ([docs/arena.md](docs/arena.md)).
 Python has no soloc bindings, so everything goes through `soloc-server` over Arrow Flight using
@@ -47,8 +47,8 @@ Terminal 2, the client:
 
 ```bash
 source .venv/bin/activate
-python run_sim.py                          # ~6.5 min → out/sim_study_0.arrow (~1.8 GB)
-python check_sim.py out/sim_study_0.arrow  # PASS/FAIL table; expect 95/95
+python run_sim.py                          # ~7.5 min → out/sim_study_0.arrow (~1.9 GB)
+python check_sim.py out/sim_study_0.arrow  # PASS/FAIL table; expect 104/104
 ```
 
 To develop one scenario without rerunning the rest, run it alone and merge the parts
@@ -73,15 +73,15 @@ Run every command from `examples/sim_study_0/` with the venv active. The ones in
 | `./fetch_data.sh` | – | downloads kernels, land polygons and three.js into `data/` |
 | `python -m sim.fetch_horizons` | – | downloads Horizons tables into `data/`; rerun after changing the window |
 | `./serve.sh` | – | runs `soloc-server` with the kernels in `data/` and `config.toml` (`SOLOC_CONFIG=FILE` to use another) |
-| `python run_sim.py` | empty | generates `out/sim_study_0.arrow` and its side tables `out/wind.arrow`, `out/fuel.arrow` and `out/bearing_truth.arrow` (`--out` to change); `--regatta-policy MOD:FN` / `--wildfire-policy MOD:FN` swap a strategy in; `--scenario GROUP` runs one group into `out/GROUP/` |
-| `python -m tools.merge_sim [GROUP...]` | empty | merges the parts in `out/*/` into `out/sim_study_0.arrow` with its wind and fuel tables |
+| `python run_sim.py` | empty | generates `out/sim_study_0.arrow` and its side tables `out/wind.arrow`, `out/fuel.arrow`, `out/bearing_truth.arrow` and `out/arm_truth.arrow` (`--out` to change); `--regatta-policy MOD:FN` / `--wildfire-policy MOD:FN` swap a strategy in; `--scenario GROUP` runs one group into `out/GROUP/` |
+| `python -m tools.merge_sim [GROUP...]` | empty | merges the parts in `out/*/` into `out/sim_study_0.arrow` with its side tables |
 | `python -m tests.compare_ledgers A B` | none | checks two saved ledgers hold identical rows and names |
 | `python check_sim.py FILE` | any | loads `FILE` and prints the checks in [docs/checks.md](docs/checks.md) |
 | `python -m tools.plot_sim FILE` | any | PNGs into `out/plots/`, ~4 min |
 | `python -m tools.bearing_eval FILE` | any | the bearing dynamics evaluation (fidelity, detection, cost) and 3 PNGs into `out/plots/`; see [docs/bearing_dynamics.md](docs/bearing_dynamics.md) |
 | `python -m tools.export_viewer FILE` | any | standalone 3D viewer → `out/sim_study_0_3d.html` |
 | `python -m tools.view_sim FILE` | none | prints rows decoded; `--summary`, `--entity NAME`, `--tail`, `--limit N`, `--schema` |
-| `python -m tools.snapshot_sim FILE --scenario regatta\|wildfire\|factory` | none | situation PNGs into `out/snapshots/`; `--at UTC` or `--every 10m` |
+| `python -m tools.snapshot_sim FILE --scenario regatta\|wildfire\|factory\|arm` | none | situation PNGs into `out/snapshots/`; `--at UTC` or `--every 10m` |
 | `python -m tools.topo_sim FILE` | none | frame tree and parent changes; `--at UTC`, `--server URL` to cross-check |
 | `python -m tests.smoke_test` | empty | checks the server contract |
 

@@ -8,6 +8,7 @@ import numpy as np
 from sim import scenario as sc
 from sim.ephemeris import Ephemeris
 from sim.models.aircraft import aircraft
+from sim.models.arm import Arm
 from sim.models.facility import Facility
 from sim.models.factory import Factory
 from sim.models.probe import Probe
@@ -20,7 +21,7 @@ from sim.models.track import Track
 from soloc_client import SolocClient
 
 # The units `run_sim.py --scenario` runs on their own, in the order the parts are merged.
-GROUPS = ("space", "aircraft", "ships", "regatta", "wildfire", "factory")
+GROUPS = ("space", "aircraft", "ships", "regatta", "wildfire", "factory", "arm")
 ARENAS = ("regatta", "wildfire")
 
 
@@ -37,6 +38,7 @@ class Roster:
     regatta: Regatta
     wildfire: Wildfire
     factory: Factory
+    arm: Arm
 
     @property
     def groups(self) -> dict[str, list]:
@@ -44,7 +46,8 @@ class Roster:
         return {"space": [*self.facilities, *self.spacecraft, *self.probes, *self.robots,
                           *self.crawlers, *self.cargo],
                 "aircraft": self.aircraft, "ships": self.ships, "regatta": self.regatta.entities,
-                "wildfire": self.wildfire.entities, "factory": self.factory.entities}
+                "wildfire": self.wildfire.entities, "factory": self.factory.entities,
+                "arm": self.arm.entities}
 
     @property
     def entities(self) -> list:
@@ -105,4 +108,4 @@ def roster(seed: int, client: SolocClient, regatta_policy: Callable | None = Non
 
     probes = [Probe(s, ephemeris) for s in sc.PROBES]
     return Roster(facilities, spacecraft, probes, robots, crawlers, cargo, planes, ships,
-                  Regatta(seed, regatta_policy), Wildfire(seed, wildfire_policy), Factory())
+                  Regatta(seed, regatta_policy), Wildfire(seed, wildfire_policy), Factory(), Arm())

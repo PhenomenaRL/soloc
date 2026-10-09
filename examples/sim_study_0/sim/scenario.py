@@ -1,5 +1,6 @@
 """The seeded roster and schedules: the one place to tweak the story."""
 
+import math
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -657,6 +658,42 @@ WEAR = (Wear(0.1e-6, 10e-6, 0.005, 0.05),
         Wear(2e-6, 20e-6, 0.02, 0.5),
         Wear(2e-6, 20e-6, 0.02, 0.5, spall=(2, 1)))   # one per line
 SPALL_M = (1.5e-3, 20e-6)            # length along the ball's surface, depth
+
+
+# -- arm: an Odense warehouse cell. Cell ENU metres; a UR10e-class arm moves a stack between pallets --
+
+ARM_VENUE = FacilitySpec("Odense cell", "ODC", EARTH, 55.3676, 10.4978)   # an unnamed industrial parcel (OSM way 452316512)
+ARM_NAME = "ARM-1"
+ARM_START = datetime(2026, 9, 3, 6)  # 08:00 CEST
+ARM_HZ = 125                         # links and carried boxes during the episode (the RTDE rate); else hourly
+ARM_TIMESCALE = "TAI"
+PEDESTAL_M = 0.6                     # the arm's base frame sits on it, over the cell origin
+# UR10e standard DH: joint i turns about z of DH frame i-1.
+DH_D = (0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655)
+DH_A = (0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0)
+DH_ALPHA = (math.pi / 2, 0.0, 0.0, math.pi / 2, -math.pi / 2, 0.0)
+LINK_MASS_KG = (7.369, 13.051, 3.989, 2.1, 1.98, 0.615)
+LINK_DIMENSIONS_M = ((0.18, 0.18, 0.2), (0.7, 0.15, 0.15), (0.65, 0.12, 0.12),
+                     (0.12, 0.12, 0.12), (0.12, 0.12, 0.12), (0.1, 0.1, 0.05))
+JOINT_SPEED = math.radians(90)       # joint transfers, every joint
+JOINT_ACCEL = math.radians(180)
+LINE_SPEED_M_S = 0.25                # vertical legs, straight
+LINE_ACCEL_M_S2 = 1.0
+DWELL_S = 0.3                        # the vacuum on, or off
+TOOL_M = 0.15                        # the vacuum gripper: flange to pad face (the tip)
+GRIPPER_DIMENSIONS_M = (0.25, 0.15, TOOL_M)
+GRIPPER_MASS_KG = 1.2
+BASE_DIMENSIONS_M = (0.25, 0.25, PEDESTAL_M)
+BASE_MASS_KG = 40.0
+PALLET_DIMENSIONS_M = (1.2, 0.8, 0.144)   # Euro pallet, on the floor
+PALLET_MASS_KG = 25.0
+PALLET_A_M = (0.0, 0.75, 0.0)
+PALLET_B_M = (0.0, -0.75, 0.0)       # turned 180° about up, so its slots mirror A's
+CELL_BOX_DIMENSIONS_M = (0.2, 0.3, 0.15)   # in the pallet frame
+CELL_BOX_MASS_KG = 4.0
+STACK = (4, 2, 3)                    # layers, rows along y, columns along x
+TRAVEL_CLEAR_M = 0.05                # a carried box's bottom clears both stacks by this
+PARK_M = (0.6, 0.0, 1.05)            # the tip when parked, cell ENU, pointing down
 
 
 def line_name(k: int) -> str:
