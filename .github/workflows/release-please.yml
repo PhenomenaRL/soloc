@@ -14,7 +14,7 @@ jobs:
     steps:
       # Keeps a "Release PR" open with the next version + changelog.
       # Merging that PR tags the release (e.g. v0.2.0) and creates a GitHub release.
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@v5
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
