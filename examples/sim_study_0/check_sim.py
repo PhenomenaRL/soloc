@@ -20,6 +20,7 @@ from sim.ephemeris import Ephemeris
 from sim.geo import EARTH, GCRF, ICRF, SUN, fixed_to_geodetic, geodetic_to_fixed
 from sim.land import CANALS, in_canal, in_rings, on_land
 from sim.models import regatta as rg
+from sim.models import factory as fm
 from sim.models import wildfire as wf
 from sim.models.robot import HULL_REACH_M
 from sim.models.sailboat import polar, wrap180
@@ -99,12 +100,13 @@ def main():
 
     world = roster(args.seed, client)
     body_by_id = {b.frame_id: b for b in sc.SNAPSHOT_BODIES}
-    g, w = world.regatta, world.wildfire
+    g, w, fac = world.regatta, world.wildfire, world.factory
     fleet_models = {"facilities": world.facilities, "spacecraft": world.spacecraft,
                     "probes": world.probes, "robots": world.robots, "crawlers": world.crawlers,
                     "cargo": world.cargo, "aircraft": world.aircraft, "ships": world.ships,
                     "regatta": [g.venue, g.rc, *g.boats, *g.buoys], "marks": g.marks,
-                    "wildfire": [w.venue, *w.crews], "fire": [*w.vertices, *w.trenches]}
+                    "wildfire": [w.venue, *w.crews], "fire": [*w.vertices, *w.trenches],
+                    "factory": [fac.plant, *fac.parts], "boxes": fac.boxes}
     by_id = {e.id: e for e in world.entities}
 
     d = Data(client)
@@ -128,13 +130,17 @@ def main():
     state_ids = set(id_bytes(state.column("entity_id")))
     members = {**{k: {e.id for e in v} for k, v in fleet_models.items()}, "bodies": set(body_by_id)}
     for name, ids in members.items():
-        if fleets[name] and name not in ("marks", "fire"):
+        if fleets[name] and name not in ("marks", "fire", "boxes"):
             got = len(state_ids & ids)
             check(f"current_state has all {len(ids)} {name}", got == len(ids), f"{got}")
     if fleets["marks"]:
         got = len(state_ids & members["marks"])
         check(f"current_state omits the {len(members['marks'])} marks, lifted at {utc(sc.seconds(sc.MARKS_LAID[1]))}",
               got == 0, f"{got} present")
+    if fleets["boxes"]:
+        got = len(state_ids & members["boxes"])
+        check(f"current_state omits the {len(members['boxes'])} boxes, all taken off the belts by "
+              f"{utc(sc.seconds(sc.RUNS[-1][1]))}", got == 0, f"{got} present")
     if fleets["fire"]:
         got = len(state_ids & fleets["fire"])
         check(f"current_state has every fire vertex and trench born ({len(fleets['fire'])} of a pool of "
@@ -161,11 +167,14 @@ def main():
     for i in present:
         if getattr(by_id.get(i), "dynamic", False):
             continue                     # born and stopped by the run; checked with the wildfire
-        if i in body_by_id:
+        if hasattr(by_id.get(i), "epochs_ns"):  # sub-tick rows: compare to the nanosecond
+            expected, got = by_id[i].epochs_ns(), np.sort(d.t_ns[d.index[i]] - d.t0_ns)
+        elif i in body_by_id:
             expected = np.arange(0, sc.DURATION_S + 1, sc.SNAPSHOT_S)
+            got = np.sort(d.t_s[d.index[i]])
         else:
             expected = np.array([t for t in grid if by_id[i].due(t)])
-        got = np.sort(d.t_s[d.index[i]])
+            got = np.sort(d.t_s[d.index[i]])
         if len(got) != len(expected):
             wrong_count.append(i)
         elif np.any(got != expected):
@@ -205,6 +214,8 @@ def main():
         check_regatta(d, g)
     if fleets["wildfire"]:
         check_wildfire(d, w)
+    if fleets["factory"]:
+        check_factory(d, fac)
 
     print(f"\n{results.count(True)}/{len(results)} passed")
     sys.exit(0 if all(results) else 1)
@@ -386,14 +397,14 @@ def check_wildfire(d: Data, w):
 
     # Trenches as (born, a, b), from their stored centre, yaw and length.
     lines = []
-    for tr in w.trenches:
-        if tr.id not in d.index:
-            continue
-        k = d.index[tr.id]
-        sub = d.rows.take(pa.array(k))
-        q = sts_field(sub, "quaternion").flatten().to_numpy().reshape(-1, 4)
+    ks = [d.index[tr.id] for tr in w.trenches if tr.id in d.index]
+    sub = d.rows.take(pa.array(np.concatenate(ks)))         # one take: it costs ~1 s on the whole ledger
+    q_all = sts_field(sub, "quaternion").flatten().to_numpy().reshape(-1, 4)
+    dims_all = np.array(sub.column("dimensions").to_pylist())
+    starts = np.cumsum([0] + [len(k) for k in ks])
+    for k, lo, hi in zip(ks, starts[:-1], starts[1:]):
+        q, dims = q_all[lo:hi], dims_all[lo:hi]
         yaw = 2 * np.arctan2(q[:, 3], q[:, 0])
-        dims = np.array(sub.column("dimensions").to_pylist())
         if np.ptp(d.pos[k], axis=0).max() > 0 or np.ptp(yaw) > 0 or np.ptp(dims, axis=0).max() > 0:
             lines.append(None)
             continue
@@ -441,10 +452,12 @@ def check_wildfire(d: Data, w):
     # Crews: never in burnt ground, never within SAFE_M of a moving vertex, at most walking pace.
     near_min, inside = math.inf, 0
     k = np.concatenate([d.of(c.id, wf.IGNITION_S) for c in w.crews])
+    k = k[np.argsort(d.t_s[k], kind="stable")]
     v = d.rows.take(pa.array(k)).column("velocity").combine_chunks().flatten().to_numpy().reshape(-1, 3)
     fast = float(np.linalg.norm(v[:, :2], axis=1).max())
-    for t in np.unique(d.t_s[k]):
-        at = d.pos[k[d.t_s[k] == t], :2]
+    ticks, first, count = np.unique(d.t_s[k], return_index=True, return_counts=True)
+    for t, lo, n in zip(ticks, first, count):
+        at = d.pos[k[lo:lo + n], :2]
         ring = rep.ring_at(t)
         moving = [n for n in ring if rep.moving(n, t)]
         if moving:
@@ -461,6 +474,94 @@ def check_wildfire(d: Data, w):
     check("replayed from the ledger, the fire is contained (every vertex stopped)", math.isfinite(end),
           (f"at {utc(end)}, {timedelta(seconds=round(end - wf.IGNITION_S))} after ignition" if math.isfinite(end)
            else "still spreading at the window's end") + f", {area:.1f} ha, {len(ring)} vertices")
+
+
+# -- factory ----------------------------------------------------------------------------------
+
+
+def check_factory(d: Data, fac):
+    parts = [p for p in fac.parts if p.id in d.index]
+    wrong = sum(int((~matches(d.frames[d.index[p.id]], p.parent_id)).sum()) for p in parts)
+    for b in fac.boxes:
+        k = d.of(b.id)
+        on_c = matches(d.frames[k], b.c_id)
+        wrong += int((~(on_c | matches(d.frames[k], b.b_id))).sum()) + int(on_c.sum() != 1)
+    chain, p = 0, next(p for p in parts if "BALL" in p.name)
+    by_id = {q.id: q for q in parts}
+    while p is not None:
+        chain, p = chain + 1, by_id.get(p.parent_id)
+    check(f"factory rows framed on their parts' parents ({chain + 1} hops from a ball to IAU_EARTH)",
+          wrong == 0, f"{len(parts)} parts, {len(fac.boxes)} boxes, {wrong} rows off")
+
+    # Static parts hold their pose; rotating parts turn by exactly spin × the shaft's angle, with
+    # angular_velocity = spin × its speed.
+    moved, spin_err, w_err, worst_step = 0, 0.0, 0.0, 0.0
+    ks = [d.index[p.id][np.argsort(d.t_ns[d.index[p.id]])] for p in parts]
+    sub = d.rows.take(pa.array(np.concatenate(ks)))        # one take: it costs ~1 s on the whole ledger
+    q_all = sts_field(sub, "quaternion").flatten().to_numpy().reshape(-1, 4)
+    w_all = sub.column("angular_velocity").combine_chunks().flatten().to_numpy().reshape(-1, 3)
+    starts = np.cumsum([0] + [len(k) for k in ks])
+    for p, k, lo, hi in zip(parts, ks, starts[:-1], starts[1:]):
+        q, w = q_all[lo:hi], w_all[lo:hi]
+        moved += int(np.ptp(d.pos[k], axis=0).max() > 0)
+        if not p.rotating:
+            moved += int(np.ptp(q, axis=0).max() > 0)
+            continue
+        t = (d.t_ns[k] - d.t0_ns) / 1e9
+        want = p.spin * fm.angle(t)
+        got = 2 * np.arctan2(q[:, 1], q[:, 0])
+        spin_err = max(spin_err, float(np.abs(wrap180(np.degrees(got - want))).max()))
+        w_err = max(w_err, float(np.abs(w[:, 0] - p.spin * fm.omega(t)).max()))
+        burst = (t >= fm.BURST_S[0]) & (t < fm.BURST_S[1])
+        worst_step = max(worst_step, float(np.abs(np.diff(want[burst])).max(initial=0.0)))
+    check("rigid parts hold their pose; rotating parts turn by spin × the shaft's angle, with that spin in angular_velocity",
+          moved == 0 and spin_err <= 1e-6 and w_err <= 1e-12,
+          f"{moved} moved, max angle error {spin_err:.1e}°, max ω error {w_err:.1e} rad/s")
+    nyquist = math.pi
+    check(f"no aliasing in the {sc.BURST_HZ} Hz burst: every row-to-row turn well under half a turn",
+          worst_step < nyquist / 4,
+          f"fastest step {np.degrees(worst_step):.1f}° per {1000 // sc.BURST_HZ} ms (ball spin), "
+          f"limit {np.degrees(nyquist):.0f}°; at the {sc.PART_CADENCE_S} s cadence a ball turns "
+          f"{abs(fm.BALL_RATIO) * sc.SHAFT_HZ * sc.PART_CADENCE_S:.1f} turns between rows")
+
+    # Bearing geometry, resolved through the ledger: the rings fix the shaft axis, and every ball
+    # centre sits on the pitch circle, touching both raceways.
+    line = fac.lines[0]
+    rings = [b["outer"] for b in line["bearings"]]
+    r = d.resolve([d.index[o.id][0] for o in rings], EARTH.frame) * 1000          # m
+    axis = (r[1] - r[0]) / np.linalg.norm(r[1] - r[0])
+    burst_ns = d.t0_ns + fm.BURST_S[0] * 10**9 + np.array([0, 7, 13, 101]) * fm.SUB_NS
+    ks = [int(k) for bear in line["bearings"] for ball in bear["balls"]
+          for k in d.index[ball.id] if int(d.t_ns[k]) in set(burst_ns.tolist())]
+    balls = d.resolve(ks, EARTH.frame) * 1000
+    mid = (r[0] + r[1]) / 2
+    along = (balls - mid) @ axis
+    radial = np.linalg.norm((balls - mid) - along[:, None] * axis, axis=1)
+    pitch_err = float(np.abs(radial - sc.PITCH_D_M / 2).max())
+    axial_err = float(np.abs(np.abs(along) - sc.BEARING_X_M).max())
+    inner = radial - sc.BALL_D_M / 2 - (sc.PITCH_D_M - sc.BALL_D_M) / 2
+    check(f"bearing balls on the pitch circle, touching both raceways ({len(ks)} burst rows via {EARTH.frame}, "
+          f"{chain + 1} hops)", pitch_err <= 1e-5 and axial_err <= 1e-5,
+          f"radial error {pitch_err * 1e6:.2f} µm, axial {axial_err * 1e6:.2f} µm, raceway gap "
+          f"{np.abs(inner).max() * 1e6:.2f} µm")
+
+    # Boxes: on the belt at PULLEY_R × the shaft's turn since the spawn, then handed to Machine C.
+    err, fast, delivered = 0.0, 0.0, Counter()
+    for b in fac.boxes:
+        k = d.of(b.id)
+        k = k[np.argsort(d.t_s[k])]
+        on_b = matches(d.frames[k], b.b_id)
+        t = d.t_s[k[on_b]]
+        x = d.pos[k[on_b], 0]
+        err = max(err, float(np.abs(x - sc.PULLEY_R_M * (fm.angle(t) - fm.angle(b.spawn_s))).max()))
+        fast = max(fast, float(x.max()))
+        if matches(d.frames[k[-1:]], b.c_id).all() and d.t_s[k[-1]] == b.end_s:
+            delivered[b.name.rsplit("-BOX", 1)[0]] += 1
+    counts = {l["name"]: len(l["boxes"]) for l in fac.lines}
+    check("boxes ride the belt at the pulley's turn and every one is handed to Machine C",
+          err <= 1e-9 and fast <= sc.BELT_M and dict(delivered) == counts,
+          f"{sum(delivered.values())} of {sum(counts.values())} delivered "
+          f"({', '.join(f'{n} {c}' for n, c in delivered.items())}), max position error {err:.1e} m")
 
 
 # -- robots -----------------------------------------------------------------------------------
@@ -838,9 +939,11 @@ def check_topology(d: Data, world):
     for c in world.cargo:
         expected[(c.id, c.origin.id, c.ship.id, s_ns(c.t_board))] = "board"
         expected[(c.id, c.ship.id, c.destination.id, s_ns(c.t_off))] = "disembark"
+    for b in world.factory.boxes:
+        expected[(b.id, b.b_id, b.c_id, s_ns(b.end_s))] = "box handover"
     kinds = Counter(kind for e, kind in expected.items() if e[0] in d.index)
     expected = {e for e in expected if e[0] in d.index}
-    check("parent changes are exactly the launches, hand-offs, landings, boardings and disembarks",
+    check("parent changes are exactly the launches, hand-offs, landings, boardings, disembarks and box handovers",
           changes == expected,
           ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
           + ("" if changes == expected else

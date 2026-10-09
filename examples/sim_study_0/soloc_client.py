@@ -191,6 +191,7 @@ def registry_ipc(bindings: list[tuple[int, str, str]]) -> bytes:
 
 
 EXCHANGE_CHUNK_ROWS = 2048
+PUT_CHUNK_ROWS = 65536
 
 
 class SolocClient:
@@ -203,7 +204,8 @@ class SolocClient:
 
     def put(self, batch: pa.RecordBatch):
         writer, _ = self.flight.do_put(fl.FlightDescriptor.for_path("entities"), batch.schema)
-        writer.write_batch(batch)
+        # Chunked so no message nears the server's `max_message_size` (default 64 MiB).
+        writer.write_table(pa.Table.from_batches([batch]), max_chunksize=PUT_CHUNK_ROWS)
         writer.close()
 
     def action(self, name: str, body: dict | bytes | None = None) -> str:

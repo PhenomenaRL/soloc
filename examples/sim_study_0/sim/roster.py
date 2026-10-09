@@ -9,6 +9,7 @@ from sim import scenario as sc
 from sim.ephemeris import Ephemeris
 from sim.models.aircraft import aircraft
 from sim.models.facility import Facility
+from sim.models.factory import Factory
 from sim.models.probe import Probe
 from sim.models.regatta import Regatta
 from sim.models.wildfire import Wildfire
@@ -31,13 +32,14 @@ class Roster:
     ships: list[Track]
     regatta: Regatta
     wildfire: Wildfire
+    factory: Factory
 
     @property
     def entities(self) -> list:
         """Parents before their children, so a tick's rows are appended in that order."""
         return [*self.facilities, *self.spacecraft, *self.probes, *self.robots, *self.crawlers,
                 *self.cargo, *self.aircraft, *self.ships, *self.regatta.entities,
-                *self.wildfire.entities]
+                *self.wildfire.entities, *self.factory.entities]
 
     @property
     def arenas(self) -> list:
@@ -93,4 +95,4 @@ def roster(seed: int, client: SolocClient, regatta_policy: Callable | None = Non
 
     probes = [Probe(s, ephemeris) for s in sc.PROBES]
     return Roster(facilities, spacecraft, probes, robots, crawlers, cargo, planes, ships,
-                  Regatta(seed, regatta_policy), Wildfire(seed, wildfire_policy))
+                  Regatta(seed, regatta_policy), Wildfire(seed, wildfire_policy), Factory())

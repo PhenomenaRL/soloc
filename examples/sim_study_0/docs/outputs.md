@@ -19,11 +19,14 @@
 | `regatta_speed.png` | each boat's stored speed while sailing against the polar bound for the wind at its row, one panel per boat; drops are tacks, gybes and luffs |
 | `wildfire.png` | the fire's perimeter every 2 h over the fuel map, the finished line coloured by when each piece was finished, the crews' tracks and the ICP |
 | `wildfire_crews.png` | each crew's distance to the nearest spreading vertex over time, one panel per crew, against the 30 m rule and the 40 m escape distance |
+| `factory_boxes.png` | per line, boxes spawned and delivered over the shift, and the belt speed from the shaft's stored `angular_velocity` (start, break, stop) |
+| `factory_bearing.png` | the 20 Hz burst: the shaft's, a cage's and a ball's stored angles (unwrapped) against the analytic kinematics; and bearing 1's balls resolved through the ledger to IAU_EARTH, seen along the shaft |
+| `factory_bearing_analysis.png` | line 1 bearing 1: shaft/cage/ball speeds and their ratios, the defect frequencies (FTF, BPFO, BPFI, BSF), burst orientation with speed taken from the quaternion against the stored `angular_velocity`, and cumulative revolutions and ball passes |
 
 ## 3D viewer
 
 `python -m tools.export_viewer out/sim_study_0.arrow` turns a saved ledger into one standalone
-HTML file, `out/sim_study_0_3d.html` (~55 MB). The tracks, the body ephemerides, the Earth
+HTML file, `out/sim_study_0_3d.html` (~72 MB). The tracks, the body ephemerides, the Earth
 coastlines and three.js are inlined into `tools/viewer_template.html`, so the page opens offline by double-click
 in any WebGL browser. Building it needs a running server.
 
@@ -54,6 +57,15 @@ It is one scene, nested the way the ledger's frames are:
   - the wind arrows
 
   "Go to" puts the camera 2.5 km away. The crews show within 15 km.
+- **The Steyr plant:** shows the three lines' machines at true size and the boxes riding the
+  belts.
+  - **Parts:** every drive and bearing part is a model you can Follow, down to 2 cm from the
+    camera. The page composes each part through its stored parents (ball → cage → ring →
+    stator → B → line → plant) and turns it on by its row's `angular_velocity`. At 5 s rows a
+    ball would otherwise jump 11.6 turns.
+  - **Precision:** the scene graph holds positions to about 3 cm at solar-system scale, too
+    coarse for a 5 cm bearing. So the plant hangs off the scene root, placed against the camera
+    target each frame, which keeps its parts within 0.01 mm of where the ledger puts them.
 
 Body positions and orientations come from the server: a zero offset in each body frame is
 exchanged to ICRF at 5 min steps over the window. That is the same resolution the ledger does.
@@ -74,8 +86,8 @@ Every entity is a small model with its body axes (x red, y green, z blue) at its
 pose; models keep a constant size on screen. The controls:
 - a time slider with ticks at the launches, burns, hand-offs, touchdowns, boardings and
   disembarks, at Parker's perihelion, at the regatta's marks laid, warning, gun, first and last
-  finish and marks lifted, and at the wildfire's ignition, first orders, last line finished and
-  containment
+  finish and marks lifted, at the wildfire's ignition, first orders, last line finished and
+  containment, and at the factory's shift start, burst and shift end
 - play at 5 s/s up to 3 h/s
 - trails from 15 min to the whole track
 - labels, a hover readout (position in the entity's own frame), and a clickable legend that
@@ -115,7 +127,16 @@ to `out/snapshots/`. Each PNG has three panels:
 python -m tools.snapshot_sim out/sim_study_0.arrow --scenario regatta --at 2026-09-05T17:20:00
 python -m tools.snapshot_sim out/sim_study_0.arrow --scenario regatta --every 10m   # 13:00–18:00 ADT
 python -m tools.snapshot_sim out/sim_study_0.arrow --scenario wildfire --every 2h   # ignition to contained
+python -m tools.snapshot_sim out/sim_study_0.arrow --scenario factory --at 2026-09-02T06:00:16.350
 ```
+
+For the factory, the panels are:
+- the plant floor with the boxes on the belts
+- line 1's Machine B from the side, with its drive pulley
+- bearing 1 along the shaft: rings, the cage's balls and each ball's spin
+- the stats: boxes per line, belt speed, shaft, cage and ball rates
+
+`--at` takes fractional seconds, for instants inside the 20 Hz burst.
 
 For the wildfire, the panels are:
 - the fuel map, the burning area and the finished line

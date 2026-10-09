@@ -35,11 +35,12 @@ from sim import scenario as sc
 from sim.ephemeris import Ephemeris
 from sim.geo import EARTH, GCRF, ICRF, MARS, MOON, SUN, quat_from_matrix
 from sim.land import outlines
+from sim.models import factory as fm
 from sim.models import regatta as rg
 from sim.models import wildfire as wf
 from sim.roster import roster
 from sim.wind import read_table
-from tools.snapshot_sim import FireView, fuel_grid
+from tools.snapshot_sim import FireView, factory_rows, fuel_grid
 from tools.snapshot_sim import Rows as SnapRows
 from soloc_client import CENTURY_NS, SolocClient, astronomical, id_bytes, sts_field, tai_ns_from_utc
 from tools.view_sim import load
@@ -52,6 +53,10 @@ VENUE_REACH_KM = 12.0           # the camera distance under which the venue's bo
 VENUE_VIEW_KM = 4.0             # "Go to" distance
 FIRE_REACH_KM = 15.0
 FIRE_VIEW_KM = 2.5
+PLANT_REACH_KM = 0.5
+PLANT_VIEW_KM = 0.045
+PLANT_NEAR_KM = 2e-5                # a bearing is 5 cm across: let the camera come within 2 cm
+PLANT_FOLLOW_KM = 3e-4
 
 # (name, NAIF id, mean radius km, colour, draw orbit)
 BODIES = (
@@ -190,6 +195,64 @@ def wind_block(venue, wind_path: Path) -> dict:
     uv = np.column_stack([w["u"].to_numpy(), w["v"].to_numpy()])
     return {"t0": float(times[0]), "step": float(times[1] - times[0]), "n": len(times),
             "xy": b64(xy.ravel()), "uv": b64(uv.ravel())}
+
+
+PART_SHAPES = {"STATOR": "stator", "SHAFT": "shaft", "ROTOR": "rotor", "IR": "ring", "OR": "ring",
+               "CAGE": "ring", "BALL": "ball"}
+
+
+def factory_context(fac, table, ledger_rows: Rows, name) -> dict:
+    """The plant: machines and belts as its floor layout; the parts as tracks in their parents'
+    frames, which the page composes (ball → cage → ring → stator → B → line → plant) and turns on
+    by each row's spin; the boxes composed onto the plant floor here (their parents are static)."""
+    rows = factory_rows(fac, table)
+    order = {p.id: k for k, p in enumerate(fac.parts)}
+    first = lambda n: rows.index[n][0]
+
+    def to_plant(part) -> tuple[np.ndarray, np.ndarray]:
+        """A static part's pose on the plant floor, from its stored rows."""
+        r, p = np.eye(3), np.zeros(3)
+        chain = []
+        while part is not None:
+            chain.append(part)
+            part = next((q for q in fac.parts if q.id == part.parent_id), None)
+        for q in reversed(chain):
+            k = first(q.name)
+            p = p + r @ rows.pos3[k]
+            r = r @ quat_matrix(rows.quat[k])
+        return p, r
+
+    tracks, machines = [], []
+    for p in fac.parts:
+        k = rows.index[p.name]
+        k = k[np.isclose(rows.t_s[k] % sc.PART_CADENCE_S, 0) | np.isclose(rows.t_s[k] % sc.PART_CADENCE_S, sc.PART_CADENCE_S)]
+        shape = next((s for key, s in PART_SHAPES.items() if f"-{key}" in p.name), "none")
+        tr = track(name(p), "part", rows.t_s[k], rows.pos3[k], rows.quat[k], model=shape)
+        tr["parent"] = order.get(p.parent_id, -1)
+        if p.rotating:
+            tr["w"] = b64(rows.spin[k])
+        tracks.append(tr)
+    for line in fac.lines:
+        for key, m in line["machines"].items():
+            pos, r = to_plant(m)
+            lx, ly, lz = sc.MACHINE_DIMENSIONS_M[key]
+            centre = pos + r @ np.array([lx / 2 if key == "B" else 0.0, 0.0, lz / 2])
+            machines.append({"c": centre.tolist(), "s": [lx, ly, lz], "belt": key == "B"})
+        b_pos, b_r = to_plant(line["machines"]["B"])
+        c_pos, c_r = to_plant(line["machines"]["C"])
+        for b in line["boxes"]:
+            k = rows.index[b.name]
+            on_c = np.array([f == b.c_id for f in rows.frames[k]])
+            xyz = np.where(on_c[:, None], c_pos + rows.pos3[k] @ c_r.T, b_pos + rows.pos3[k] @ b_r.T)
+            tracks.append(track(name(b), "box", rows.t_s[k], xyz, np.tile([1.0, 0, 0, 0], (len(k), 1))))
+    pose = Pose(ledger_rows, fac.plant.id)
+    ys = [l["line"].offset[1] for l in fac.lines]
+    return {"id": fac.plant.spec.code.lower(), "kind": "site", "layout": "plant", "body": EARTH.name,
+            "name": name(fac.plant), "frame": f"{name(fac.plant)} ENU",
+            "p": pose.p_km.tolist(), "q": quat_from_matrix(pose.r),
+            "extent": [-6.0, sc.MACHINE_C_M[0] + 3, min(ys) - 4, max(ys) + 4], "machines": machines,
+            "reach": PLANT_REACH_KM, "view": PLANT_VIEW_KM, "near": PLANT_NEAR_KM, "follow": PLANT_FOLLOW_KM,
+            "tracks": tracks}
 
 
 def fire_context(w, table, rows: Rows, name, wind_path: Path, fuel_path: Path) -> tuple[dict, list]:
@@ -341,6 +404,12 @@ def main():
                                         args.path.with_name("fuel.arrow"))
         contexts.append(ctx)
         events += fire_events
+    fac = world.factory
+    if len(rows.of(fac.plant.id)):
+        contexts.append(factory_context(fac, ledger, rows, name))
+        events += [{"t": float(fm.SHIFT_S[0]), "label": "factory shift starts"},
+                   {"t": float(fm.BURST_S[0]), "label": f"factory {sc.BURST_HZ} Hz burst"},
+                   {"t": float(fm.SHIFT_S[1]), "label": "factory shift ends"}]
 
     for c in world.spacecraft:
         for key, label in EVENT_LABELS.items():

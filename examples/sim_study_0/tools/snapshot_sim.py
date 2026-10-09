@@ -8,6 +8,7 @@ drawn over the fuel map from `out/fuel.arrow`.
     python -m tools.snapshot_sim out/sim_study_0.arrow --scenario regatta --at 2026-09-05T17:20:00
     python -m tools.snapshot_sim out/sim_study_0.arrow --scenario regatta --every 10m
     python -m tools.snapshot_sim out/sim_study_0.arrow --scenario wildfire --every 2h
+    python -m tools.snapshot_sim out/sim_study_0.arrow --scenario factory --at 2026-09-02T06:00:01.350
 """
 
 import argparse
@@ -24,6 +25,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from sim import scenario as sc
+from sim.models import factory as fm
 from sim.models import regatta as rg
 from sim.models import wildfire as wf
 from sim.wind import read_table
@@ -36,19 +38,30 @@ ADT = timedelta(hours=-3)
 
 
 class Rows:
-    """The rows framed on one venue, as arrays, with each entity's rows in time order."""
+    """The rows framed on a venue (or on any of a set of frames), as arrays, with each entity's
+    rows in time order."""
 
-    def __init__(self, table: pa.Table, names: dict[bytes, str], venue_id: bytes, t0_ns: int):
-        table = table.filter(pa.array(matches(id_bytes(sts_field(table, "frame_id")), venue_id)))
+    def __init__(self, table: pa.Table, names: dict[bytes, str], venue_id: bytes | set, t0_ns: int):
+        frames = id_bytes(sts_field(table, "frame_id"))
+        if isinstance(venue_id, bytes):
+            keep = matches(frames, venue_id)
+        else:
+            keep = np.fromiter((f in venue_id for f in frames), bool, len(frames))
+        self.table = table = table.filter(pa.array(keep))
         t_ns = (sts_field(table, "duration_centuries").to_numpy().astype(np.int64) * CENTURY_NS
                 + sts_field(table, "duration_ns").to_numpy().astype(np.int64))
         self.t_s = (t_ns - t0_ns) / 1e9
         self.names = np.array([names.get(i, i.hex()) for i in id_bytes(table.column("entity_id"))])
-        self.pos = positions(table)[:, :2]
+        self.pos3 = positions(table)
+        self.pos = self.pos3[:, :2]
         q = sts_field(table, "quaternion").flatten().to_numpy().reshape(-1, 4)
         self.heading = (90 - np.degrees(2 * np.arctan2(q[:, 3], q[:, 0]))) % 360
         v = table.column("velocity").combine_chunks().flatten().to_numpy().reshape(-1, 3)
         self.speed = np.hypot(v[:, 0], v[:, 1])
+        self.spin = np.array([w[0] if w else 0.0 for w in table.column("angular_velocity").to_pylist()])
+        self.turn = 2 * np.arctan2(q[:, 1], q[:, 0])              # about x, for parts that spin
+        self.quat = q
+        self.frames = np.array(frames, dtype=object)[keep]
         self.length = np.array([d[0] if d else np.nan for d in table.column("dimensions").to_pylist()])
         self.index = {}
         for n in np.unique(self.names):
@@ -282,6 +295,116 @@ def draw_wildfire(w: wf.Wildfire, rows: Rows, fire: FireView, fuel: np.ndarray, 
     return path
 
 
+CEST = timedelta(hours=2)
+
+
+def factory_rows(fac: fm.Factory, table: pa.Table) -> Rows:
+    """Every row framed on the plant or on one of its parts."""
+    return Rows(table, fac.names, {fac.plant.id, *(p.id for p in fac.parts)}, tai_ns_from_utc(sc.T0))
+
+
+def turn_at(rows: Rows, name: str, t_s: float) -> float:
+    """A spinning part's angle about its x at `t_s`: its latest row's, carried on by its spin."""
+    k = rows.upto(name, t_s)[-1]
+    return float(rows.turn[k] + rows.spin[k] * (t_s - rows.t_s[k]))
+
+
+def boxes_at(fac: fm.Factory, rows: Rows, line: dict, t_s: float) -> tuple[list[float], int, int]:
+    """Belt positions of the boxes on the line's belt at `t_s`, and how many were spawned and
+    delivered by then."""
+    on, spawned, delivered = [], 0, 0
+    for b in line["boxes"]:
+        if b.spawn_s > t_s:
+            break
+        spawned += 1
+        k = rows.upto(b.name, t_s)
+        if len(k) and rows.frames[k[-1]] == b.c_id:
+            delivered += 1
+        elif len(k):
+            on.append(float(rows.pos[k[-1], 0]))
+    return on, spawned, delivered
+
+
+def draw_bearing(ax, rows: Rows, line: dict, t_s: float):
+    """Bearing 1 of a line seen along the shaft, in mm: rings, the cage's pitch circle and the
+    balls at the cage's angle, each with a tick showing its own spin."""
+    bear = line["bearings"][0]
+    r_o, r_i = (sc.PITCH_D_M + sc.BALL_D_M) / 2 * 1000, (sc.PITCH_D_M - sc.BALL_D_M) / 2 * 1000
+    for r, style_ in ((sc.RING_DIMENSIONS_M["outer"][1] / 2 * 1000, "-"), (r_o, "-"), (r_i, "-"),
+                      (sc.RING_DIMENSIONS_M["inner"][1] / 2 * 1000 - 3, "-"), (sc.PITCH_D_M / 2 * 1000, ":")):
+        ax.add_patch(plt.Circle((0, 0), r, fill=False, linestyle=style_, color=INK_MUTED, linewidth=0.8))
+    cage = turn_at(rows, bear["cage"].name, t_s)
+    shaft = turn_at(rows, line["shaft"].name, t_s)
+    ax.plot([0, r_i * np.cos(shaft)], [0, r_i * np.sin(shaft)], color=MARK, linewidth=1.2)
+    for i, ball in enumerate(bear["balls"]):
+        beta = cage + 2 * np.pi * i / sc.BALLS
+        c = sc.PITCH_D_M / 2 * 1000 * np.array([np.cos(beta), np.sin(beta)])
+        ax.add_patch(plt.Circle(c, sc.BALL_D_M / 2 * 1000, color=TRACK, alpha=0.8))
+        spin = beta + turn_at(rows, ball.name, t_s)
+        ax.plot(*np.column_stack([c, c + sc.BALL_D_M / 2 * 1000 * np.array([np.cos(spin), np.sin(spin)])]),
+                color="#ffffff", linewidth=1.0)
+    ax.set_xlim(-30, 30)
+    ax.set_ylim(-30, 30)
+    ax.set_aspect("equal")
+    style(ax)
+    ax.set_title(f"{line['name']} bearing 1 along the shaft (mm): shaft mark orange, ball spin ticks white", fontsize=8)
+
+
+def draw_factory(fac: fm.Factory, rows: Rows, t_s: float, out_dir: Path) -> Path:
+    fig = plt.figure(figsize=(17, 6.5), layout="constrained")
+    grid = fig.add_gridspec(2, 3, width_ratios=[1.2, 1.2, 0.9])
+    floor, side, bearing, panel = (fig.add_subplot(grid[:, 0]), fig.add_subplot(grid[0, 1]),
+                                   fig.add_subplot(grid[1, 1]), fig.add_subplot(grid[:, 2]))
+    stats = []
+    for k, line in enumerate(fac.lines):
+        y0 = k * sc.LINE_SPACING_M
+        for key, (x, y, _) in (("A", sc.MACHINE_A_M), ("B", sc.MACHINE_B_M), ("C", sc.MACHINE_C_M)):
+            lx, ly, _ = sc.MACHINE_DIMENSIONS_M[key]
+            x0 = x if key == "B" else x - lx / 2
+            floor.add_patch(plt.Rectangle((x0, y0 + y - ly / 2), lx, ly, color="#d9d8d2" if key == "B" else "#bcbab2"))
+            floor.annotate(key, (x0 + lx / 2, y0 + ly / 2 + 0.2), ha="center", fontsize=7, color="#3d3c37")
+        on, spawned, delivered = boxes_at(fac, rows, line, t_s)
+        floor.plot(on, [y0] * len(on), "s", color=TRACK, markersize=6)
+        floor.annotate(line["name"], (-3.5, y0), fontsize=8, ha="right", va="center")
+        w = rows.spin[rows.upto(line["shaft"].name, t_s)[-1]]
+        stats.append((line["name"], spawned, delivered, len(on), w))
+        if k == 0:
+            side.add_patch(plt.Rectangle((0, 0), sc.BELT_M, sc.BELT_TOP_M, color="#d9d8d2"))
+            side.plot(on, [sc.BELT_TOP_M + sc.BOX_DIMENSIONS_M[2] / 2] * len(on), "s", color=TRACK, markersize=9)
+            a = turn_at(rows, line["shaft"].name, t_s)
+            side.add_patch(plt.Circle((sc.BELT_M, sc.BELT_TOP_M - sc.PULLEY_R_M), sc.PULLEY_R_M, fill=False, color="#3d3c37"))
+            side.plot([sc.BELT_M, sc.BELT_M + sc.PULLEY_R_M * np.cos(a)],
+                      [sc.BELT_TOP_M - sc.PULLEY_R_M, sc.BELT_TOP_M - sc.PULLEY_R_M + sc.PULLEY_R_M * np.sin(a)], color=MARK)
+            side.set_xlim(-0.5, sc.BELT_M + 0.8)
+            side.set_ylim(0, 1.6)
+            side.set_aspect("equal")
+            style(side)
+            side.set_title(f"{line['name']} Machine B from the side (m): boxes on the belt, drive pulley", fontsize=8)
+            draw_bearing(bearing, rows, line, t_s)
+    floor.set_xlim(-6, sc.MACHINE_C_M[0] + 2)
+    floor.set_ylim(-3, (sc.LINES - 1) * sc.LINE_SPACING_M + 3)
+    floor.set_aspect("equal")
+    style(floor)
+    floor.set_title(f"{fac.plant.name} floor, plant ENU (m): machines A → B (belt) → C, boxes ■", fontsize=9)
+
+    when = sc.T0 + timedelta(seconds=t_s)
+    burst = fm.BURST_S[0] <= t_s < fm.BURST_S[1]
+    lines = [f"{when:%Y-%m-%d %H:%M:%S.%f}"[:-3] + " UTC", f"{when + CEST:%H:%M:%S.%f}"[:-3] + " CEST", "",
+             f"rows: {'20 Hz burst' if burst else ('every 5 s' if fm.in_shift(t_s) else 'hourly (at rest)')}", "",
+             "line     spawned  delivered  on belt"]
+    lines += [f"{n:8s} {s:7d} {d:10d} {o:8d}" for n, s, d, o, _ in stats]
+    w = stats[0][4]
+    lines += ["", f"shaft   {w / (2 * np.pi) * 60:7.1f} rpm", f"belt    {w * sc.PULLEY_R_M:7.3f} m/s",
+              f"cage    {w * fm.CAGE_RATIO / (2 * np.pi) * 60:7.1f} rpm",
+              f"ball    {abs(w * fm.BALL_RATIO) / (2 * np.pi) * 60:7.1f} rpm spin"]
+    panel.axis("off")
+    panel.text(0, 1, "\n".join(lines), va="top", family="monospace", fontsize=8)
+    path = out_dir / f"factory_{when:%Y%m%dT%H%M%S}{f'.{when.microsecond // 1000:03d}' if when.microsecond else ''}.png"
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+    return path
+
+
 def parse_every(text: str) -> int:
     m = re.fullmatch(r"(\d+)([smh]?)", text)
     if not m:
@@ -289,7 +412,8 @@ def parse_every(text: str) -> int:
     return int(m[1]) * {"": 1, "s": 1, "m": 60, "h": 3600}[m[2]]
 
 
-SCENARIOS = {"regatta": (rg.ON_S, rg.OFF_S), "wildfire": (wf.IGNITION_S, None)}
+SCENARIOS = {"regatta": (rg.ON_S, rg.OFF_S), "wildfire": (wf.IGNITION_S, None),
+             "factory": (fm.SHIFT_S[0] - 60, fm.SHIFT_S[1] + 60)}
 
 
 def main():
@@ -315,6 +439,11 @@ def main():
         rows = Rows(table, names, g.venue.id, t0_ns)
         draw = lambda t_s: draw_regatta(g, rows, wind, t_s, out_dir)
         on, off = SCENARIOS["regatta"]
+    elif args.scenario == "factory":
+        fac = fm.Factory()
+        rows = factory_rows(fac, table)
+        draw = lambda t_s: draw_factory(fac, rows, t_s, out_dir)
+        on, off = SCENARIOS["factory"]
     else:
         w = wf.Wildfire(sc.SEED)
         rows = Rows(table, names, w.venue.id, t0_ns)
@@ -322,7 +451,7 @@ def main():
         fuel = fuel_grid(path.with_name("fuel.arrow"), w.venue)
         draw = lambda t_s: draw_wildfire(w, rows, fire, fuel, wind, t_s, out_dir)
         on, off = wf.IGNITION_S, int(min(fire.end, sc.DURATION_S))
-    times = [sc.seconds(args.at)] if args.at else range(on, off + 1, args.every)
+    times = [(args.at - sc.T0).total_seconds()] if args.at else range(on, off + 1, args.every)
     for t_s in times:
         print(draw(t_s))
 

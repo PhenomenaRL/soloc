@@ -31,7 +31,7 @@ was recorded under a small `memory_limit` or the server's limit evicted part of 
 | Parker Solar Probe | the stored rows equal the Horizons table; its distance from the Sun agrees with the Sun's snapshot rows; perihelion falls inside the window at 9.8–9.9 solar radii |
 | crawlers | on the hull in the stored frame, and within hull reach of the host once both are resolved to the host's frame |
 | disembark | the crawler is framed on the facility afterwards, at ground level inside the site |
-| topology | the parent changes are exactly the 10 that the models' phases predict |
+| topology | the parent changes are exactly the 1,360 that the models predict: the 10 vehicle phase changes and 1,350 box handovers |
 | aircraft | every row between the lowest field and cruise altitude; at rest only on an airfield; 900 km/h (±1%) ground speed at cruise altitude |
 | ships | at sea level; 22-40 km/h (±1%) under way; at rest only at a berth; every row on water |
 | regatta frame | every boat, mark and buoy row is framed on the venue at z = 0, and sits on water (`scenario.BASIN_WATER`); 6 boat rows resolved to IAU_EARTH land on the venue's ENU plane |
@@ -45,6 +45,15 @@ was recorded under a small `memory_limit` or the server's limit evicted part of 
 | spread | every step of a spreading vertex is no faster than the head rate for the wind and fuel where it started, and none crosses a trench finished before it |
 | crew safety | no crew row inside the burnt perimeter or within 30 m of a spreading vertex; no crew faster than 1.2 m/s |
 | contained | replayed from the ledger, every vertex has stopped by the window's end |
+| factory frames | every part row is framed on its designed parent; every box is on Machine B, then on Machine C for its last row |
+| part kinematics | static parts never move; rotating parts' quaternions turn by spin × the shaft's angle (to 1e-6°), with spin × the shaft's speed in `angular_velocity` |
+| no aliasing | in the 20 Hz burst, no part turns more than a quarter of the half-turn limit between rows (the balls turn 42°) |
+| bearing geometry | 64 burst ball rows resolved through 7 frames to IAU_EARTH sit on the pitch circle at ±0.15 m along the shaft axis (fixed by the outer rings), so they touch both raceways (µm) |
+| boxes | every box sits at the pulley's turn × 0.1 m along the belt and is handed to Machine C: 450 per line |
+| roster (factory) | `current_state` holds the 88 plant parts and none of the 1,350 boxes, which were all off the belts by 14:00 CEST |
+
+Rotating factory parts have rows at sub-second epochs in the burst, so their schedule is checked
+to the nanosecond against `Part.epochs_ns`.
 
 Resolving rows through the ledger at historical epochs scans for the parent's pose once per
 `(frame, epoch)`. The resolution checks therefore run on a few epochs, and the per-row checks

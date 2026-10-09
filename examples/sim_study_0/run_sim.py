@@ -25,6 +25,8 @@ class Sim:
         self.client = client
         self.world = roster(seed, client, regatta_policy, wildfire_policy)
         self.entities = self.world.entities
+        # An entity with `samples(t_s) -> [(offset_ns, row)]` may report several rows per tick.
+        self.sub = [getattr(e, "samples", None) for e in self.entities]
         self.t0_ns = tai_ns_from_utc(sc.T0)
         self.buffer = client.buffer()
         self.batches = self.rows = self.snapshots = 0
@@ -41,13 +43,20 @@ class Sim:
         if t_s % sc.SNAPSHOT_S == 0:
             self.client.snapshot([b.frame_id for b in sc.SNAPSHOT_BODIES], tai_ns)
             self.snapshots += len(sc.SNAPSHOT_BODIES)
-        for e in self.entities:
-            row = e.sample(t_s)
-            if row is not None:
-                self.seen.add(e.id)
-                self.buffer.append(e.id, row.frame_id, row.position, row.quaternion, tai_ns,
-                                   units=row.units, timescale=row.timescale,
-                                   source_id=row.source_id, estimate=row.estimate, **row.optional)
+        for e, sub in zip(self.entities, self.sub):
+            if sub is None:
+                row = e.sample(t_s)
+                if row is not None:
+                    self.append(e, row, tai_ns)
+            else:
+                for offset_ns, row in sub(t_s):
+                    self.append(e, row, tai_ns + offset_ns)
+
+    def append(self, e, row, tai_ns: int):
+        self.seen.add(e.id)
+        self.buffer.append(e.id, row.frame_id, row.position, row.quaternion, tai_ns,
+                           units=row.units, timescale=row.timescale,
+                           source_id=row.source_id, estimate=row.estimate, **row.optional)
 
     def flush(self, t_s: int):
         n = len(self.buffer)
@@ -111,6 +120,7 @@ def main():
           f"in {time.monotonic() - started:.0f} s")
     for arena in sim.world.arenas:
         print(arena.result())
+    print(sim.world.factory.result())
 
 
 if __name__ == "__main__":

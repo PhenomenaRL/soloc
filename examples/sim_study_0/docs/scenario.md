@@ -6,14 +6,17 @@ appends), plus one before every arena decision tick. Each `do_put` is `Ledger::a
 checks on every batch), `append_snapshot` adds the celestial bodies from the kernels, and
 `save_ledger` is `Ledger::save_ipc`.
 
-A full run (~85 s) prints `265 entities, 1,361,302 entity rows + 484 snapshot rows` and a result
-line per arena. It writes these files:
+A full run (~140 s) prints `1703 entities, 2,383,724 entity rows + 484 snapshot rows` and a
+result line per arena and for the factory. It writes these files:
 - `out/sim_study_0.arrow`
 - its `out/sim_study_0.arrow.names.arrow` name registry
 - the `out/wind.arrow` and `out/fuel.arrow` side tables
 
 The wildfire's vertices and trenches come from fixed pools of 240 and 620 names, so the run
-registers 996 names; 131 of them get rows.
+registers 2,434 names; 1,703 of them get rows. The ledger holds about 1.2 GB in the server, of
+the 2 GB `memory_limit`, and the factory's 20 Hz burst accounts for 684,000 of its rows. Batches
+go to the server in chunks of 65,536 rows (`PUT_CHUNK_ROWS`), so the burst stays under the 64 MiB
+message limit.
 
 `sim/scenario.py` holds the roster and every schedule (times, orbits, airports, lanes); the
 models live in `sim/models/`.
@@ -40,18 +43,28 @@ models live in `sim/models/`.
 | 12 crews | Squamish Valley fire | m | GPST | 30 s from ignition (09-03 14:00 PDT), else 1 h | wait at the ICP 2 km down-valley; from 1 h after ignition walk and dig line (100 m/h) where the incident commander sends them |
 | fire vertices (90 of 240) | Squamish Valley fire | m | TAI | 1 min while spreading, then 10 min | the perimeter: 48 on a 20 m ignition circle, more born midway as the front stretches; each stops for good at finished line, the river, or burnt ground |
 | trenches (41 of 620) | Squamish Valley fire | m | TAI | 10 min once finished | one per 50 m of finished line: pose at the midpoint along the line, `dimensions` 50 × 1 × 0.5 m |
+| Steyr plant | IAU_EARTH | km | TAI | 1 h | the factory, a facility on an industrial parcel in Steyr, Upper Austria; 3 conveyor lines 15 m apart |
+| lines, machines A/B/C, stators, outer rings, rotors, inner rings | the plant, the line, Machine B, the stator, the shaft | m | TAI | 1 h | each part fixed in its parent's frame. Machine B is a 10 m belt; its gearmotor (the stator) sits at the drive pulley with its x along the pulley axle; two 6205-size bearings sit 0.15 m either side of the shaft's centre |
+| 3 shafts, 6 cages, 48 balls | the stator, an outer ring, a cage | m | TAI | 5 s in the shift (09-02 06:00–14:00 CEST), 20 Hz in the burst (08:00–08:10), else 1 h | the shaft turns at 60 rpm with 10 s ramps and a break 10:00–10:30. Each cage turns at 0.397 × the shaft (23.8 rpm), and each ball spins in its cage at −2.32 × the shaft (139 rpm): rolling-bearing kinematics, pure rolling, 0° contact. The quaternion turns about x, and the spin is in `angular_velocity` |
+| 1,350 boxes | Machine B, then Machine C | m | TAI | 5 s while on the belt | one spawned every 60 s per running line; it rides the 10 m belt at the pulley's turn × 0.1 m (0.63 m/s, 16 s) and its last row is on Machine C; 450 per line |
 | 4 bodies | ICRF | km | TAI | 1 h | `append_snapshot` of Sun, Earth, Moon, Mars |
 
-- **Frame tree.** The deepest chain is 3 hops: CRAWLER-04 rides the landed LUNA-1, which sits
-  on Shackleton Base, which sits on IAU_MOON. Astro frames are roots that the kernels resolve.
+- **Frame tree.** The deepest chain is 7 hops, a factory ball to IAU_EARTH; among the vehicles
+  it is 3, CRAWLER-04 riding the landed LUNA-1 on Shackleton Base on IAU_MOON. Astro frames are
+  roots that the kernels resolve.
   The bodies also appear as entities under ICRF; their ids are the IAU frames' ids, but frame
   resolution never reads those rows.
 - **Inertial roots.** Rows between bodies are stored in GCRF (Earth-centred) or ICRF (centred
   on the solar-system barycentre), both with J2000 axes. soloc has no Sun-centred inertial
   frame, so a Sun-centred path is stored as the Sun's barycentric position plus the
   heliocentric one.
-- **Parent changes.** Exactly 10: three launches, SELENE-1's two hand-offs between frames in
-  flight, two landings, CARGO-01 boarding, and two disembarks.
+- **Parent changes.** Exactly 1,360. There are 10 for vehicles: three launches, SELENE-1's two
+  hand-offs between frames in flight, two landings, CARGO-01 boarding, and two disembarks. The
+  other 1,350 are box handovers from Machine B to Machine C.
+- **The factory tree.** A ball resolves through 7 frames to IAU_EARTH: ball → cage → outer ring
+  → stator → Machine B → line → plant → IAU_EARTH. At the 5 s cadence a ball spins 11.6 turns
+  between rows, so its quaternion alone aliases the motion; `angular_velocity` carries the spin,
+  and the 20 Hz burst resolves it (at most 42° per row).
 - **Real data.** Parker Solar Probe's rows are Horizons' vectors as they come, with no
   interpolation. They carry `estimate_type` `ESTIMATED` and `source_id`
   `jpl.nasa.gov/horizons`. After 2026-06-17 Horizons serves the mission's reference
@@ -111,5 +124,8 @@ that already covers the window) after changing `T0` or `T_END`.
   points moving along their normals (Huygens), with no spotting, crowning, slope or burnout. A
   pocket of fuel left inside the line (here, the low-fuel corridor) keeps the fire "spreading"
   long after the line is closed, which is why containment takes ~20 h.
+- **The factory** is kinematics only: a rigid tree with no slip, clearance, load or wear, and
+  every line identical. The three lines run the same shift and produce the same 450 boxes. The
+  plant site is an unnamed industrial parcel on OpenStreetMap.
 - **The venue plane.** Regatta rows sit at z = 0 on the venue's ENU plane, which rises above the
   sea away from its origin: about 1.1 m at the docks, 3.8 km out.

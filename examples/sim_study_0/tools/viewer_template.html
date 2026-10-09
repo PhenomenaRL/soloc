@@ -126,6 +126,8 @@ const CATS = {
   marker:     { label: "Marks and met buoys", color: "#a8a79f" },
   crew:       { label: "Fire crews",          color: "#e9e8e2" },
   fire:       { label: "Fire perimeter",      color: "#e34948" },   // the status "critical" red: a hazard
+  box:        { label: "Boxes",               color: "#e9e8e2" },
+  part:       { label: "Drive and bearing parts", color: "#a8a79f" },
 };
 const FIRE_LINE = 0xd6d4cc;
 // How close the camera must be before a context's vehicles, trails and labels show.
@@ -241,7 +243,13 @@ function box(sx, sy, sz, mat, x = 0, y = 0, z = 0) { const m = new THREE.Mesh(ne
 function makeModel(cat, shape = cat) {
   const g = new THREE.Group(), mat = new THREE.MeshLambertMaterial({ color: CATS[cat].color });
   if (shape === "none") return g;                  // a fire vertex: only its place on the perimeter loop
-  if (shape === "crew") g.add(box(0.5, 0.5, 0.18, mat, 0, 0, 0.09), box(0.12, 0.12, 0.5, mat, 0.15, 0.15, 0.3));
+  if (shape === "ball") g.add(new THREE.Mesh(new THREE.SphereGeometry(0.3, 16, 12), mat), box(0.62, 0.04, 0.04, new THREE.MeshLambertMaterial({ color: "#3d3c37" })));
+  else if (shape === "ring") { const m = new THREE.Mesh(new THREE.TorusGeometry(0.45, 0.08, 8, 32), mat); m.rotation.y = Math.PI / 2; g.add(m, box(0.04, 0.9, 0.04, mat)); }
+  else if (shape === "shaft") g.add(box(1.0, 0.12, 0.12, mat), box(0.06, 0.4, 0.06, mat, 0.3));
+  else if (shape === "rotor") g.add(box(0.3, 0.7, 0.7, mat));
+  else if (shape === "stator") g.add(box(0.9, 0.5, 0.5, mat));
+  else if (shape === "box") g.add(box(0.6, 0.45, 0.45, mat, 0, 0, 0.22));
+  else if (shape === "crew") g.add(box(0.5, 0.5, 0.18, mat, 0, 0, 0.09), box(0.12, 0.12, 0.5, mat, 0.15, 0.15, 0.3));
   else if (shape === "sailboat") g.add(box(0.8, 0.26, 0.1, mat), box(0.03, 0.03, 1.1, mat, 0.08, 0, 0.55), box(0.42, 0.015, 0.85, mat, -0.14, 0, 0.55));
   else if (shape === "motorboat") g.add(box(0.95, 0.34, 0.14, mat), box(0.36, 0.26, 0.22, mat, -0.05, 0, 0.18));
   else if (shape === "mark") g.add(box(0.3, 0.3, 0.6, mat, 0, 0, 0.3));
@@ -270,6 +278,17 @@ function underlay(layers) {
 function buildVenueLayout(ctx) {
   const s = ctx.def, [e0, e1, n0, n1] = s.extent, grp = ctx.group, layers = [];
   const add = o => { grp.add(o); layers.push(o); return o; };
+  if (s.machines) {
+    // The plant floor, then its machines at true size (B's top is the belt), drawn as solids.
+    add(new THREE.Mesh(new THREE.PlaneGeometry(e1 - e0, n1 - n0), new THREE.MeshLambertMaterial({ color: "#26262b" })))
+      .position.set((e0 + e1) / 2, (n0 + n1) / 2, 0);
+    underlay(layers);
+    for (const m of s.machines) {
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(...m.s), new THREE.MeshLambertMaterial({ color: m.belt ? "#55555e" : "#6b6a63" }));
+      mesh.position.set(...m.c); grp.add(mesh);
+    }
+    return;
+  }
   if (s.fuel) {
     // Fuel as grey lightness by R0 factor (darker burns faster), the river (0) as water.
     const f = f32(s.fuel.f), cols = s.fuel.cols, rows = f.length / cols, px = new Uint8Array(f.length * 4);
@@ -359,7 +378,7 @@ function updateWind(ctx, T) {
   w.lines.geometry.attributes.position.needsUpdate = true;
 }
 function buildSiteLayout(ctx) {
-  if (ctx.def.layout === "venue") return buildVenueLayout(ctx);
+  if (ctx.def.layout === "venue" || ctx.def.layout === "plant") return buildVenueLayout(ctx);
   const s = ctx.def, W = s.half * 1.25, grp = ctx.group;
   const layers = [];
   const add = o => { grp.add(o); layers.push(o); return o; };
@@ -390,7 +409,10 @@ for (const c of DATA.contexts) {
     ctx.q = new THREE.Quaternion(c.q[1], c.q[2], c.q[3], c.q[0]);
     ctx.group.position.copy(ctx.p); ctx.group.quaternion.copy(ctx.q);
     ctx.group.scale.setScalar(1e-3);                 // site metres inside body-fixed km
-    body.fixed.add(ctx.group);
+    // A plant's parts are millimetres apart, finer than the scene graph holds at solar-system
+    // scale (~3 cm), so its group hangs off the scene root, placed against the target each frame.
+    ctx.anchored = c.layout === "plant";
+    (ctx.anchored ? scene : body.fixed).add(ctx.group);
     buildSiteLayout(ctx);
     // The facility itself: its ENU axes at the site origin.
     const e = { name: c.name, cat: "facility", ctx, static: true, model: makeModel("facility"), local: V(), active: true };
@@ -401,8 +423,10 @@ for (const c of DATA.contexts) {
   }
   for (const tr of c.tracks) {
     const e = { name: tr.name, cat: tr.cat, ctx, t: f32(tr.t), p: (tr.wide ? f64 : f32)(tr.p), q: f32(tr.q),
-                model: makeModel(tr.cat, tr.model), local: V(), active: false, quiet: tr.model === "none" };
-    if (e.quiet) {
+                model: makeModel(tr.cat, tr.model), local: V(), active: false, quiet: tr.model === "none",
+                parent: tr.parent, w: tr.w ? f32(tr.w) : null };
+    if (e.quiet || e.parent !== undefined) {
+      // A part in its parent's frame: the page composes its place, so no trail of its own.
       ctx.group.add(e.model);
     } else if (c.kind === "site") {
       e.line = trailLine(e.p, tr.cat); ctx.group.add(e.line, e.model);
@@ -466,13 +490,13 @@ function focusDist(f) {
   if (f.kind === "system") return 6e8;
   if (f.kind === "body") return f.body.radius * (f.body.name === "Sun" ? 6 : 4);
   if (f.kind === "site") return f.ctx.def.view || 0.5;
-  return f.entity.ctx.kind === "site" ? 0.06 : 900;
+  return f.entity.ctx.kind === "site" ? (f.entity.ctx.def.follow || 0.06) : 900;
 }
 function minDist() {
   const f = state.focus;
   if (f.kind === "body") return f.body.radius * 1.02;
   if (f.kind === "site") return 0.01;
-  if (f.kind === "entity") return f.entity.ctx.kind === "site" ? 0.003 : 0.05;
+  if (f.kind === "entity") return f.entity.ctx.kind === "site" ? (f.entity.ctx.def.near || 0.003) : 0.05;
   return 1e5;
 }
 function setFocus(f) {
@@ -504,9 +528,24 @@ function sample(e, T) {
   const f = j > i ? (T - e.t[i]) / (e.t[j] - e.t[i]) : 0, P = e.p, Q = e.q;
   e.local.set(P[3 * i] + f * (P[3 * j] - P[3 * i]), P[3 * i + 1] + f * (P[3 * j + 1] - P[3 * i + 1]), P[3 * i + 2] + f * (P[3 * j + 2] - P[3 * i + 2]));
   tq1.set(Q[4 * i + 1], Q[4 * i + 2], Q[4 * i + 3], Q[4 * i]); tq2.set(Q[4 * j + 1], Q[4 * j + 2], Q[4 * j + 3], Q[4 * j]);
-  e.model.quaternion.copy(tq1).slerp(tq2, f);
+  if (e.w) {
+    // Spinning parts: rows 5 s apart alias the turn, so carry the latest row on by its spin.
+    const a = e.w[i] * (T - e.t[i]);
+    e.model.quaternion.copy(tq1).multiply(tq2.set(Math.sin(a / 2), 0, 0, Math.cos(a / 2)));
+  } else e.model.quaternion.copy(tq1).slerp(tq2, f);
   e.seen = true;
   return true;
+}
+const cq = Qt(), cv = V();
+function compose(ctx) {
+  // Parts are stored in their parents' frames; parents come first, so each is placed in turn.
+  for (const e of ctx.tracks) {
+    if (e.parent === undefined || e.parent < 0 || !e.active) continue;
+    const p = ctx.tracks[e.parent];
+    cv.copy(e.local).applyQuaternion(p.model.quaternion).add(p.local);
+    e.local.copy(cv);
+    e.model.quaternion.premultiply(cq.copy(p.model.quaternion));
+  }
 }
 function trailRange(e, T) {
   const n = e.t.length, tr = state.trail;
@@ -527,6 +566,7 @@ function update() {
   const T = state.T;
   for (const b of bodies) bodyAt(b, T, b.pos, b.quat);
   for (const e of entities) if (!e.static) e.active = sample(e, T);
+  for (const ctx of contexts) if (ctx.def.layout === "plant") compose(ctx);
   const followed = state.focus;
   if (followed.kind === "entity") {
     const e = pickEntity(followed.name, followed.entity);
@@ -548,6 +588,15 @@ function update() {
 
   world.position.copy(target).negate();
   for (const b of bodies) { b.inertial.position.copy(b.pos); b.fixed.quaternion.copy(b.quat); }
+  for (const ctx of contexts) if (ctx.anchored) {
+    // Following one of its parts puts that part exactly on the target; otherwise the group sits
+    // where its origin is, which is only coarse when the camera is far off anyway.
+    const f = state.focus, g = ctx.group;
+    g.quaternion.copy(ctx.body.quat).multiply(ctx.q);
+    if (!fly && f.kind === "entity" && f.entity.ctx === ctx) g.position.copy(f.entity.local).multiplyScalar(-1e-3).applyQuaternion(g.quaternion);
+    else g.position.copy(icrfOf(ctx, V())).sub(target);
+    g.updateMatrixWorld(true);
+  }
   const c = Math.cos(ctl.el);
   camRel.set(c * Math.cos(ctl.az), c * Math.sin(ctl.az), Math.sin(ctl.el)).multiplyScalar(ctl.dist).applyQuaternion(basis);
   camera.position.copy(camRel);
@@ -577,9 +626,10 @@ function update() {
         for (const l of [e.line, e.lineInertial]) if (l) { l.geometry.setDrawRange(a, n); l.visible = !hidden && near && n > 1; }
       }
       e.icrf = e.active ? icrfOf(ctx, e.local) : null;
+      e.rel = ctx.anchored && e.active ? ctx.group.localToWorld(e.local.clone()) : null;   // from the target
       if (e.model.visible) {
         e.model.position.copy(e.local);
-        const d = tmp.copy(e.icrf).sub(target).sub(camRel).length();
+        const d = e.rel ? tmp.copy(e.rel).sub(camRel).length() : tmp.copy(e.icrf).sub(target).sub(camRel).length();
         e.model.scale.setScalar(d * kSize / (ctx.kind === "site" ? 1e-3 : 1));
       }
     }
@@ -643,7 +693,7 @@ function updateLabels() {
   for (const e of entities) {
     const el = labelFor(e, e.name, "");
     if (!state.labels || !e.model.visible || !e.icrf) { el.style.display = "none"; continue; }
-    place(el, rel.copy(e.icrf).sub(target), 10);
+    place(el, e.rel ? rel.copy(e.rel) : rel.copy(e.icrf).sub(target), 10);
   }
 }
 function hover(ev) {
@@ -651,7 +701,7 @@ function hover(ev) {
   let best = null, bestD = 14;
   for (const e of entities) {
     if (!e.model.visible || !e.icrf) continue;
-    rel.copy(e.icrf).sub(target);
+    if (e.rel) rel.copy(e.rel); else rel.copy(e.icrf).sub(target);
     if (occluded(rel)) continue;
     const s = screenOf(rel); if (!s) continue;
     const d = Math.hypot(s[0] - ev.clientX, s[1] - ev.clientY);
@@ -671,7 +721,10 @@ function updateWhere() {
     : `${f.entity.name} in ${f.entity.ctx.kind === "site" ? f.entity.ctx.name + " ENU" : f.entity.ctx.def.frame}`;
   $("where").textContent = "Viewing: " + frame + ". Distance " + fmtDist(ctl.dist) + ".";
 }
-function fmtDist(km) { return km >= 1e6 ? (km / 1.496e8).toFixed(3) + " AU" : km >= 1 ? Math.round(km).toLocaleString() + " km" : Math.round(km * 1000) + " m"; }
+function fmtDist(km) {
+  return km >= 1e6 ? (km / 1.496e8).toFixed(3) + " AU" : km >= 1 ? Math.round(km).toLocaleString() + " km"
+    : km >= 1e-3 ? Math.round(km * 1000) + " m" : km >= 1e-5 ? Math.round(km * 1e5) + " cm" : Math.round(km * 1e6) + " mm";
+}
 
 // ---- UI --------------------------------------------------------------------------------------
 $("src").textContent = DATA.source;

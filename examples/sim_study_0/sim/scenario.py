@@ -585,6 +585,55 @@ POWER_LINE = (
 )
 
 
+# -- factory: Steyr, Upper Austria. Plant ENU metres; three conveyor lines with bearing-level parts --
+
+FACTORY_VENUE = FacilitySpec("Steyr plant", "STY", EARTH, 48.0582, 14.4414)   # an unnamed industrial parcel
+LINES = 3
+LINE_SPACING_M = 15.0                # line k's origin sits at (0, k × this) on the plant floor
+RUNS = ((datetime(2026, 9, 2, 4), datetime(2026, 9, 2, 8)),      # 06:00–10:00 CEST
+        (datetime(2026, 9, 2, 8, 30), datetime(2026, 9, 2, 12)))  # 10:30–14:00 CEST
+RAMP_S = 10                          # linear start and stop
+BURST = (datetime(2026, 9, 2, 6), datetime(2026, 9, 2, 6, 10))   # 08:00–08:10 CEST
+BURST_HZ = 20
+PART_CADENCE_S = 5                   # rotating parts during the shift; 1 h outside it
+STATIC_CADENCE_S = 3600              # lines, machines, stator, rings, rotor
+PART_TIMESCALE = "TAI"
+BOX_TIMESCALE = "TAI"
+
+SHAFT_HZ = 1.0                       # the gearmotor's output shaft, which turns the drive pulley
+PULLEY_R_M = 0.1
+BELT_M = 10.0
+BELT_TOP_M = 0.9
+BOX_EVERY_S = 60                     # from the end of each start ramp
+BOX_CLEAR_S = 20                     # no box is spawned unless it is off the belt this long before the stop ramp
+BOX_MASS_KG = 5.0
+BOX_DIMENSIONS_M = (0.4, 0.3, 0.3)
+
+# Line frame (x along the belt): Machine A feeds the belt's start, C takes from its end.
+MACHINE_A_M = (-1.5, 0.0, 0.0)
+MACHINE_B_M = (0.0, 0.0, 0.0)        # the conveyor; its x runs along the belt from 0 to BELT_M
+MACHINE_C_M = (BELT_M + 1.5, 0.0, 0.0)
+MACHINE_DIMENSIONS_M = {"A": (2.0, 1.5, 1.8), "B": (BELT_M, 1.0, BELT_TOP_M), "C": (2.0, 1.5, 1.8)}
+BOX_ON_C_M = (-0.8, 0.0, BELT_TOP_M + BOX_DIMENSIONS_M[2] / 2)
+STATOR_ON_B_M = (BELT_M, -0.8, BELT_TOP_M)   # the gearmotor beside the drive pulley; its x is B's y
+STATOR_MASS_KG = 45.0
+STATOR_DIMENSIONS_M = (0.45, 0.25, 0.25)
+
+# 6205-size deep-groove ball bearings, two on the shaft at ±BEARING_X_M (0° contact angle).
+PITCH_D_M = 0.0385
+BALL_D_M = 0.00794
+BALLS = 8
+CONTACT_DEG = 0.0
+BEARING_X_M = 0.15
+RING_DIMENSIONS_M = {"inner": (0.015, 0.0306, 0.0306), "outer": (0.015, 0.052, 0.052)}   # width, Ø, Ø
+SHAFT_DIMENSIONS_M = (0.40, 0.025, 0.025)
+ROTOR_DIMENSIONS_M = (0.06, 0.12, 0.12)
+
+
+def line_name(k: int) -> str:
+    return f"STY-L{k + 1}"
+
+
 def crew_name(i: int) -> str:
     return f"CREW-{i + 1}"
 
