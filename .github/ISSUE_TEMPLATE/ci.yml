@@ -1,0 +1,28 @@
+name: CI / tooling
+description: Changes to CI, release automation, dev tooling or repo config
+labels: [ci]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What needs to change?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: The problem it solves, e.g. slow builds, flaky job, missing check.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - GitHub Actions workflows
+        - Release automation
+        - Dependabot
+        - Local dev tooling
+        - Other

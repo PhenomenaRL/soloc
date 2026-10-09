@@ -51,6 +51,11 @@
       "type": "chore",
       "section": "Chores",
       "hidden": true
+    },
+    {
+      "type": "exp",
+      "section": "Experiments",
+      "hidden": true
     }
   ],
   "packages": {

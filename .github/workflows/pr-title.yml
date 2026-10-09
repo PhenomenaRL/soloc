@@ -28,4 +28,5 @@ jobs:
             build
             ci
             chore
+            exp
           requireScope: false
