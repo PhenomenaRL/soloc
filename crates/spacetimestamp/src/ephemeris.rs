@@ -59,6 +59,9 @@ pub(crate) const ASTRO_FRAMES: &[(&str, i32, i32)] = &[
     ("GCRF", 399, 1),
     ("EME2000", 399, 1),
     ("EMB", 3, 1),
+    // Earth terrestrial frame, distinct from Earth / IAU_EARTH. ANISE uses BPC
+    // orientation id 3000 here, not the SPICE frame code 13000.
+    ("ITRF93", 399, 3000),
     // Planetary barycenters.
     ("MERCURY_BARYCENTER", 1, 1),
     ("VENUS_BARYCENTER", 2, 1),
@@ -763,6 +766,24 @@ mod tests {
         assert_eq!(frame_pair("ICRF"), Some((0, 1)));
         assert_eq!(frame_pair("icrf"), None, "names are byte-exact");
         assert_eq!(frame_pair("NOT_A_FRAME"), None);
+    }
+
+    #[test]
+    fn test_itrf93_identity_and_resolution() {
+        use anise::constants::frames::EARTH_ITRF93;
+
+        assert_eq!(frame_pair("ITRF93"), Some((399, 3000)));
+        assert_eq!(frame_name(399, 3000), Some("ITRF93"));
+        assert_eq!(resolve_astronomical_frame("ITRF93"), Some(EARTH_ITRF93));
+        let id = PrescribedId::astronomical_from_name("ITRF93").unwrap();
+        assert_eq!(id.astro_frame(), Some((399, 3000)));
+        assert_eq!(PrescribedId::from_bytes(id.as_bytes()).unwrap(), id);
+        assert_ne!(id, PrescribedId::astronomical_from_name("Earth").unwrap());
+        assert_eq!(frame_pair("Earth"), frame_pair("IAU_EARTH"));
+        assert!(
+            !recognised(399, 13000),
+            "SPICE frame code is not an ANISE orientation"
+        );
     }
 
     #[test]
