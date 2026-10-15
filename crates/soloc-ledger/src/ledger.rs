@@ -2494,6 +2494,40 @@ mod tests {
         assert_eq!(ledger.len(), 1);
     }
 
+    /// Storing GPS-frame observations and changing their units needs no Earth kernels.
+    #[test]
+    fn test_itrf93_storage_and_unit_conversion_need_no_kernels() {
+        let mut ledger = make_entity_ledger();
+        let itrf93 = PrescribedId::astronomical_from_name("ITRF93").unwrap();
+        let position_km = [4_000.0, -3_000.0, 2_000.0];
+        ledger
+            .append(make_entity_batch(
+                demo("gps-receiver"),
+                itrf93,
+                position_km,
+                [1.0, 0.0, 0.0, 0.0],
+                0,
+            ))
+            .unwrap();
+
+        let stored = ledger.current_state(None, None).unwrap();
+        assert_eq!(stored.num_rows(), 1);
+        let stored_cols = StsColumns::try_new(&stored).unwrap();
+        assert_eq!(stored_cols.frame_at(0).unwrap(), itrf93);
+        assert_eq!(stored_cols.position_at(0), position_km);
+
+        let converted = ledger
+            .transform(&stored, "ITRF93", LengthUnit::m, &Almanac::default())
+            .unwrap();
+        let converted_cols = StsColumns::try_new(&converted).unwrap();
+        assert_eq!(converted_cols.frame_at(0).unwrap(), itrf93);
+        assert_eq!(converted_cols.units_at(0).unwrap(), LengthUnit::m);
+        assert_eq!(
+            converted_cols.position_at(0),
+            position_km.map(|value| value * 1_000.0)
+        );
+    }
+
     // -----------------------------------------------------------------------
     // topology derivation, persistence, and federation tests
     // -----------------------------------------------------------------------
