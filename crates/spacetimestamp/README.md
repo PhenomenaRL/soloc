@@ -240,8 +240,66 @@ second and fractional nanoseconds. A later text/GPX parser must handle or reject
 `:60` explicitly. Existing TAI rows produced with the former UTC conversion bug cannot
 be identified or repaired automatically; rebuild affected rows from their original times.
 
-These are reusable position and time primitives. The full observation API, attitude
-policy, and GPX parsing remain subsequent implementation steps.
+## One GPS observation into the ledger
+
+`gps::gps_observation_to_batch(&fix, &options, &almanac)` converts one fix into a complete
+one-row `EntitySchema` batch, ready for `Ledger::append` or Flight `do_put`. It supplies
+the nested `spacetimestamp`, frame and provenance IDs, metre units, TAI epoch parts,
+position, and quaternion. All optional state and covariances remain null.
+
+```rust
+use anise::prelude::Almanac;
+use soloc_ledger::ledger::Ledger;
+use spacetimestamp::gps::{GpsObservation, GpsOptions, GpsOrientation, gps_observation_to_batch};
+use spacetimestamp::schemas::entity::EntitySchema;
+use spacetimestamp::PrescribedId;
+
+let fix = GpsObservation {
+    latitude_deg: 44.6488,
+    longitude_deg: -63.5752,
+    ellipsoidal_height_m: 12.0,
+    epoch: "2025-01-01T00:00:00 UTC".parse()?,
+    orientation: GpsOrientation::LocalEnu,
+};
+let options = GpsOptions::new(
+    PrescribedId::new("example.org", "vessel-1")?,
+    PrescribedId::abstract_source("example.org", "gps-receiver")?,
+);
+let batch = gps_observation_to_batch(&fix, &options, &Almanac::default())?;
+let mut ledger = Ledger::for_schema::<EntitySchema>()?;
+ledger.append(batch)?;
+let latest = ledger.current_state(None, None)?;
+```
+
+Reuse the same options/entity ID across successive fixes. `GpsOptions::new` selects
+approximate ITRF93 and `ESTIMATED`; its public fields allow another supported Earth
+frame and estimate type. The tracked entity must have a Soloc ID. Its source may be a
+Soloc receiver or abstract provenance ID, including the same Soloc ID for a self-report.
+
+Orientation is always an explicit choice:
+
+| Policy | Meaning |
+|---|---|
+| `GpsOrientation::LocalEnu` | Conventional east/north/up axes at the fix, not vehicle attitude. Requires `ESTIMATED` or `SIMULATED`; `MEASURED` returns an error because the schema's estimate type applies to the whole pose. At a pole, the supplied longitude selects east/north. |
+| `GpsOrientation::QuaternionInEnu([w, x, y, z])` | Caller-supplied rotation from entity axes into local ENU. Requires finite components and norm within `1e-6` of one; roundoff is normalized. `MEASURED` is appropriate only when both position and attitude were measured. |
+
+Both position and orientation use the same Earth rotation at the fix's epoch. A frame
+change never leaves the quaternion expressed in the previous axes. Height and epoch
+are required inputs; unknown elevation, vertical datum, or time must be resolved before
+conversion. The ordinary-tracking approximation and leap-second parsing limits above
+also apply to this API.
+
+For a batch of fixes, `gps::convert_gps_observation` returns a validated
+`ConvertedGpsObservation`. Its accessors expose pose fields for another schema, while
+`append_to(&mut EntityBuilder)` reuses an existing builder and `to_entity_batch()`
+produces a single row. Conversion finishes before any append, so errors cannot insert
+a partial observation. Private result fields preserve validation until it is appended.
+
+`GpsError` distinguishes invalid coordinates, identity, orientation, estimate policy,
+unrepresentable time, invalid frame, and transformation failures. Transform errors carry
+the target frame and epoch. A successful batch submitted to a ledger with a different
+schema receives the ledger's existing recoverable schema-mismatch error. GPX parsing
+and file-ingestion policies remain subsequent work.
 
 ## License
 

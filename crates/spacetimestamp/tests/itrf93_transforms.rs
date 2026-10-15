@@ -19,7 +19,10 @@ use hifitime::{Duration, TimeScale};
 use nalgebra::{Quaternion, UnitQuaternion, Vector3};
 
 use spacetimestamp::ephemeris::{epoch_from_parts, epoch_to_parts};
-use spacetimestamp::gps::wgs84_to_frame_m;
+use spacetimestamp::gps::{
+    GpsError, GpsObservation, GpsOptions, GpsOrientation, gps_observation_to_batch,
+    wgs84_to_frame_m,
+};
 use spacetimestamp::identity::PrescribedId;
 use spacetimestamp::schema::StsColumns;
 use spacetimestamp::schemas::entity::EntityBuilder;
@@ -373,5 +376,195 @@ fn gps_checks_actual_kernel_coverage_without_restricting_pure_ecef_conversion() 
             wgs84_to_frame_m(0.0, 0.0, 0.0, at, "ITRF93", &Almanac::default()).unwrap(),
             [6_378_137.0, 0.0, 0.0]
         );
+    }
+}
+
+#[test]
+#[ignore = "requires local .pca and Earth .bpc files in SOLOC_KERNEL_PATHS"]
+fn complete_gps_observations_agree_with_existing_batch_transforms_at_each_epoch() {
+    let almanac = local_almanac();
+    let entity = PrescribedId::new("gps-test", "receiver").unwrap();
+    let source = PrescribedId::abstract_source("gps-test", "receiver-fix").unwrap();
+    for year in [2020, 2025] {
+        let at = Epoch::from_gregorian_utc(year, 1, 1, 0, 0, 0, 123_456_789);
+        for orientation in [
+            GpsOrientation::LocalEnu,
+            GpsOrientation::QuaternionInEnu(QUATERNION),
+        ] {
+            let observation = GpsObservation {
+                latitude_deg: 43.65,
+                longitude_deg: -79.38,
+                ellipsoidal_height_m: 113.7,
+                epoch: at,
+                orientation,
+            };
+            let mut options = GpsOptions::new(entity, source);
+            let terrestrial =
+                gps_observation_to_batch(&observation, &options, &Almanac::default()).unwrap();
+            for target in ["IAU_EARTH", "Earth", "GCRF", "EME2000"] {
+                options.target_frame = target;
+                let direct = gps_observation_to_batch(&observation, &options, &almanac).unwrap();
+                let projected =
+                    transform_batch(&terrestrial, target, &almanac, LengthUnit::m, None).unwrap();
+                validate_spacetimestamp_batch(&direct).unwrap();
+                let actual = StsColumns::try_new(&direct).unwrap();
+                let expected = StsColumns::try_new(&projected).unwrap();
+                assert!(
+                    (Vector3::from(actual.position_at(0)) - Vector3::from(expected.position_at(0)))
+                        .norm()
+                        < 1e-6,
+                    "{target}, {at}"
+                );
+                assert!(
+                    quaternion(actual.quaternion_at(0))
+                        .angle_to(&quaternion(expected.quaternion_at(0)))
+                        < 1e-12,
+                    "{target}, {at}"
+                );
+                assert_eq!(
+                    actual.frame_at(0).unwrap(),
+                    PrescribedId::astronomical_from_name(target).unwrap()
+                );
+                assert_eq!(actual.units_at(0).unwrap(), LengthUnit::m);
+                assert_eq!(actual.timescale_at(0).unwrap(), TimeScaleCode::TAI);
+                assert_eq!(actual.source_at(0).unwrap(), source);
+                assert_eq!(actual.estimate_at(0).unwrap(), EstimateType::ESTIMATED);
+                assert_eq!(actual.epoch_parts_at(0), epoch_to_parts(at));
+                // The GPS adapter returns the complete entity schema expected by the
+                // transform pipeline, preserving its identity and optional state fields.
+                for (index, field) in direct.schema().fields().iter().enumerate() {
+                    if field.name() != "spacetimestamp" {
+                        assert_eq!(
+                            direct.column(index).to_data(),
+                            projected.column(index).to_data()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires local .pca and Earth .bpc files in SOLOC_KERNEL_PATHS"]
+fn gps_caller_attitude_composes_enu_and_target_rotation_in_the_correct_order() {
+    let almanac = local_almanac();
+    let at = Epoch::from_gregorian_utc_at_midnight(2025, 1, 1);
+    let observation = GpsObservation {
+        latitude_deg: 0.0,
+        longitude_deg: 0.0,
+        ellipsoidal_height_m: 0.0,
+        epoch: at,
+        // A 90-degree rotation about local Up sends entity X to North,
+        // entity Y to West, and entity Z to Up.
+        orientation: GpsOrientation::QuaternionInEnu([
+            std::f64::consts::FRAC_1_SQRT_2,
+            0.0,
+            0.0,
+            std::f64::consts::FRAC_1_SQRT_2,
+        ]),
+    };
+    let entity = PrescribedId::new("gps-test", "receiver").unwrap();
+    let source = PrescribedId::abstract_source("gps-test", "receiver-pose").unwrap();
+    let mut options = GpsOptions::new(entity, source);
+    options.estimate_type = EstimateType::MEASURED;
+    for (target, frame) in [
+        ("ITRF93", EARTH_ITRF93),
+        ("Earth", IAU_EARTH_FRAME),
+        ("GCRF", EARTH_J2000),
+    ] {
+        options.target_frame = target;
+        let result = gps_observation_to_batch(&observation, &options, &almanac).unwrap();
+        let columns = StsColumns::try_new(&result).unwrap();
+        assert_eq!(columns.estimate_at(0).unwrap(), EstimateType::MEASURED);
+        let actual = quaternion(columns.quaternion_at(0));
+        let target_rotation = almanac.rotate(EARTH_ITRF93, frame, at).unwrap();
+        // At latitude/longitude zero, North is ECEF +Z, West is -Y, Up is +X.
+        // These independent axis references detect inverse attitude or reversed
+        // quaternion composition even if both Soloc conversion paths share a bug.
+        for (entity_axis, ecef_axis) in [
+            (Vector3::x(), Vector3::z()),
+            (Vector3::y(), -Vector3::y()),
+            (Vector3::z(), Vector3::x()),
+        ] {
+            let expected = target_rotation.rot_mat * ecef_axis;
+            assert!((actual * entity_axis - expected).norm() < 1e-12, "{target}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires local .pca and Earth .bpc files in SOLOC_KERNEL_PATHS"]
+fn gps_observation_kernel_failures_retain_typed_frame_and_epoch_context() {
+    let almanac = local_almanac();
+    let entity = PrescribedId::new("gps-test", "receiver").unwrap();
+    let source = PrescribedId::abstract_source("gps-test", "receiver-fix").unwrap();
+    let mut options = GpsOptions::new(entity, source);
+    let mut observation = GpsObservation {
+        latitude_deg: 0.0,
+        longitude_deg: 0.0,
+        ellipsoidal_height_m: 0.0,
+        epoch: Epoch::from_gregorian_utc_at_midnight(2025, 1, 1),
+        orientation: GpsOrientation::LocalEnu,
+    };
+    let check_error = |error: GpsError, target: &str, at: Epoch, detail: &str| {
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains(target), "{diagnostic}");
+        assert!(diagnostic.contains(&at.to_string()), "{diagnostic}");
+        match error {
+            GpsError::Transform {
+                frame,
+                epoch,
+                message,
+            } => {
+                assert_eq!(frame, target);
+                assert_eq!(epoch, at);
+                assert!(!message.is_empty());
+                assert!(message.contains(detail), "{message}");
+            }
+            other => panic!("expected a typed transform failure, got {other:?}"),
+        }
+    };
+    let mut without_bpc = almanac.clone();
+    without_bpc.bpc_data.clear();
+    for target in ["IAU_EARTH", "GCRF"] {
+        options.target_frame = target;
+        check_error(
+            gps_observation_to_batch(&observation, &options, &without_bpc).unwrap_err(),
+            target,
+            observation.epoch,
+            "no Earth orientation BPC data for ITRF93",
+        );
+    }
+
+    let mut bpc_only = almanac.clone();
+    bpc_only.planetary_data.clear();
+    options.target_frame = "IAU_EARTH";
+    check_error(
+        gps_observation_to_batch(&observation, &options, &bpc_only).unwrap_err(),
+        "IAU_EARTH",
+        observation.epoch,
+        "",
+    );
+    options.target_frame = "GCRF";
+    assert!(gps_observation_to_batch(&observation, &options, &bpc_only).is_ok());
+
+    let (start, end) = almanac.bpc_domain(ITRF93).unwrap();
+    for at in [
+        start - Duration::from_seconds(1.0),
+        end + Duration::from_seconds(1.0),
+    ] {
+        observation.epoch = at;
+        for target in ["IAU_EARTH", "GCRF"] {
+            options.target_frame = target;
+            check_error(
+                gps_observation_to_batch(&observation, &options, &almanac).unwrap_err(),
+                target,
+                at,
+                "no loaded ITRF93 BPC segment covers this epoch",
+            );
+        }
+        options.target_frame = "ITRF93";
+        assert!(gps_observation_to_batch(&observation, &options, &Almanac::default()).is_ok());
     }
 }

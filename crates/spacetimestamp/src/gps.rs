@@ -10,17 +10,24 @@
 //! survey/RTK work: it applies no WGS84-realization, station-motion, or epoch-dependent
 //! datum correction and promises no sub-metre accuracy or fixed error bound.
 //!
-//! These helpers return positions, not measured attitudes or ledger-ready observations.
-//! Use [`crate::ephemeris::epoch_to_parts`] with [`crate::TimeScaleCode::TAI`] when
-//! encoding the same observation epoch into a row.
+//! [`gps_observation_to_batch`] builds a ledger-ready entity observation with explicit
+//! identity, provenance, and orientation policy. [`convert_gps_observation`] exposes
+//! the validated result for reuse in an [`EntityBuilder`](crate::schemas::entity::EntityBuilder).
+//! The lower-level coordinate helpers remain available independently.
 
 use anise::constants::celestial_objects::EARTH;
 use anise::constants::frames::EARTH_ITRF93;
-use anise::prelude::{Almanac, Epoch};
-use nalgebra::Vector3;
+use anise::prelude::{Almanac, Epoch, Frame};
+use nalgebra::{Rotation3, Vector3};
 
 use crate::ephemeris::resolve_astronomical_frame;
 use crate::transforms::check_itrf93_coverage;
+
+mod observation;
+pub use observation::{
+    ConvertedGpsObservation, GpsError, GpsObservation, GpsOptions, GpsOrientation,
+    convert_gps_observation, gps_observation_to_batch,
+};
 
 // WGS84 defining ellipsoid parameters, independent of loaded planetary constants.
 // https://earth-info.nga.mil/index.php?action=wgs84&dir=wgs84
@@ -107,6 +114,20 @@ pub fn wgs84_to_frame_m(
     target_frame_name: &str,
     almanac: &Almanac,
 ) -> Result<[f64; 3], String> {
+    let target = resolve_earth_frame(target_frame_name)?;
+    let position = wgs84_to_ecef_m(latitude_deg, longitude_deg, ellipsoidal_height_m)?;
+    let rotation = itrf93_rotation(epoch, target_frame_name, target, almanac)?;
+    let rotated = rotation * Vector3::from(position);
+    if !rotated.iter().all(|coordinate| coordinate.is_finite()) {
+        return Err(format!(
+            "GPS rotation error at epoch {epoch} ('ITRF93' → '{target_frame_name}'): \
+             rotation produced non-finite coordinates"
+        ));
+    }
+    Ok([rotated.x, rotated.y, rotated.z])
+}
+
+fn resolve_earth_frame(target_frame_name: &str) -> Result<Frame, String> {
     let target = resolve_astronomical_frame(target_frame_name).ok_or_else(|| {
         format!(
             "Invalid target_frame_name '{target_frame_name}': not recognized by Soloc's astronomical frame catalog"
@@ -118,9 +139,19 @@ pub fn wgs84_to_frame_m(
              use transform_batch for changes of origin"
         ));
     }
-    let position = wgs84_to_ecef_m(latitude_deg, longitude_deg, ellipsoidal_height_m)?;
+    Ok(target)
+}
+
+// Shared by the position primitive and full pose conversion: positions and attitudes
+// must use the same rotation, epoch, and missing-data policy.
+fn itrf93_rotation(
+    epoch: Epoch,
+    target_frame_name: &str,
+    target: Frame,
+    almanac: &Almanac,
+) -> Result<Rotation3<f64>, String> {
     if target == EARTH_ITRF93 {
-        return Ok(position);
+        return Ok(Rotation3::identity());
     }
 
     let context = |error| {
@@ -130,12 +161,10 @@ pub fn wgs84_to_frame_m(
     let rotation = almanac
         .rotate(EARTH_ITRF93, target, epoch)
         .map_err(|error| context(error.to_string()))?;
-    // Same-origin rotation is unit-independent: keep metres at the GPS boundary.
-    let rotated = rotation.rot_mat * Vector3::from(position);
-    if !rotated.iter().all(|coordinate| coordinate.is_finite()) {
-        return Err(context("rotation produced non-finite coordinates".into()));
+    if !rotation.rot_mat.iter().all(|value| value.is_finite()) {
+        return Err(context("rotation produced a non-finite matrix".into()));
     }
-    Ok([rotated.x, rotated.y, rotated.z])
+    Ok(Rotation3::from_matrix_unchecked(rotation.rot_mat))
 }
 
 #[cfg(test)]
