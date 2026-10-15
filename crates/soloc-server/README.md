@@ -58,8 +58,9 @@ kernels = ["/path/to/de440s.bsp", "/path/to/pck11.pca"]
 ```
 
 Kernels resolve in order: the `kernels` list, then `SOLOC_KERNEL_PATHS` (colon-separated), then
-`MetaAlmanac::latest()` (downloads DE440s + PCK, ~150 MB, cached locally). With no kernels the
-server still starts, but astronomical transforms will fail.
+`MetaAlmanac::latest()` (downloads ephemeris and orientation data, cached locally). The
+locked ANISE version's default includes an Earth high-precision BPC. With no kernels the
+server still accepts observations; transforms requiring ephemeris or orientation data fail.
 
 ```bash
 # Zero-config: in-memory ledger, entity schema, bound to 0.0.0.0:50051
@@ -69,6 +70,35 @@ cargo run --release -p soloc-server
 SOLOC_KERNEL_PATHS=/path/to/de440s.bsp:/path/to/pck11.pca \
   cargo run --release -p soloc-server
 ```
+
+### ITRF93 kernel configuration
+
+For ITRF93 transformations, configure a local Earth high-precision binary PCK explicitly.
+Include planetary constants for `IAU_EARTH` rotations and SPK ephemerides for changes of
+origin, such as Earth → ICRF:
+
+```toml
+[ephemeris]
+kernels = [
+    "/data/kernels/earth_high_prec_snapshot.bpc",
+    "/data/kernels/pck11.pca",
+    "/data/kernels/de440s.bsp",
+]
+```
+
+Replace these paths with your local files. For reproducibility, retain a dated snapshot,
+its checksum, and its coverage rather than depending on a changing `latest` file. An
+Earth BPC may contain predicted orientation as well as observed data; coverage alone is
+not an accuracy guarantee. Check each observation epoch, not the server's startup date.
+In a Rust caller, `almanac.bpc_domain(3000)` reports the outer interval, while
+`almanac.bpc_summary_at_epoch(3000, epoch)` checks an actual segment, including gaps.
+The transform engine performs the latter check on every row requiring ITRF93 rotation.
+
+An explicit configuration replaces the default set; a file that failed to load is not
+usable data. Inspect startup load errors and the per-transform error, which distinguishes
+missing Earth BPC from an uncovered observation epoch. Merely storing Cartesian ITRF93
+rows or converting units within ITRF93 needs no kernels. See the core crate's
+[frame and data requirements](../spacetimestamp/README.md#itrf93-earth-frame).
 
 ## A simple use case
 

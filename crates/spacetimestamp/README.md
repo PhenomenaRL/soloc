@@ -105,6 +105,7 @@ let robot  = PrescribedId::new("acme.com", "radar_boresight")?;
 
 // Astronomical id: embeds anise's (ephemeris_id, orientation_id) pair directly — not a hash.
 let earth  = PrescribedId::astronomical(399, 399)?;   // Earth == IAU_EARTH
+let itrf93 = PrescribedId::astronomical(399, 3000)?;  // ITRF93, distinct Earth-fixed axes
 let icrf   = PrescribedId::astronomical(0, 1)?;        // ICRF == J2000 == SSB
 let (e, o) = earth.astro_frame().unwrap();             // (399, 399) — read straight back out
 
@@ -168,6 +169,43 @@ and the name registry. Both are **idempotent, all-or-nothing, and replayable**:
 The pose *data* itself, `current_state`, spatiotemporal queries, and `entity_id` subsetting, 
 federates one level up in [`soloc-ledger`](../soloc-ledger/). A peer that receives an exported log
 gets **structure only**; poses stay with their owner.
+
+## ITRF93 Earth frame
+
+`PrescribedId::astronomical_from_name("ITRF93")` resolves to `(399, 3000)` and UUID
+`0000018f-0000-8000-8000-000bb8000000`. `Earth` and `IAU_EARTH` retain `(399, 399)`.
+Use ANISE's orientation ID `3000`, not the SPICE frame code `13000`.
+
+Already-correct Cartesian ITRF93 observations can be validated, stored, queried, and
+converted between length units without kernels. `transform_batch` supports ITRF93 as
+either source or target, including entity frames rooted in it. The necessary loaded data
+depends on the requested transformation:
+
+| Transformation | Required data |
+|---|---|
+| ITRF93 → ITRF93 (including unit changes) | None |
+| ITRF93 ↔ GCRF | Earth high-precision binary PCK (`.bpc`) |
+| ITRF93 ↔ Earth / IAU_EARTH | Earth BPC plus ANISE planetary constants (`pck11.pca`) |
+| ITRF93 ↔ ICRF | Earth BPC plus SPK ephemerides connecting Earth to the solar-system barycenter (e.g. `de440s.bsp`) |
+
+Each row's observation epoch must be covered by a usable BPC segment and, when needed,
+the SPK data. Unknown target names produce a catalog error; absent Earth BPC data and
+uncovered epochs produce distinct errors with the row index (zero-based), epoch, and
+frames. Other ANISE failures retain their underlying explanation. No alternative frame
+is substituted. See [server kernel configuration](../soloc-server/README.md#itrf93-kernel-configuration).
+
+The required integration tests use explicit local PCA/BPC files covering January 1, 2020
+and January 1, 2025 (TAI). They are ignored in the default suite and never download data;
+an explicit invocation fails if its files or coverage are missing:
+
+```bash
+SOLOC_KERNEL_PATHS=/path/pck11.pca:/path/earth_high_prec_snapshot.bpc \
+  cargo test -p spacetimestamp --test itrf93_transforms -- --ignored
+```
+
+These tests verify the Soloc pipeline against ANISE rotations; they do not independently
+validate the Earth orientation model. Geodetic latitude/longitude conversion and GPX
+import are separate, upcoming adapter work.
 
 ## License
 
