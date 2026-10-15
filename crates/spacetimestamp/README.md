@@ -25,15 +25,17 @@ the two covariance columns.
 | `estimate_type` | `UInt8` · `soloc.estimate_type` | how the row was arrived at |
 | `position` | `FixedSizeList(3, f64)` | `[x, y, z]` translation |
 | `quaternion` | `FixedSizeList(4, f64)` | `[w, x, y, z]` orientation |
-| `duration_centuries` | `Int16` | whole-centuries half of the epoch offset from J2000 TAI |
-| `duration_ns` | `UInt64` | sub-century nanosecond remainder of the offset |
+| `duration_centuries` | `Int16` | whole-centuries half of the epoch offset from the tagged timescale's J2000 reference |
+| `duration_ns` | `UInt64` | sub-century nanosecond remainder of that offset |
 | `position_covariance` | `FixedSizeList(6, f64)` *(nullable)* | upper triangle of the 3×3 position covariance |
 | `orientation_covariance` | `FixedSizeList(6, f64)` *(nullable)* | upper triangle of the 3×3 orientation covariance (axis-angle) |
 
-Epochs are a two-part offset from the **J2000 TAI** reference (`2000-01-01T12:00:00 TAI`): whole
-centuries in `duration_centuries`, the remainder in `duration_ns`, reconstructed with the row's own
-`timescale_id`. Rows are built with `SpaceTimestampBuilder` and read back with `StsColumns`, which
-accepts both the nested (struct-column) and flat layouts.
+Epochs are two-part offsets from `2000-01-01T12:00:00` in the declared `timescale_id`:
+whole centuries in `duration_centuries`, the remainder in `duration_ns`. New normalized
+rows use **J2000 TAI**, so both parts represent continuous elapsed time. Legacy UTC rows
+advance the UTC clock and omit inserted leap seconds; normalization applies the UTC
+offset at the observation date. Rows are built with `SpaceTimestampBuilder` and read
+back with `StsColumns`, which accepts both nested (struct-column) and flat layouts.
 
 ### The reference `entity` schema
 
@@ -204,8 +206,42 @@ SOLOC_KERNEL_PATHS=/path/pck11.pca:/path/earth_high_prec_snapshot.bpc \
 ```
 
 These tests verify the Soloc pipeline against ANISE rotations; they do not independently
-validate the Earth orientation model. Geodetic latitude/longitude conversion and GPX
-import are separate, upcoming adapter work.
+validate the Earth orientation model.
+
+## GPS coordinate and time conversion
+
+`gps::wgs84_to_ecef_m(latitude_deg, longitude_deg, ellipsoidal_height_m)` converts WGS84
+geodetic coordinates into Earth-centered, Earth-fixed metres without kernels. Latitude
+must be finite and within `[-90, 90]`, longitude within `[-180, 180]`, and height finite.
+Negative height is supported. Height is required and must refer to the WGS84 ellipsoid;
+mean-sea-level height or an unspecified GPX elevation requires an explicit datum decision
+before conversion. Longitude is east-positive and is not automatically wrapped.
+
+`gps::wgs84_to_frame_m(latitude_deg, longitude_deg, ellipsoidal_height_m, epoch, target, almanac)`
+uses an **approximate WGS84 ECEF → ITRF93 mapping for ordinary tracking**, then rotates
+at that observation's epoch if requested. `ITRF93` works with an empty almanac;
+`Earth`/`IAU_EARTH` and `GCRF`/`EME2000` use the data listed above. Other origins such as
+ICRF require the existing batch transform after constructing an Earth-frame observation.
+The approximation applies no realization or epoch-dependent datum correction and offers
+no survey/RTK, sub-metre, or fixed-error guarantee. Numerical test tolerances describe
+calculation error, not measurement or datum accuracy.
+
+Encode observation time using `epoch_to_parts(epoch)` and `TimeScaleCode::TAI`. It converts
+UTC, GPST, and other input epochs to TAI before subtracting J2000, retaining integer
+nanoseconds. `duration_since_j2000_tai(epoch)` provides the equivalent duration for ledger
+comparisons. For example, `2025-01-01T00:00:00 UTC` becomes `00:00:37 TAI` with row parts
+`(0, 788961637000000000)`. Flight's JSON time fields instead use `epoch.to_tai_seconds()`
+from **J1900** (`3944678437` for this instant); row offsets must not be sent directly.
+
+UTC conversion uses the installed hifitime leap-second table. The locked version (4.3.1)
+folds a parsed literal UTC `:60` onto `:59`, so supply inserted-second instants as TAI or
+GPST instead (e.g. `2017-01-01T00:00:36 TAI`). The integer TAI row encoding preserves that
+second and fractional nanoseconds. A later text/GPX parser must handle or reject literal
+`:60` explicitly. Existing TAI rows produced with the former UTC conversion bug cannot
+be identified or repaired automatically; rebuild affected rows from their original times.
+
+These are reusable position and time primitives. The full observation API, attitude
+policy, and GPX parsing remain subsequent implementation steps.
 
 ## License
 

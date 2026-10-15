@@ -100,6 +100,18 @@ missing Earth BPC from an uncovered observation epoch. Merely storing Cartesian 
 rows or converting units within ITRF93 needs no kernels. See the core crate's
 [frame and data requirements](../spacetimestamp/README.md#itrf93-earth-frame).
 
+### Time values on the wire
+
+JSON fields `epoch_tai_s`, `time_range_tai_s`, and `not_before_tai_s` use TAI seconds
+since **1900-01-01 00:00:00 TAI**, matching `hifitime::Epoch::from_tai_seconds` and
+`Epoch::to_tai_seconds`. This preserves the existing Flight contract. Arrow row
+`duration_centuries` and `duration_ns` instead use the J2000 reference in their declared
+timescale; the ledger normalizes them to TAI on append. For example,
+`2025-01-01T00:00:00Z` is JSON `3944678437` TAI seconds and a stored Arrow offset of
+`(0, 788961637000000000)` from J2000 TAI. Query bounds and the current-state cutoff are
+inclusive. JSON floating-point seconds cannot preserve every nanosecond; the Arrow integer
+fields retain that precision.
+
 ## A simple use case
 
 Any Arrow Flight client works. Here is `pyarrow.flight`:

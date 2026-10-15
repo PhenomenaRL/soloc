@@ -15,10 +15,11 @@ use anise::constants::frames::{EARTH_ITRF93, EARTH_J2000, IAU_EARTH_FRAME};
 use anise::constants::orientations::ITRF93;
 use anise::prelude::{Almanac, Epoch, Frame};
 use arrow::array::RecordBatch;
-use hifitime::Duration;
+use hifitime::{Duration, TimeScale};
 use nalgebra::{Quaternion, UnitQuaternion, Vector3};
 
 use spacetimestamp::ephemeris::{epoch_from_parts, epoch_to_parts};
+use spacetimestamp::gps::wgs84_to_frame_m;
 use spacetimestamp::identity::PrescribedId;
 use spacetimestamp::schema::StsColumns;
 use spacetimestamp::schemas::entity::EntityBuilder;
@@ -263,5 +264,114 @@ fn earth_bpc_coverage_is_checked_for_the_observation_row_in_both_directions() {
             assert!(error.contains("row 1"), "{error}");
             assert!(error.contains(&at.to_string()), "{error}");
         }
+    }
+}
+
+#[test]
+#[ignore = "requires local .pca and Earth .bpc files in SOLOC_KERNEL_PATHS"]
+fn gps_rotations_use_the_same_physical_instant_in_utc_tai_and_gpst() {
+    let almanac = local_almanac();
+    let targets = [
+        ("Earth", IAU_EARTH_FRAME),
+        ("IAU_EARTH", IAU_EARTH_FRAME),
+        ("GCRF", EARTH_J2000),
+        ("EME2000", EARTH_J2000),
+    ];
+    // Exact equatorial-axis positions provide references independently of the GPS math.
+    let positions = [
+        (0.0, 0.0, [6_378_137.0, 0.0, 0.0]),
+        (90.0, 100.0, [0.0, 6_378_237.0, 0.0]),
+        (-90.0, -100.0, [0.0, -6_378_037.0, 0.0]),
+    ];
+    for year in [2020, 2025] {
+        // For these dates, TAI = UTC + 37 s and GPST = UTC + 18 s.
+        // Construct the known calendar values independently instead of converting one
+        // input Epoch to produce all references through the helper under test.
+        let tai = Epoch::from_gregorian_tai(year, 1, 1, 0, 0, 37, 123_456_789);
+        let instants = [
+            Epoch::from_gregorian_utc(year, 1, 1, 0, 0, 0, 123_456_789),
+            tai,
+            Epoch::from_gregorian(year, 1, 1, 0, 0, 18, 123_456_789, TimeScale::GPST),
+        ];
+        for (target, target_frame) in targets {
+            let rotation = almanac.rotate(EARTH_ITRF93, target_frame, tai).unwrap();
+            for (longitude, height, ecef_m) in positions {
+                let expected = rotation.rot_mat * Vector3::from(ecef_m);
+                for at in instants {
+                    let actual = Vector3::from(
+                        wgs84_to_frame_m(0.0, longitude, height, at, target, &almanac).unwrap(),
+                    );
+                    assert!(
+                        (actual - expected).norm() < 1e-6,
+                        "{target}, {at}, longitude {longitude}, height {height}"
+                    );
+                    assert!((actual.norm() - Vector3::from(ecef_m).norm()).abs() < 1e-6);
+                    assert!(
+                        (actual - Vector3::from(ecef_m)).norm() > 10.0,
+                        "the GPS adapter must rotate the coordinates, not just relabel them"
+                    );
+                    assert_eq!(epoch_to_parts(at), epoch_to_parts(tai));
+                }
+            }
+            // The primitive and the existing Arrow transform must use the same units,
+            // axes, and observation time when Step 3 composes them into ledger rows.
+            let input = batch("ITRF93", &[(instants[0], LengthUnit::m)]);
+            let output = transform_batch(&input, target, &almanac, LengthUnit::m, None).unwrap();
+            let columns = StsColumns::try_new(&output).unwrap();
+            let gps = wgs84_to_frame_m(0.0, 0.0, 0.0, instants[0], target, &almanac).unwrap();
+            assert!((Vector3::from(gps) - Vector3::from(columns.position_at(0))).norm() < 1e-6);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires local .pca and Earth .bpc files in SOLOC_KERNEL_PATHS"]
+fn gps_rotation_requires_the_data_for_its_requested_axes() {
+    let almanac = local_almanac();
+    let at = Epoch::from_gregorian_utc_at_midnight(2025, 1, 1);
+    let mut without_bpc = almanac.clone();
+    without_bpc.bpc_data.clear();
+    for target in ["IAU_EARTH", "GCRF"] {
+        let error = wgs84_to_frame_m(0.0, 0.0, 0.0, at, target, &without_bpc).unwrap_err();
+        assert!(
+            error.contains("no Earth orientation BPC data for ITRF93"),
+            "{error}"
+        );
+        assert!(error.contains(target), "{error}");
+        assert!(error.contains(&at.to_string()), "{error}");
+    }
+
+    let mut bpc_only = almanac;
+    bpc_only.planetary_data.clear();
+    assert!(wgs84_to_frame_m(0.0, 0.0, 0.0, at, "GCRF", &bpc_only).is_ok());
+    let error = wgs84_to_frame_m(0.0, 0.0, 0.0, at, "IAU_EARTH", &bpc_only).unwrap_err();
+    assert!(error.contains("IAU_EARTH"), "{error}");
+    assert!(error.contains(&at.to_string()), "{error}");
+}
+
+#[test]
+#[ignore = "requires local .pca and Earth .bpc files in SOLOC_KERNEL_PATHS"]
+fn gps_checks_actual_kernel_coverage_without_restricting_pure_ecef_conversion() {
+    let almanac = local_almanac();
+    let (start, end) = almanac.bpc_domain(ITRF93).unwrap();
+    for at in [
+        start - Duration::from_seconds(1.0),
+        end + Duration::from_seconds(1.0),
+    ] {
+        for target in ["IAU_EARTH", "GCRF"] {
+            let error = wgs84_to_frame_m(0.0, 0.0, 0.0, at, target, &almanac).unwrap_err();
+            assert!(
+                error.contains("no loaded ITRF93 BPC segment covers this epoch"),
+                "{error}"
+            );
+            assert!(error.contains(target), "{error}");
+            assert!(error.contains(&at.to_string()), "{error}");
+        }
+        // The approximate terrestrial mapping itself uses no Earth orientation model.
+        // This does not assert a datum-accuracy bound for the out-of-coverage date.
+        assert_eq!(
+            wgs84_to_frame_m(0.0, 0.0, 0.0, at, "ITRF93", &Almanac::default()).unwrap(),
+            [6_378_137.0, 0.0, 0.0]
+        );
     }
 }
