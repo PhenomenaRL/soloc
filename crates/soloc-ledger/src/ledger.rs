@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anise::prelude::Almanac;
-use spacetimestamp::ephemeris::{epoch_from_parts, j2000_tai};
+use spacetimestamp::ephemeris::{duration_since_j2000_tai, epoch_from_parts};
 use spacetimestamp::identity::{
     IdMap, IdSet, NameRegistry, PrescribedId, as_id_column, id_at, id_type, registry_schema,
 };
@@ -125,7 +125,7 @@ impl Segment {
             let (centuries, nanos) = sts.epoch_parts_at(row);
             let epoch = match sts.timescale_at(row)? {
                 TimeScaleCode::TAI => Duration::from_parts(centuries, nanos),
-                ts => epoch_from_parts(centuries, nanos, ts.into()) - j2000_tai(),
+                ts => duration_since_j2000_tai(epoch_from_parts(centuries, nanos, ts.into())),
             };
             min_epoch = min_epoch.min(epoch);
             max_epoch = max_epoch.max(epoch);
@@ -356,9 +356,12 @@ impl Ledger {
         &'a self,
         filter: &SpatiotemporalFilter,
     ) -> impl Iterator<Item = &'a RecordBatch> + 'a {
-        let range = filter
-            .time_range
-            .map(|(start, end)| (start - j2000_tai(), end - j2000_tai()));
+        let range = filter.time_range.map(|(start, end)| {
+            (
+                duration_since_j2000_tai(start),
+                duration_since_j2000_tai(end),
+            )
+        });
         self.all_segments()
             .filter(move |s| range.is_none_or(|(start, end)| s.overlaps(start, end)))
             .map(|s| &s.batch)
@@ -741,7 +744,7 @@ impl Ledger {
             return None;
         }
 
-        let target_dur = epoch - j2000_tai();
+        let target_dur = duration_since_j2000_tai(epoch);
 
         // Fast path. The cached epoch is the highest ever ingested for this entity, so if
         // it is already at or before the query there cannot be a later row to find, and
@@ -819,7 +822,7 @@ impl Ledger {
     ) -> Result<(), String> {
         let chain = self
             .transform_tree
-            .ancestry_at(entity_id, epoch - j2000_tai())?;
+            .ancestry_at(entity_id, duration_since_j2000_tai(epoch))?;
 
         // `ancestry_at` never returns an empty chain: the last element is the astronomical
         // root, everything before it is an entity needing a pose lookup.
@@ -976,7 +979,7 @@ impl Ledger {
         }
 
         let cutoff: Option<Duration> = match not_before {
-            Some(ep) => Some(ep - j2000_tai()),
+            Some(ep) => Some(duration_since_j2000_tai(ep)),
             None => self
                 .latest_stored_duration()
                 .map(|latest| latest - Duration::from_parts(0, CURRENT_STATE_WINDOW_NS)),
@@ -1404,6 +1407,151 @@ mod tests {
         let filter = SpatiotemporalFilter::new().with_time_range(t1, t2);
         let result = ledger.query(&filter).unwrap();
         assert_eq!(result.num_rows(), 1);
+    }
+
+    // 2025-01-01 00:00:00 UTC is 00:00:37 TAI. These calendar-coordinate offsets
+    // are fixed independently of the conversion helpers under test.
+    const MODERN_UTC_NS: u64 = 788_961_600_000_000_000;
+    const MODERN_TAI_NS: u64 = 788_961_637_000_000_000;
+
+    fn modern_utc() -> Epoch {
+        Epoch::from_gregorian_utc(2025, 1, 1, 0, 0, 0, 0)
+    }
+
+    fn modern_tai() -> Epoch {
+        Epoch::from_gregorian_tai(2025, 1, 1, 0, 0, 37, 0)
+    }
+
+    #[test]
+    fn test_modern_utc_append_and_exact_time_queries_match_tai() {
+        let mut ledger = make_entity_ledger();
+        let frame = PrescribedId::astronomical_from_name("ITRF93").unwrap();
+        for (name, timescale, ns) in [
+            ("utc-fix", TimeScaleCode::UTC, MODERN_UTC_NS),
+            ("tai-fix", TimeScaleCode::TAI, MODERN_TAI_NS),
+        ] {
+            ledger
+                .append(make_entity_batch_with_timescale(
+                    demo(name),
+                    frame,
+                    [1.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                    ns,
+                    timescale,
+                ))
+                .unwrap();
+        }
+
+        for batch in ledger.all_batches() {
+            let sts = StsColumns::try_new(batch).unwrap();
+            assert_eq!(sts.timescale_at(0).unwrap(), TimeScaleCode::TAI);
+            assert_eq!(sts.epoch_parts_at(0), (0, MODERN_TAI_NS));
+        }
+
+        // Both segment pruning and the row predicate must include the exact instant.
+        for epoch in [modern_utc(), modern_tai()] {
+            let filter = SpatiotemporalFilter::new().with_time_range(epoch, epoch);
+            assert_eq!(ledger.query(&filter).unwrap().num_rows(), 2);
+        }
+        for epoch in [
+            modern_utc() - Duration::from_parts(0, 1),
+            modern_utc() + Duration::from_parts(0, 1),
+        ] {
+            let filter = SpatiotemporalFilter::new().with_time_range(epoch, epoch);
+            assert_eq!(ledger.query(&filter).unwrap().num_rows(), 0);
+        }
+    }
+
+    #[test]
+    fn test_segment_range_converts_modern_utc_without_append_normalization() {
+        let batch = make_entity_batch_with_timescale(
+            demo("utc-fix"),
+            PrescribedId::astronomical_from_name("ITRF93").unwrap(),
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            MODERN_UTC_NS,
+            TimeScaleCode::UTC,
+        );
+        let segment = Segment::new(batch).unwrap();
+        let expected = Duration::from_parts(0, MODERN_TAI_NS);
+        assert_eq!(segment.min_epoch, expected);
+        assert_eq!(segment.max_epoch, expected);
+        assert!(segment.overlaps(expected, expected));
+    }
+
+    #[test]
+    fn test_modern_utc_pose_and_ancestry_resolve_at_exact_tai_boundary() {
+        let mut ledger = make_entity_ledger();
+        let itrf = PrescribedId::astronomical_from_name("ITRF93").unwrap();
+        let gcrf = PrescribedId::astronomical_from_name("GCRF").unwrap();
+        let receiver = demo("receiver");
+        let sensor = demo("sensor");
+        for (entity, frame, x, ns) in [
+            (receiver, itrf, 1.0, MODERN_TAI_NS - 1),
+            (sensor, receiver, 10.0, MODERN_TAI_NS - 1),
+            (receiver, gcrf, 2.0, MODERN_TAI_NS),
+        ] {
+            ledger
+                .append(make_entity_batch(
+                    entity,
+                    frame,
+                    [x, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                    ns,
+                ))
+                .unwrap();
+        }
+
+        // The cache and its historical scan must use the same physical TAI boundary;
+        // ancestry must also switch roots at that instant, not five seconds later.
+        for use_cache in [true, false] {
+            if !use_cache {
+                ledger.clear_pose_cache();
+            }
+            for epoch in [modern_utc(), modern_tai()] {
+                for (at, root, receiver_x) in [
+                    (epoch - Duration::from_parts(0, 1), itrf, 1.0),
+                    (epoch, gcrf, 2.0),
+                ] {
+                    let (parent, pose) = ledger.resolve_frame_at(receiver, at).unwrap();
+                    assert_eq!(parent, root);
+                    assert_eq!(pose.translation.vector.x, receiver_x);
+                    let (parent, pose) = ledger.resolve_to_root(sensor, at).unwrap();
+                    assert_eq!(parent, root);
+                    assert_eq!(pose.translation.vector.x, receiver_x + 10.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_modern_utc_current_state_cutoff_matches_tai() {
+        let mut ledger = make_entity_ledger();
+        let frame = PrescribedId::astronomical_from_name("ITRF93").unwrap();
+        for (name, ns) in [("before", MODERN_TAI_NS - 1), ("at", MODERN_TAI_NS)] {
+            ledger
+                .append(make_entity_batch(
+                    demo(name),
+                    frame,
+                    [1.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                    ns,
+                ))
+                .unwrap();
+        }
+        for cutoff in [modern_utc(), modern_tai()] {
+            let state = ledger.current_state(None, Some(cutoff)).unwrap();
+            assert_eq!(state.num_rows(), 1);
+            assert_eq!(
+                StsColumns::try_new(&state).unwrap().epoch_parts_at(0),
+                (0, MODERN_TAI_NS)
+            );
+            let after = cutoff + Duration::from_parts(0, 1);
+            assert_eq!(
+                ledger.current_state(None, Some(after)).unwrap().num_rows(),
+                0
+            );
+        }
     }
 
     #[test]
@@ -2167,13 +2315,24 @@ mod tests {
         quat: [f64; 4],
         ns: u64,
     ) -> RecordBatch {
+        make_entity_batch_with_timescale(entity_id, frame_id, pos, quat, ns, TimeScaleCode::TAI)
+    }
+
+    fn make_entity_batch_with_timescale(
+        entity_id: PrescribedId,
+        frame_id: PrescribedId,
+        pos: [f64; 3],
+        quat: [f64; 4],
+        ns: u64,
+        timescale: TimeScaleCode,
+    ) -> RecordBatch {
         use crate::schemas::entity::EntityBuilder;
         let mut b = EntityBuilder::new(1);
         b.append_entity(
             entity_id,
             frame_id,
             LengthUnit::km,
-            TimeScaleCode::TAI,
+            timescale,
             test_source(),
             EstimateType::MEASURED,
             pos,
