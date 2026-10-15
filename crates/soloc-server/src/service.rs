@@ -120,7 +120,7 @@ struct AppendSnapshotBody {
     /// e.g. `{"ephemeris_id": 399, "orientation_id": 399}` for Earth. The id carries the body,
     /// so there is no separate `naif_id`.
     bodies: Vec<WireId>,
-    /// Epoch expressed as TAI seconds past J2000.
+    /// Epoch expressed as TAI seconds since 1900-01-01 00:00:00 TAI (hifitime's origin).
     epoch_tai_s: f64,
 }
 
@@ -135,7 +135,7 @@ struct OrbitRequest {
 #[derive(Deserialize)]
 struct QueryOrbitsBody {
     orbits: Vec<OrbitRequest>,
-    /// Epoch expressed as TAI seconds past J2000.
+    /// Epoch expressed as TAI seconds since 1900-01-01 00:00:00 TAI (hifitime's origin).
     epoch_tai_s: f64,
     /// Points per path, at most [`MAX_ORBIT_SAMPLES`].
     #[serde(default = "default_orbit_samples")]
@@ -166,6 +166,7 @@ enum QueryType {
 
 #[derive(Deserialize)]
 struct GetTicket {
+    /// Inclusive bounds in TAI seconds since 1900-01-01 00:00:00 TAI.
     #[serde(default)]
     time_range_tai_s: Option<[f64; 2]>,
     #[serde(default)]
@@ -176,6 +177,7 @@ struct GetTicket {
     query_type: QueryType,
     #[serde(default)]
     entity_ids: Option<Vec<WireId>>,
+    /// Inclusive cutoff in TAI seconds since 1900-01-01 00:00:00 TAI.
     #[serde(default)]
     not_before_tai_s: Option<f64>,
 }
@@ -868,6 +870,61 @@ mod tests {
                 Some(service.state.ledger.read().unwrap().schema()),
                 "{ticket}"
             );
+        }
+    }
+
+    /// JSON uses hifitime's J1900 TAI origin, while Arrow rows use J2000 TAI offsets.
+    /// The UTC instant 2025-01-01T00:00:00Z fixes both values independently here.
+    #[tokio::test]
+    async fn test_do_get_time_fields_use_j1900_tai_seconds() {
+        const ROW_OFFSET_NS: u64 = 788_961_637_000_000_000;
+        let service = make_service().await;
+        let frame = PrescribedId::astronomical_from_name("ITRF93").unwrap();
+        {
+            let mut ledger = service.state.ledger.write().unwrap();
+            for (name, ns) in [
+                ("before", ROW_OFFSET_NS - 1_000_000_000),
+                ("at", ROW_OFFSET_NS),
+            ] {
+                ledger
+                    .append(entity_rows(demo(name), frame, 1.0, ns..ns + 1))
+                    .unwrap();
+            }
+        }
+
+        for (ticket, expected_rows) in [
+            (r#"{"time_range_tai_s": [3944678437, 3944678437]}"#, 1),
+            (r#"{"time_range_tai_s": [788961637, 788961637]}"#, 0),
+            (
+                r#"{"query_type": "current_state", "not_before_tai_s": 3944678437}"#,
+                1,
+            ),
+            (
+                r#"{"query_type": "current_state", "not_before_tai_s": 3944678438}"#,
+                0,
+            ),
+        ] {
+            let response = service
+                .do_get(Request::new(Ticket {
+                    ticket: ticket.into(),
+                }))
+                .await
+                .unwrap();
+            let mut decoded = FlightRecordBatchStream::new_from_flight_data(
+                response
+                    .into_inner()
+                    .map_err(|e| FlightError::Tonic(Box::new(e))),
+            );
+            let mut rows = 0;
+            while let Some(batch) = decoded.next().await {
+                let batch = batch.unwrap();
+                rows += batch.num_rows();
+                let sts = spacetimestamp::schema::StsColumns::try_new(&batch).unwrap();
+                for row in 0..batch.num_rows() {
+                    assert_eq!(sts.epoch_parts_at(row), (0, ROW_OFFSET_NS), "{ticket}");
+                }
+            }
+            assert_eq!(rows, expected_rows, "{ticket}");
         }
     }
 
