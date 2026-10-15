@@ -133,8 +133,8 @@ pub(crate) const ASTRO_FRAMES: &[(&str, i32, i32)] = &[
 
 /// Returns the J2000 TAI reference epoch: 2000-01-01T12:00:00 TAI.
 ///
-/// All `duration_centuries` / `duration_ns` fields in the spacetimestamp schema are
-/// offsets from this epoch.
+/// `duration_centuries` / `duration_ns` fields tagged with [`TimeScaleCode::TAI`] are
+/// offsets from this epoch. Other timescale tags use [`j2000_in_timescale`].
 pub fn j2000_tai() -> Epoch {
     Epoch::from_str("2000-01-01T12:00:00 TAI").expect("J2000 TAI is a valid epoch string")
 }
@@ -142,9 +142,9 @@ pub fn j2000_tai() -> Epoch {
 /// Returns the J2000 reference epoch in the given timescale.
 ///
 /// `(duration_centuries, duration_ns)` stored with `timescale_id` equal to `ts` are
-/// SI-second offsets from this calendar moment. `2000-01-01T12:00:00` in that timescale.
+/// clock-coordinate offsets from `2000-01-01T12:00:00` in that timescale.
 /// Each timescale's J2000 is a different physical moment (e.g. J2000 UTC is 32 SI seconds
-/// earlier than J2000 TAI due to the leap-second offset in 2000).
+/// later than J2000 TAI due to the leap-second offset in 2000).
 pub fn j2000_in_timescale(ts: TimeScale) -> Epoch {
     Epoch::from_gregorian(2000, 1, 1, 12, 0, 0, 0, ts)
 }
@@ -152,17 +152,42 @@ pub fn j2000_in_timescale(ts: TimeScale) -> Epoch {
 /// Reconstructs a physical [`Epoch`] from stored `(duration_centuries, duration_ns)` and
 /// the timescale that was used as the J2000 reference when those values were computed.
 ///
-/// This is the read-side complement to `epoch_to_parts_in`: given the stored raw integers
-/// and their declared `timescale_id`, return the unambiguous physical moment as a hifitime
-/// `Epoch` (internally always TAI-equivalent), suitable for almanac queries or comparison.
+/// The offset advances the declared timescale's clock, preserving the existing row
+/// encoding. In particular, UTC offsets omit inserted leap seconds; they are not
+/// continuous elapsed SI time since J2000 UTC. Conversion to TAI applies the UTC offset
+/// at the reconstructed date. Use [`epoch_to_parts`] and a [`TimeScaleCode::TAI`] tag
+/// when writing new normalized rows.
+///
+/// UTC clock coordinates cannot distinguish an inserted leap second from the preceding
+/// second in hifitime 4.3.1. Represent such instants in TAI or GPST instead.
 pub fn epoch_from_parts(centuries: i16, ns: u64, ts: TimeScale) -> Epoch {
     j2000_in_timescale(ts) + Duration::from_parts(centuries, ns)
 }
 
+/// Converts an [`Epoch`] to a continuous TAI duration since [`j2000_tai`].
+///
+/// Both endpoints are converted to TAI before subtraction so historical changes in
+/// UTC's leap-second offset are included. Direct `Epoch` subtraction uses the left
+/// operand's timescale and would omit those changes for a UTC input.
+///
+/// This duration uses the row schema's J2000 origin. It differs from
+/// [`Epoch::to_tai_duration`], which counts from J1900 and underlies the Flight JSON
+/// `epoch_tai_s` / `time_range_tai_s` fields. Integer durations preserve nanoseconds;
+/// converting them to floating-point seconds may lose that precision.
+///
+/// UTC conversion uses hifitime's built-in leap-second table. An `Epoch` parsed from a
+/// literal UTC `:60` second cannot retain that leap second in hifitime 4.3.1; callers
+/// must supply its TAI or GPST representation to preserve the instant.
+pub fn duration_since_j2000_tai(epoch: Epoch) -> Duration {
+    epoch.to_tai_duration() - j2000_tai().to_tai_duration()
+}
+
 /// Converts an [`Epoch`] to the `(duration_centuries, duration_ns)` offset from J2000 TAI
-/// used throughout the spacetimestamp schema.
+/// used by rows tagged with [`TimeScaleCode::TAI`].
+///
+/// See [`duration_since_j2000_tai`] for timescale conversion and leap-second behavior.
 pub fn epoch_to_parts(epoch: Epoch) -> (i16, u64) {
-    (epoch - j2000_tai()).to_parts()
+    duration_since_j2000_tai(epoch).to_parts()
 }
 
 // ---------------------------------------------------------------------------
@@ -865,11 +890,10 @@ mod tests {
         // J2000 UTC (noon UTC) is therefore a physical moment 32 s AFTER J2000 TAI (noon TAI).
         let tai = j2000_tai();
         let utc = j2000_in_timescale(TimeScale::UTC);
-        let diff_s = (tai - utc).to_seconds();
-        // tai < utc in physical time, so (tai − utc) ≈ −32 s.
-        assert!(
-            (diff_s + 32.0).abs() < 1.0,
-            "J2000 UTC should be ~32s after J2000 TAI, got diff = {diff_s}s"
+        assert_eq!(
+            (utc.to_tai_duration() - tai.to_tai_duration()).to_parts(),
+            (0, 32_000_000_000),
+            "J2000 UTC is exactly 32 SI seconds after J2000 TAI"
         );
     }
 
@@ -883,33 +907,131 @@ mod tests {
 
     #[test]
     fn test_epoch_from_parts_utc_gives_correct_physical_moment() {
-        // A UTC timestamp: compute parts relative to J2000 UTC, then reconstruct.
-        // The recovered Epoch should match the original physical moment.
-        let j2000_utc = j2000_in_timescale(TimeScale::UTC);
-        let offset = Duration::from_parts(0, 1_000_000_000u64); // 1 second
-        let utc_epoch = j2000_utc + offset;
-        let (c, n) = (utc_epoch - j2000_utc).to_parts();
-        let recovered = epoch_from_parts(c, n, TimeScale::UTC);
-        assert_eq!(recovered, utc_epoch);
+        // 9,132 calendar days from 2000-01-01 to 2025-01-01, minus the noon
+        // origin's half day. UTC rows omit the five leap seconds inserted since 2000.
+        let recovered = epoch_from_parts(0, 788_961_600_000_000_000, TimeScale::UTC);
+        assert_eq!(
+            recovered,
+            Epoch::from_str("2025-01-01T00:00:00 UTC").unwrap()
+        );
+        assert_eq!(
+            epoch_to_parts(recovered),
+            (0, 788_961_637_000_000_000),
+            "normalization applies the 37-second offset at the observation date"
+        );
     }
 
     #[test]
-    fn test_tai_and_utc_parts_for_same_moment_differ() {
-        // For the same physical moment, parts relative to J2000 TAI vs J2000 UTC differ.
-        // J2000 UTC is 32 s LATER than J2000 TAI, so UTC parts are ~32 s SMALLER
-        // (closer to zero) than TAI parts for any epoch after both J2000 references.
-        let physical_moment = j2000_tai() + Duration::from_parts(0, 1_000_000_000u64);
-        let (tai_c, tai_n) = epoch_to_parts(physical_moment);
-        let utc_j2000 = j2000_in_timescale(TimeScale::UTC);
-        let (utc_c, utc_n) = (physical_moment - utc_j2000).to_parts();
-        let tai_ns_total = tai_c as i64 * 36_525i64 * 86_400 * 1_000_000_000 + tai_n as i64;
-        let utc_ns_total = utc_c as i64 * 36_525i64 * 86_400 * 1_000_000_000 + utc_n as i64;
-        // utc_parts < tai_parts because the UTC reference is later: utc_ns - tai_ns ≈ -32 s.
-        let diff_s = (utc_ns_total - tai_ns_total) as f64 / 1e9;
-        assert!(
-            (diff_s + 32.0).abs() < 1.0,
-            "UTC parts should be ~32s less than TAI parts, got {diff_s}s"
+    fn test_epoch_to_parts_historical_utc_tai_gpst_equivalence() {
+        // Independent calendar intervals, with historical TAI−UTC values of 32,
+        // 34, and 37 seconds. TAI−GPST is always 19 seconds for these dates.
+        for (utc, tai, gpst, expected_ns) in [
+            (
+                "2000-01-01T12:00:00 UTC",
+                "2000-01-01T12:00:32 TAI",
+                "2000-01-01T12:00:13 GPST",
+                32_000_000_000,
+            ),
+            (
+                "2010-01-01T00:00:00 UTC",
+                "2010-01-01T00:00:34 TAI",
+                "2010-01-01T00:00:15 GPST",
+                315_576_034_000_000_000,
+            ),
+            (
+                "2025-01-01T00:00:00 UTC",
+                "2025-01-01T00:00:37 TAI",
+                "2025-01-01T00:00:18 GPST",
+                788_961_637_000_000_000,
+            ),
+        ] {
+            let expected_tai = Epoch::from_str(tai).unwrap();
+            for input in [utc, tai, gpst] {
+                let epoch = Epoch::from_str(input).unwrap();
+                let (c, n) = epoch_to_parts(epoch);
+                assert_eq!((c, n), (0, expected_ns), "{input}");
+                assert_eq!(duration_since_j2000_tai(epoch).to_parts(), (c, n));
+                assert_eq!(epoch_from_parts(c, n, TimeScale::TAI), expected_tai);
+            }
+        }
+    }
+
+    #[test]
+    fn test_epoch_to_parts_preserves_fractional_nanoseconds_and_sign() {
+        for input in [
+            "2025-01-01T00:00:00.123456789 UTC",
+            "2025-01-01T00:00:37.123456789 TAI",
+            "2025-01-01T00:00:18.123456789 GPST",
+        ] {
+            let epoch = Epoch::from_str(input).unwrap();
+            let (c, n) = epoch_to_parts(epoch);
+            assert_eq!((c, n), (0, 788_961_637_123_456_789), "{input}");
+            assert_eq!(epoch_from_parts(c, n, TimeScale::TAI), epoch);
+        }
+
+        for (input, expected_ns) in [
+            ("2000-01-01T11:59:27.999999999 UTC", -1),
+            ("2000-01-01T11:59:28 UTC", 0),
+            ("2000-01-01T11:59:28.000000001 UTC", 1),
+        ] {
+            let epoch = Epoch::from_str(input).unwrap();
+            let (c, n) = epoch_to_parts(epoch);
+            assert_eq!(
+                Duration::from_parts(c, n).total_nanoseconds(),
+                expected_ns,
+                "{input}"
+            );
+            assert_eq!(epoch_from_parts(c, n, TimeScale::TAI), epoch);
+        }
+    }
+
+    #[test]
+    fn test_epoch_to_parts_across_the_2016_leap_second() {
+        // UTC 23:59:59 -> 00:00:00 spans two SI seconds. The middle second can
+        // be supplied unambiguously as TAI 00:00:36 or GPST 00:00:17.
+        for (input, expected_ns) in [
+            ("2016-12-31T23:59:59 UTC", 536_500_835_000_000_000),
+            ("2017-01-01T00:00:35 TAI", 536_500_835_000_000_000),
+            ("2017-01-01T00:00:36 TAI", 536_500_836_000_000_000),
+            ("2017-01-01T00:00:17 GPST", 536_500_836_000_000_000),
+            ("2017-01-01T00:00:36.999999999 TAI", 536_500_836_999_999_999),
+            ("2017-01-01T00:00:00 UTC", 536_500_837_000_000_000),
+            ("2017-01-01T00:00:37 TAI", 536_500_837_000_000_000),
+        ] {
+            let (c, n) = epoch_to_parts(Epoch::from_str(input).unwrap());
+            assert_eq!((c, n), (0, expected_ns), "{input}");
+            assert_eq!(
+                epoch_to_parts(epoch_from_parts(c, n, TimeScale::TAI)),
+                (c, n),
+                "TAI rows preserve every instant around the leap second"
+            );
+        }
+    }
+
+    #[test]
+    fn test_utc_leap_second_representation_limit() {
+        // hifitime 4.3.1 folds a parsed UTC :60 onto :59 before these helpers
+        // receive it. A future parser must reject :60 or convert it explicitly;
+        // the normalized TAI representation itself preserves that second.
+        let preceding = Epoch::from_str("2016-12-31T23:59:59 UTC").unwrap();
+        let folded = Epoch::from_str("2016-12-31T23:59:60 UTC").unwrap();
+        assert_eq!(epoch_to_parts(folded), epoch_to_parts(preceding));
+        assert_ne!(
+            epoch_to_parts(folded),
+            epoch_to_parts(Epoch::from_str("2017-01-01T00:00:36 TAI").unwrap())
         );
+    }
+
+    #[test]
+    fn test_row_and_flight_wire_tai_origins_are_distinct() {
+        // J1900 -> J2000 noon is 36,524.5 days = 3,155,716,800 seconds.
+        // Flight JSON uses hifitime's J1900 TAI seconds; row parts use J2000 TAI.
+        let epoch = Epoch::from_str("2025-01-01T00:00:00 UTC").unwrap();
+        assert_eq!(j2000_tai().to_tai_seconds(), 3_155_716_800.0);
+        assert_eq!(epoch.to_tai_seconds(), 3_944_678_437.0);
+        assert_eq!(epoch_to_parts(epoch), (0, 788_961_637_000_000_000));
+        let from_wire = Epoch::from_tai_seconds(3_944_678_437.0);
+        assert_eq!(epoch_to_parts(from_wire), epoch_to_parts(epoch));
     }
 
     #[test]
