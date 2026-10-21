@@ -970,7 +970,7 @@ impl Ledger {
     /// "Best" is determined by:
     /// 1. Most recent timestamp (highest `duration_centuries` / `duration_ns`).
     /// 2. For equal timestamps, source priority: `MEASURED` > `ESTIMATED` > `SIMULATED`.
-    /// 3. For equal timestamps and equal priority, later insertion order wins.
+    /// 3. For equal timestamps and equal priority, the first retained row wins.
     ///
     /// `id_filter`: if `Some`, only rows whose id-column value is in the set are included.
     ///   If this ledger has no `id_column`, an `id_filter` of `Some(_)` returns an empty batch.

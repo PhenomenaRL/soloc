@@ -8,15 +8,17 @@
 //!   cargo test -p spacetimestamp --test itrf93_transforms -- --ignored
 //! ```
 //!
-//! Direct ANISE rotations check Soloc's frame resolution, units and per-row composition;
-//! they are not an independent validation of the underlying Earth orientation model.
+//! Most tests compare the integration against direct ANISE rotations. The CSPICE
+//! fixture test independently checks both directions and all rotation axes against
+//! frozen NAIF results. Input versions and regeneration instructions are documented
+//! in `fixtures/earth_orientation/README.md`.
 
 use anise::constants::frames::{EARTH_ITRF93, EARTH_J2000, IAU_EARTH_FRAME};
 use anise::constants::orientations::ITRF93;
 use anise::prelude::{Almanac, Epoch, Frame};
 use arrow::array::RecordBatch;
 use hifitime::{Duration, TimeScale};
-use nalgebra::{Quaternion, UnitQuaternion, Vector3};
+use nalgebra::{Matrix3, Quaternion, UnitQuaternion, Vector3};
 
 use spacetimestamp::ephemeris::{epoch_from_parts, epoch_to_parts};
 use spacetimestamp::gps::{
@@ -116,6 +118,78 @@ fn reference_frame(name: &str) -> Frame {
         "GCRF" => EARTH_J2000,
         _ => panic!("unexpected test frame: {name}"),
     }
+}
+
+#[test]
+#[ignore = "requires local .pca and Earth .bpc files in SOLOC_KERNEL_PATHS"]
+fn earth_rotations_match_independent_cspice_reference() {
+    // Reference inputs are recorded with hashes beside the fixture. Other kernel
+    // snapshots can run this comparison, but different models may require review
+    // and independent regeneration rather than relaxing the numerical tolerance.
+    let almanac = local_almanac();
+    let frame_name = |name| match name {
+        // CSPICE names the inertial axes J2000; all these transforms keep Earth's
+        // centre, which Soloc identifies as GCRF (399, 1).
+        "J2000" => "GCRF",
+        other => other,
+    };
+    let mut rows = 0;
+    for line in include_str!("fixtures/earth_orientation/cspice_rotations.csv")
+        .lines()
+        .skip(1)
+    {
+        let values: Vec<_> = line.split(',').collect();
+        assert_eq!(values.len(), 12);
+        let at: Epoch = format!("{} UTC", values[0]).parse().unwrap();
+        let from = frame_name(values[1]);
+        let to = frame_name(values[2]);
+        let elements: Vec<f64> = values[3..]
+            .iter()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        let reference = Matrix3::from_row_slice(&elements);
+        for units in [LengthUnit::m, LengthUnit::km] {
+            let input = batch(from, &[(at, units)]);
+            let output = transform_batch(&input, to, &almanac, units, None).unwrap();
+            let actual = StsColumns::try_new(&output).unwrap();
+            let expected_m = reference * Vector3::from(POSITION_KM) * 1_000.0;
+            let actual_m = Vector3::from(actual.position_at(0).map(|v| units.to_km(v) * 1_000.0));
+            let position_error_m = (actual_m - expected_m).norm();
+            assert!(
+                position_error_m < 0.02,
+                "{from} -> {to} at {at}: CSPICE position error {position_error_m} m"
+            );
+            // The input quaternion sends X->Y, Y->Z, Z->X. Check each axis against
+            // the external matrix, including axes that this input position misses.
+            let actual_orientation = quaternion(actual.quaternion_at(0));
+            for (axis, source_axis) in [
+                (Vector3::x(), Vector3::y()),
+                (Vector3::y(), Vector3::z()),
+                (Vector3::z(), Vector3::x()),
+            ] {
+                let axis_error = (actual_orientation * axis - reference * source_axis).norm();
+                assert!(
+                    axis_error < 3e-9,
+                    "{from} -> {to} at {at}: CSPICE orientation-axis error {axis_error}"
+                );
+            }
+        }
+        if from == "ITRF93" {
+            // At the equator/prime meridian this is the exact WGS84 ECEF +X axis;
+            // compare the public GPS conversion directly to the external reference.
+            let actual = wgs84_to_frame_m(0.0, 0.0, 0.0, at, to, &almanac).unwrap();
+            let expected = reference * Vector3::new(6_378_137.0, 0.0, 0.0);
+            assert!(
+                (Vector3::from(actual) - expected).norm() < 0.02,
+                "GPS -> {to} at {at} disagrees with CSPICE"
+            );
+        }
+        rows += 1;
+    }
+    assert_eq!(
+        rows, 8,
+        "both directions at both independent reference epochs"
+    );
 }
 
 #[test]

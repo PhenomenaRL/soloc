@@ -213,8 +213,9 @@ cargo run -p soloc-server --example import_gpx --features gpx -- \
 The example prints the bounded report to stdout, streams original context,
 metadata, segment boundaries and mapping assumptions to stderr, and exits with an
 error if the import is incomplete. Keep that context log and the original file;
-the entity schema does not store GPX metadata or segment gaps. This is an ingestion
-example; correct Earth-relative rendering and gap-aware playback are separate work.
+the entity schema does not store GPX metadata or segment gaps. For Earth-relative
+rendering and gap-aware playback, use the [playback exporter](../soloc-ledger/README.md#earth-relative-gpx-playback-export)
+and [visualizer](../../visualizer/README.md#gpx-playback-with-a-positioned-earth).
 
 ## Roadmap
 

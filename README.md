@@ -26,8 +26,9 @@ explicit reference frame, at an explicit instant, in native units. Tag any data 
 it becomes spatiotemporally addressable, comparable, transformable, and mergeable with everyone
 else's, from a robot deep underwater, to a deep-space probe or construction vehicles on the lunar surface.
 
-- **Store raw, reproject on demand.** Observations are kept forever in their original frame and
-  units. Transforms to any astronomical frame (ICRF, GCRF, body-fixed) happen at query time via a
+- **Store raw, reproject on demand.** Retained observations keep their original frame and
+  units; an optional memory limit evicts older history. Transforms to astronomical frames
+  (ICRF, GCRF, body-fixed) happen at query time via a
   physics engine backed by [NAIF SPICE](https://naif.jpl.nasa.gov/naif/toolkit.html) ephemerides.
 - **Arrow-native throughout.** Every observation is an [Apache Arrow](https://arrow.apache.org/)
   `RecordBatch`. Zero-copy interop with Python (`pyarrow`), Julia, and the rest of the Arrow
@@ -61,15 +62,25 @@ cargo test --workspace
 
 To run the server, see [`crates/soloc-server`](crates/soloc-server/).
 
-GPS fixes can already be converted into complete entity observations. Enable the
-optional `spacetimestamp` **`gpx`** feature to stream GPX 1.1 tracks/routes through
-the same converter, with explicit identity, height and timing policies and preserved
-segment context. Bounded importers now submit through a [local ledger](crates/soloc-ledger/README.md)
-or [existing Flight endpoint](crates/soloc-server/README.md), with counts and partial-failure
-reports. See the [GPS/GPX API and examples](crates/spacetimestamp/README.md#gpx-tracks-and-routes-optional).
-For Earth-relative playback, the [GPX export example](crates/soloc-ledger/README.md#earth-relative-gpx-playback-export)
-adds kernel-derived frame poses and segment provenance. The [visualizer](visualizer/README.md#gpx-playback-with-a-positioned-earth)
-renders the WGS84 surface and leaves gaps in the observations visible.
+The [GPS/GPX workflow](crates/soloc-ledger/README.md#gpsgpx-workflow) covers a single
+fix or GPX 1.1 tracks/routes through conversion, bounded ingestion, query, transform
+and IPC persistence. Run the small Halifax example without kernels:
+
+```bash
+cargo run --locked -p soloc-ledger --features gpx --example import_gpx -- /tmp/halifax.arrow
+```
+
+It uses explicit identities, ellipsoidal heights, time and orientation policies with
+the ordinary-tracking WGS84→ITRF93 approximation. The
+[core API](crates/spacetimestamp/README.md#gps-coordinate-and-time-conversion) documents
+precision limits and failure behavior; [Flight ingestion](crates/soloc-server/README.md#batched-gpx-import)
+uses the existing server. For Earth-relative playback, the
+[exporter](crates/soloc-ledger/README.md#earth-relative-gpx-playback-export) adds
+kernel-derived frame poses and segment provenance. The
+[visualizer](visualizer/README.md#gpx-playback-with-a-positioned-earth) renders the
+WGS84 surface and preserves observation gaps. See the
+[acceptance checks](crates/soloc-ledger/README.md#gpsgpx-acceptance-checks) to reproduce
+the complete validation workflow.
 
 ## Roadmap
 

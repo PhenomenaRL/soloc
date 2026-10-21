@@ -197,7 +197,7 @@ frames. Other ANISE failures retain their underlying explanation. No alternative
 is substituted. See [server kernel configuration](../soloc-server/README.md#itrf93-kernel-configuration).
 
 The required integration tests use explicit local PCA/BPC files covering January 1, 2020
-and January 1, 2025 (TAI). They are ignored in the default suite and never download data;
+and January 1, 2025, through 12:00 UTC. They are ignored in the default suite and never download data;
 an explicit invocation fails if its files or coverage are missing:
 
 ```bash
@@ -205,8 +205,15 @@ SOLOC_KERNEL_PATHS=/path/pck11.pca:/path/earth_high_prec_snapshot.bpc \
   cargo test -p spacetimestamp --test itrf93_transforms -- --ignored
 ```
 
-These tests verify the Soloc pipeline against ANISE rotations; they do not independently
-validate the Earth orientation model.
+The suite includes eight frozen **CSPICE** rotation matrices covering both directions
+of ITRF93 ↔ IAU_EARTH and ITRF93 ↔ GCRF at two epochs, checking positions and every
+attitude axis. The [reference provenance and regeneration instructions](tests/fixtures/earth_orientation/README.md)
+record tool versions, kernel hashes, time conventions and tolerances. CSPICE evaluates
+the shared Earth data independently of ANISE; this checks implementation agreement,
+not independent physical measurements or datum accuracy. The remaining integration
+checks compare Soloc composition against direct ANISE rotations, including missing
+data and coverage failures. See the [full acceptance commands](../soloc-ledger/README.md#gpsgpx-acceptance-checks)
+for ledger/export and browser checks as well.
 
 ## GPS coordinate and time conversion
 
@@ -300,6 +307,22 @@ a partial observation. Private result fields preserve validation until it is app
 unrepresentable time, invalid frame, and transformation failures. Transform errors carry
 the target frame and epoch. A successful batch submitted to a ledger with a different
 schema receives the ledger's existing recoverable schema-mismatch error.
+
+Typical failures and the caller's next action:
+
+| Input | Result and recovery |
+|---|---|
+| Latitude `91` or a non-finite coordinate | `GpsError::InvalidCoordinates`; fix the source input before submitting. |
+| `LocalEnu` with `MEASURED` | `GpsError::InvalidEstimateType`; declare `ESTIMATED`/`SIMULATED`, or supply an actual measured attitude. |
+| `GCRF` with no Earth BPC | `GpsError::Transform` identifies the target, epoch and missing orientation data; load covering data or deliberately store native ITRF93. No fallback is applied automatically. |
+| Epoch outside the loaded BPC | A coverage error; provide a kernel covering the observation instant. Startup-date coverage is insufficient. |
+| GPX point missing `<ele>` or `<time>` | Contextual `GpxError` under required-field policies; correct the input or select an explicit supported height/scheduling policy. |
+| Flight batch exceeds the configured message cap | Rejected before submission; explicitly reduce the batch size or raise both client/server caps. |
+
+These are recoverable errors. Conversion finishes before any observation is appended;
+an importer may already have submitted earlier batches, so inspect its report before
+retrying. The [complete runnable workflow and acceptance checks](../soloc-ledger/README.md#gpsgpx-workflow)
+exercise the public API through querying and persistence.
 
 ### Earth-relative playback frames
 
@@ -522,7 +545,7 @@ Acknowledgement does not promise disk durability or historical retention. A ledg
 memory limit can permanently evict older observations even during small-batch imports.
 Use adequate capacity or explicitly disable eviction for complete-route replay, and
 check retained history with `query`, not just `current_state`. The local example
-disables eviction and checks all five observations survive its three appends. Correct
+disables eviction and checks its single fix and five GPX observations survive. Correct
 Earth-relative visualization and segment-gap playback use the separate
 [playback exporter](../soloc-ledger/README.md#earth-relative-gpx-playback-export),
 which adds kernel-derived frame samples and row provenance without changing
