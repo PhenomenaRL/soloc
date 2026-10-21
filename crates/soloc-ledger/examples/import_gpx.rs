@@ -2,7 +2,7 @@
 //!
 //! cargo run -p soloc-ledger --features gpx --example import_gpx
 //! Add an output path to save the retained entity rows as Arrow IPC. Visualization
-//! still needs Step 6's Earth/frame anchors and segment-aware playback.
+//! needs the `export_gpx` example's Earth/frame anchors and segment provenance.
 
 use std::error::Error;
 

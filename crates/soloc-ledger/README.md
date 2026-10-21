@@ -122,7 +122,72 @@ two disconnected segments in batches of two, explicitly disables eviction, and c
 all five observations remain queryable. It uses SIMULATED poses, explicitly ellipsoidal heights,
 recorded UTC timestamp fields, LocalEnu orientation, and the approximate ITRF93 policy. No kernel
 download is needed. The optional output is entity Arrow IPC plus its name-registry sidecar;
-Earth/frame anchors and segment-aware visualization remain Step 6.
+For correctly positioned Earth playback with segment boundaries, use the separate
+playback export below; the basic ingestion example saves observation rows only.
+
+## Earth-relative GPX playback export
+
+With `gpx` enabled, `gpx::playback::import_gpx_for_playback` combines the existing
+importer with a dedicated export ledger. Observations retain their ITRF93 identity,
+metres, TAI epochs, orientation and unknown optional state. Four nullable columns
+carry original GPX source/object/segment/point provenance. Additional ITRF93 pose
+rows reference GCRF with zero translation and kernel-derived Earth rotation. The
+visualizer therefore resolves `vessel → ITRF93 → GCRF`, with an explicit Earth-centred
+inertial scene. No Earth/IAU_EARTH identities are relabelled and no solar-system
+position is invented.
+
+```rust,ignore
+use soloc_ledger::gpx::playback::{GpxPlaybackOptions, import_gpx_for_playback};
+
+let export = import_gpx_for_playback(
+    reader, &mapper, &almanac, GpxPlaybackOptions::default(),
+    |event| eprintln!("{event:?}"),
+)?;
+export.save_ipc(std::path::Path::new("journey.arrows"))?;
+// Also writes journey.arrows.names.arrow through the existing ledger API.
+```
+
+Supply a local Earth BPC covering the entire first-to-last observation interval,
+including gaps. No kernel download is performed. Frame samples include every
+distinct observation epoch and a uniform TAI cadence (default 60 seconds; maximum
+300 seconds). `GpxPlaybackOptions::new(import_options, cadence_seconds, max_samples)`
+also caps the number of frame samples, at most 1,000,000. `check_itrf93_interval`
+rejects coverage holes; each sample must evaluate successfully. Frame interpolation
+between samples is a display approximation, not a replacement for kernel queries.
+
+The export owns a fresh ledger with eviction disabled and verifies retained row
+counts without allocating a full-history query. It exposes read-only ledger/report
+access and checked `register_name` calls. Incomplete, empty, non-ITRF93 or uncovered
+imports fail before a file is written; the error retains the import report, whose
+accepted counts refer to the discarded private ledger. Explicitly skipped points
+remain visible in the report and create discontinuities in playback. Full export
+requires enough memory to retain the journey; bounded ingestion does not make this
+an out-of-core storage system. Saving the IPC and names files uses the existing
+nontransactional filesystem API.
+
+The viewer validates the versioned metadata and embedded provenance before playing
+the file. It connects only consecutive source points in the same object/segment,
+with compatible frame/units and increasing timestamps. Skipped points, segment
+boundaries, reversals and duplicate epochs break interpolation and trails. It hides
+the marker during gaps and outside coverage; at a duplicate instant, the last row
+in file order is shown, with no interpolation into or out of the duplicate group.
+Original rows are preserved. GPX paths are never fitted to a full orbital circle.
+
+Run the synthetic five-point Halifax example with an explicit local kernel:
+
+```bash
+SOLOC_KERNEL_PATHS=/path/to/earth_latest_high_prec.bpc \
+  cargo run -p soloc-ledger --features gpx --example export_gpx -- \
+  visualizer/public/data/halifax-gpx.arrows
+npm --prefix visualizer run dev
+```
+
+Open `http://localhost:5173/?src=/data/halifax-gpx.arrows`, or load the two output
+files using the viewer's file picker or drag-and-drop. A small generated artifact
+is checked in for offline frontend tests and immediate viewing; its [provenance
+and regeneration instructions](../../visualizer/public/data/README.md) identify
+the input and Earth kernel. The example deliberately includes a gap from
+12:00:20 to 12:05:00 UTC (12:00:57 to 12:05:37 TAI).
 
 ```sh
 cargo run --locked --offline -p soloc-ledger --features gpx --example import_gpx

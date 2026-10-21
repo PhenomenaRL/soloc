@@ -16,6 +16,9 @@ use spacetimestamp::gps::gpx::{
 
 use crate::ledger::Ledger;
 
+/// Earth-frame anchors and source-aware playback exports.
+pub mod playback;
+
 /// Stream GPX observations into an existing ledger in bounded Arrow batches.
 ///
 /// Each successful [`Ledger::append`] is confirmed in the returned report. A

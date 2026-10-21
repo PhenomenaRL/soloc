@@ -53,6 +53,54 @@ Not yet wired up: a live Arrow Flight (gRPC-web) connection straight to
 by `soloc-server`'s own `file://`/`s3://`/`gs://`/`az://` storage. See
 "v2 candidates" below.
 
+## GPX playback with a positioned Earth
+
+The small, checked-in Halifax export can be opened immediately at
+`http://localhost:5173/?src=/data/halifax-gpx.arrows` after `npm run dev`.
+Click **halifax-vessel** to inspect its source point and focus the route.
+Its Earth map is unlit because this Earth-centred export has no Sun or lighting
+model; apparent darkness must not imply an actual day/night calculation.
+
+Use the production `export_gpx` example described in the ledger README to
+generate a GPX playback `.arrows` file and its `.names.arrow` sibling, then
+drop both files onto this viewer or use the file picker. The ledger remains
+TAI-normalized and observations retain their native ITRF93 coordinates in
+metres. The export adds sampled ITRF93 poses under the Earth-centred inertial
+GCRF root; it does not claim to include Earth's solar-system translation.
+The initial view focuses Earth, and clicking the route approaches from above
+the surface. Playback starts at one minute per second; real-time and ten-second
+speeds are also available.
+
+The dedicated export schema includes `soloc:gpx_playback=1` and
+`soloc:gpx_earth_frame=<ITRF93 prescribed ID>` metadata, plus nullable
+`gpx_source`, `gpx_object`, `gpx_segment` and `gpx_point` columns. These are
+export-only provenance columns; they do not change EntitySchema. Earth anchor
+rows have null provenance. The loader rejects missing or unsupported metadata,
+incomplete provenance, absent anchors, uncovered observations, duplicate anchor
+epochs and anchor intervals over 300 seconds. Loading the raw Step 5 import
+without its ITRF93 pose timeline produces an explanatory error instead of
+silently treating Earth-fixed coordinates as inertial coordinates.
+
+Interpolation is limited to consecutive original points within one source,
+object and segment, with strictly increasing timestamps and matching frame and
+units. Segment boundaries, skipped points, reversed timestamps and duplicate
+epochs break the path. At a duplicate instant the last original-file row is
+shown, but no interpolation enters or leaves that duplicate group. Between
+runs and outside the observed interval, the marker, label and live tree edge
+are hidden and the inspector reports no observation. Completed trail segments
+remain visible as history, without connecting lines across gaps. GPX trails
+never trigger the orbital-circle fitting used by the solar-system demo.
+
+The Earth surface attaches to the actual ITRF93 anchor and uses the WGS84
+ellipsoid, with geographic latitude mapped to texture V, north on +Z,
+longitude zero on +X and east on +Y. Positions are not lifted or distorted to
+match a sphere. Surface triangles and textures remain visual approximations:
+the 512-column mesh has roughly 120 m maximum local chord sag, contains no
+terrain, and cannot verify metre-level height by eye. Numerical checks against
+the stored coordinates establish height and scale; the inspector shows the
+original values. Frame poses are interpolated between exported kernel samples,
+so playback is an approximation between those samples.
+
 ## What you're looking at
 
 A 7-day window, 2026-08-01 → 08-08 TAI, written through a real `Ledger` —
@@ -177,7 +225,7 @@ reading the UVs back off the geometry.
 
 - Live Arrow Flight (gRPC-web) connection to `soloc-server`
 - Real body centres for Mars and the giants, given a satellite SPK
-- Body-centred *inertial* frames (GCRF and friends) as first-class anchors —
-  today an id with no rows resolves to the world root, which is right for ICRF
-  and wrong for GCRF; nothing in the fixture uses one
+- Mixing body-centred inertial roots with a barycentric solar-system scene —
+  GPX exports deliberately use GCRF as their sole Earth-centred root. A combined
+  scene would also need an explicit GCRF translation under ICRF.
 - Covariance ellipsoid rendering (inspector shows raw values today)

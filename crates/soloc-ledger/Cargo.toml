@@ -12,6 +12,10 @@ gpx = ["spacetimestamp/gpx"]
 name = "import_gpx"
 required-features = ["gpx"]
 
+[[example]]
+name = "export_gpx"
+required-features = ["gpx"]
+
 [dependencies]
 spacetimestamp = { path = "../spacetimestamp" }
 anise.workspace = true

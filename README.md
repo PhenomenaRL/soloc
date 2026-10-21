@@ -67,7 +67,9 @@ the same converter, with explicit identity, height and timing policies and prese
 segment context. Bounded importers now submit through a [local ledger](crates/soloc-ledger/README.md)
 or [existing Flight endpoint](crates/soloc-server/README.md), with counts and partial-failure
 reports. See the [GPS/GPX API and examples](crates/spacetimestamp/README.md#gpx-tracks-and-routes-optional).
-Correct Earth-relative track playback remains separate work.
+For Earth-relative playback, the [GPX export example](crates/soloc-ledger/README.md#earth-relative-gpx-playback-export)
+adds kernel-derived frame poses and segment provenance. The [visualizer](visualizer/README.md#gpx-playback-with-a-positioned-earth)
+renders the WGS84 surface and leaves gaps in the observations visible.
 
 ## Roadmap
 
@@ -80,7 +82,7 @@ schema library, the tooling, and the integrations around it.
 - [x] Arrow Flight server (proof-of-concept)
 - [x] Single GPS observation conversion and optional GPX 1.1 parsing/mapping
 - [x] Batched GPX ingestion and partial-completion reports (local ledger / Flight)
-- [ ] Correct Earth-relative track playback
+- [x] Earth-relative GPX export and playback with explicit segment gaps
 - [ ] Debugging / visualizer tool for inspecting frames, chains, and poses
 - [ ] Ledger performance benchmarks and storage-organization optimizations
 - [ ] Ecosystem integrations — ROS2 [tf2](https://wiki.ros.org/tf2),

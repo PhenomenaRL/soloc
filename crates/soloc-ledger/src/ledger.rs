@@ -609,6 +609,14 @@ impl Ledger {
         self.all_segments().count()
     }
 
+    /// Number of observation rows currently retained, including pinned latest
+    /// rows. Unlike [`Self::len`], this counts rows rather than storage segments
+    /// and does not allocate or concatenate a query result. Evicted history is
+    /// excluded.
+    pub fn row_count(&self) -> usize {
+        self.all_batches().map(RecordBatch::num_rows).sum()
+    }
+
     /// Returns `true` if the ledger holds no batches.
     pub fn is_empty(&self) -> bool {
         self.len() == 0

@@ -301,6 +301,22 @@ unrepresentable time, invalid frame, and transformation failures. Transform erro
 the target frame and epoch. A successful batch submitted to a ledger with a different
 schema receives the ledger's existing recoverable schema-mismatch error.
 
+### Earth-relative playback frames
+
+`gps::itrf93_frame_snapshot(&almanac, epoch)` returns one ordinary entity row posing
+ITRF93 relative to **GCRF**, with zero translation and the kernel-derived rotation.
+It uses metres, J2000 TAI, `ESTIMATED`, and source `anise:almanac`; optional state stays
+unknown. Append these display frame samples alongside native ITRF93 observations
+to resolve `receiver → ITRF93 → GCRF`. GCRF is an Earth-centred root, not the
+solar-system barycentre. No relabelling or alteration of the observations is needed.
+
+Only an Earth BPC is required. `gps::check_itrf93_interval(&almanac, start, end)`
+checks continuous segment coverage, including internal gaps and actual kernel
+selection; every snapshot still evaluates its selected kernel. Sample both ends
+of the route, observation times, and intermediate epochs at a short cadence.
+Interpolation is a display approximation. The viewer's terrestrial mesh should
+use the ITRF93 anchor; the canonical `Earth` ID continues to mean IAU_EARTH.
+
 ## GPX tracks and routes (optional)
 
 Enable `spacetimestamp`'s **`gpx` feature** to use `gps::gpx`. XML/calendar parsing
@@ -507,7 +523,10 @@ memory limit can permanently evict older observations even during small-batch im
 Use adequate capacity or explicitly disable eviction for complete-route replay, and
 check retained history with `query`, not just `current_state`. The local example
 disables eviction and checks all five observations survive its three appends. Correct
-Earth-relative visualization and segment-gap playback remain Step 6.
+Earth-relative visualization and segment-gap playback use the separate
+[playback exporter](../soloc-ledger/README.md#earth-relative-gpx-playback-export),
+which adds kernel-derived frame samples and row provenance without changing
+the original observations' frame semantics.
 
 ```bash
 cargo test --locked --offline -p spacetimestamp --features gpx

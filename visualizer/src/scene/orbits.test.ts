@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { EntityRow } from "../arrow/loader";
-import { countAtOrBefore, guideLine } from "./orbits";
+import { countAtOrBefore, guideLine, guideLines } from "./orbits";
 
 const HOUR = 3_600_000_000_000n;
 
@@ -124,4 +124,17 @@ describe("guideLine", () => {
     const atOrigin = [0, 1].map((h) => row({ epochNs: BigInt(h) * HOUR }));
     expect(guideLine(atOrigin, "earth")).toBeNull();
   });
+});
+
+it("renders constant-radius GPX samples as separate segment trails, never full orbits", () => {
+  const rows = [0, 1, 2, 3].map((i) => row({
+    rowIndex: i, epochNs: BigInt(i) * HOUR,
+    position: [6378 * Math.cos(i / 100), 6378 * Math.sin(i / 100), 0],
+    gpx: { source: "gps.gpx", object: "track:1", segment: i < 2 ? 1n : 2n, point: BigInt(i % 2 + 1) },
+  }));
+  const guides = guideLines(rows, "earth");
+  expect(guides).toHaveLength(2);
+  expect(guides.every((g) => g.kind === "trail" && g.points.length === 6)).toBe(true);
+  expect(guides[0]!.epochs).toEqual([0n, HOUR]);
+  expect(guides[1]!.epochs).toEqual([2n * HOUR, 3n * HOUR]);
 });

@@ -27,11 +27,13 @@ use crate::transforms::check_itrf93_coverage;
 #[cfg(feature = "gpx")]
 pub mod gpx;
 mod observation;
+mod playback;
 
 pub use observation::{
     ConvertedGpsObservation, GpsError, GpsObservation, GpsOptions, GpsOrientation,
     convert_gps_observation, gps_observation_to_batch,
 };
+pub use playback::{check_itrf93_interval, itrf93_frame_snapshot};
 
 // WGS84 defining ellipsoid parameters, independent of loaded planetary constants.
 // https://earth-info.nga.mil/index.php?action=wgs84&dir=wgs84
