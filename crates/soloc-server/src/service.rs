@@ -705,6 +705,205 @@ mod tests {
     use soloc_ledger::schemas::entity::EntityBuilder;
     use spacetimestamp::vocabulary::{EstimateType, TimeScaleCode};
 
+    #[cfg(feature = "gpx")]
+    mod gpx_import {
+        use super::*;
+        use soloc_server::gpx::submit_batch;
+        use spacetimestamp::gps::{gpx::*, GpsOptions, GpsOrientation};
+        use spacetimestamp::identity::{as_id_column, id_at};
+        use spacetimestamp::schema::StsColumns;
+
+        const GPX: &[u8] =
+            include_bytes!("../../spacetimestamp/tests/fixtures/gpx/multiple_objects.gpx");
+
+        fn mapper() -> GpxMapper<'static> {
+            let mut mapping = GpxMapping {
+                gps: GpsOptions::new(
+                    demo("gpx-vessel"),
+                    PrescribedId::abstract_source("demo", "gpx-receiver").unwrap(),
+                ),
+                height: GpxHeightPolicy::EllipsoidalElevation,
+                time: GpxTimePolicy::RequireTimestamp,
+                orientation: GpsOrientation::LocalEnu,
+            };
+            let first = [
+                (GpxObjectId::Route(1), mapping),
+                (GpxObjectId::Track(1), mapping),
+            ];
+            mapping.gps.entity_id = demo("gpx-second-vessel");
+            GpxMapper::new(
+                "flight.gpx",
+                first.into_iter().chain([(GpxObjectId::Track(2), mapping)]),
+            )
+            .unwrap()
+        }
+
+        async fn import(
+            client: arrow_flight::flight_service_client::FlightServiceClient<
+                tonic::transport::Channel,
+            >,
+            cap: usize,
+        ) -> GpxImportReport {
+            import_gpx_async(
+                GpxReader::new(GPX, "flight.gpx", WaypointPolicy::Reject),
+                &mapper(),
+                &Almanac::default(),
+                GpxImportOptions::new(2, GpxPointErrorPolicy::Strict).unwrap(),
+                |batch| submit_batch(client.clone(), batch, cap),
+                |_| {},
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn gpx_batches_round_trip_through_existing_flight_and_reimport_duplicates() {
+            // No retention cap: every imported observation must remain queryable.
+            let service = make_service().await;
+            let mut client = serve(service).await;
+            for repeat in 1..=2 {
+                let report = import(client.clone(), DEFAULT_MAX_MESSAGE_SIZE).await;
+                assert!(report.complete, "{report:?}");
+                assert_eq!(report.read, 6);
+                assert_eq!(report.converted, 6);
+                assert_eq!(report.submitted, 6);
+                assert_eq!(report.submitted_batches, 3);
+                assert_eq!(report.uncertain, 0);
+                assert_eq!(report.unsubmitted, 0);
+                let replies = client
+                    .do_get(Ticket::new(br#"{"query_type":"filter"}"#.to_vec()))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .map_err(|error| FlightError::Tonic(Box::new(error)));
+                let batches: Vec<_> = FlightRecordBatchStream::new_from_flight_data(replies)
+                    .try_collect()
+                    .await
+                    .unwrap();
+                let all = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+                assert_eq!(all.num_rows(), repeat * 6);
+                let ids =
+                    as_id_column(all.column_by_name("entity_id").unwrap(), "entity_id").unwrap();
+                let columns = StsColumns::try_new(&all).unwrap();
+                for row in 0..all.num_rows() {
+                    let expected = if row % 6 == 5 {
+                        demo("gpx-second-vessel")
+                    } else {
+                        demo("gpx-vessel")
+                    };
+                    assert_eq!(id_at(ids, row).unwrap(), expected);
+                    assert_eq!(
+                        columns.source_at(row).unwrap(),
+                        PrescribedId::abstract_source("demo", "gpx-receiver").unwrap()
+                    );
+                    assert_eq!(
+                        columns.frame_at(row).unwrap().astro_frame(),
+                        Some((399, 3000))
+                    );
+                }
+                // Duplicate and reversed-time points survive the Flight boundary.
+                assert_eq!(all.slice(1, 1), all.slice(2, 1));
+                assert!(columns.epoch_parts_at(3).1 < columns.epoch_parts_at(2).1);
+                if repeat == 2 {
+                    assert_eq!(all.slice(0, 6), all.slice(6, 6));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn gpx_size_preflight_rejects_without_appending() {
+            let service = make_service().await;
+            let state = service.state.clone();
+            let client = serve(service).await;
+            let report = import(client, 1).await;
+            assert!(!report.complete);
+            assert_eq!(report.read, 2);
+            assert_eq!(report.converted, 2);
+            assert_eq!(report.submitted, 0);
+            assert_eq!(report.rejected, 2);
+            assert_eq!(report.uncertain, 0);
+            assert!(state.ledger.read().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn gpx_server_error_is_uncertain_and_is_not_retried() {
+            let service = make_service().await;
+            let state = service.state.clone();
+            let client = serve(service).await;
+            let mut calls = 0;
+            let report = import_gpx_async(
+                GpxReader::new(GPX, "flight.gpx", WaypointPolicy::Reject),
+                &mapper(),
+                &Almanac::default(),
+                GpxImportOptions::new(2, GpxPointErrorPolicy::Strict).unwrap(),
+                |batch| {
+                    calls += 1;
+                    // A later incompatible batch reaches the real server and
+                    // fails after the first request was already acknowledged.
+                    let batch = if calls == 2 {
+                        batch.project(&[0, 1]).unwrap()
+                    } else {
+                        batch
+                    };
+                    submit_batch(client.clone(), batch, DEFAULT_MAX_MESSAGE_SIZE)
+                },
+                |_| {},
+            )
+            .await;
+            assert_eq!(calls, 2);
+            assert!(!report.complete);
+            assert_eq!(report.submitted, 2);
+            assert_eq!(report.submitted_batches, 1);
+            assert_eq!(report.uncertain, 2);
+            assert_eq!(report.rejected, 0);
+            assert_eq!(report.last_submitted.unwrap().last.point, Some(1));
+            assert_eq!(
+                state
+                    .ledger
+                    .read()
+                    .unwrap()
+                    .query(&SpatiotemporalFilter::new())
+                    .unwrap()
+                    .num_rows(),
+                2
+            );
+        }
+
+        #[tokio::test]
+        async fn gpx_later_parse_failure_preserves_acknowledged_prefix() {
+            let service = make_service().await;
+            let state = service.state.clone();
+            let client = serve(service).await;
+            let mut malformed = GPX.to_vec();
+            // The valid points arrive first, but trailing XML prevents completed EOF.
+            malformed.extend_from_slice(b"<broken");
+            let report = import_gpx_async(
+                GpxReader::new(malformed.as_slice(), "flight.gpx", WaypointPolicy::Reject),
+                &mapper(),
+                &Almanac::default(),
+                GpxImportOptions::new(4, GpxPointErrorPolicy::Strict).unwrap(),
+                |batch| submit_batch(client.clone(), batch, DEFAULT_MAX_MESSAGE_SIZE),
+                |_| {},
+            )
+            .await;
+            assert!(!report.complete);
+            assert_eq!(report.converted, 6);
+            assert_eq!(report.submitted, 4);
+            assert_eq!(report.submitted_batches, 1);
+            assert_eq!(report.unsubmitted, 2);
+            assert_eq!(report.uncertain, 0);
+            assert_eq!(
+                state
+                    .ledger
+                    .read()
+                    .unwrap()
+                    .query(&SpatiotemporalFilter::new())
+                    .unwrap()
+                    .num_rows(),
+                4
+            );
+        }
+    }
+
     /// Mints a test entity id under the `demo` authority.
     fn demo(name: &str) -> PrescribedId {
         PrescribedId::new("demo", name).unwrap()

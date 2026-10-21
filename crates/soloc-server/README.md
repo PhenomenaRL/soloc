@@ -149,6 +149,73 @@ writer.done_writing()
 transformed = next(reader).data
 ```
 
+## Batched GPX import
+
+Enable this crate's `gpx` feature to use `soloc_server::gpx::submit_batch` with
+`spacetimestamp::gps::gpx::import_gpx_async`. The importer streams the input and
+awaits each batch submission before continuing. The helper uses the existing
+`do_put` endpoint, with **one unsplit Arrow batch per request**. It checks the exact
+protobuf size of every message, including the schema, against your supplied
+`max_message_size` and applies that cap to the client too. Set it to the server's
+configured cap or less; the server's default is 67,108,864 bytes (64 MiB). If a
+message is too large, that batch is rejected before any RPC; reduce `max_rows`
+explicitly or raise the cap on both sides.
+
+```rust,ignore
+use soloc_server::gpx::submit_batch;
+use spacetimestamp::gps::gpx::import_gpx_async;
+
+let report = import_gpx_async(
+    reader, &mapper, &almanac, options,
+    |batch| submit_batch(client.clone(), batch, 67_108_864),
+    |event| { /* stream context/assumptions to your audit output */ },
+).await;
+```
+
+A successful response, including its final stream status, confirms that batch was
+appended. `report.submitted` counts these acknowledged rows. Earlier requests remain
+accepted after a later failure. Encoding and size failures count as rejected; every
+RPC error counts the current batch as **uncertain**, because this protocol supplies
+no commit receipt. It may already have been appended. The importer stops and does
+not retry, and reports the batch's first/last source positions. A malformed file
+can also stop the import after earlier batches were accepted; any buffered rows
+are reported as unsubmitted and are not flushed after that error.
+
+Reimporting a file appends its observations again, preserving duplicates. There is
+no import ID, deduplication, rollback or whole-file transaction. Reconcile uncertain
+rows before a manual retry. Acknowledgement is also separate from persistence:
+use the existing save/shutdown facilities when durable storage is required.
+
+For complete-route replay, omit `storage.memory_limit` on the server or provision
+and verify sufficient retention. A memory cap can permanently evict old history
+while preserving each entity's latest row; small import batches do not prevent
+this. The integration tests use an in-memory server with no cap and query every
+imported observation back through Flight.
+
+The included example maps explicitly listed tracks/routes to one supplied entity
+and receiver, requires recorded timestamps, declares conventional local ENU axes
+and approximate ITRF93 output, and rejects waypoints and unmapped objects. Its
+required `--ellipsoidal-elevation` flag declares that `<ele>` is WGS84 ellipsoidal
+height; select another production mapping policy for other height datums.
+
+Start the normal server, then run this from the repository root against the
+synthetic six-point test fixture:
+
+```bash
+cargo run -p soloc-server --example import_gpx --features gpx -- \
+  http://localhost:50051 \
+  crates/spacetimestamp/tests/fixtures/gpx/multiple_objects.gpx \
+  example.org fixture-vessel fixture-receiver 2 67108864 \
+  --ellipsoidal-elevation route:1 track:1 track:2 \
+  2>gpx-import-context.log
+```
+
+The example prints the bounded report to stdout, streams original context,
+metadata, segment boundaries and mapping assumptions to stderr, and exits with an
+error if the import is incomplete. Keep that context log and the original file;
+the entity schema does not store GPX metadata or segment gaps. This is an ingestion
+example; correct Earth-relative rendering and gap-aware playback are separate work.
+
 ## Roadmap
 
 - [x] **Proof-of-concept demo complete** — Flight `do_get` / `do_put` / `do_exchange` plus the

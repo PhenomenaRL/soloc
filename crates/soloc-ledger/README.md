@@ -67,6 +67,70 @@ ledger.append(celestial_snapshot(&almanac, &ids, epoch)?)?;
 let orbits = celestial_orbits(&almanac, &[(earth, None), (moon, None)], epoch, 361)?;
 ```
 
+## GPX ingestion (optional)
+
+Enable `soloc-ledger`'s `gpx` feature to use
+`soloc_ledger::gpx::import_gpx_into_ledger`. It streams the GPX reader through explicit
+track/route mappings and the shared GPS converter, building batches of at most the configured
+row count. The [core GPX documentation](../spacetimestamp/README.md#gpx-tracks-and-routes-optional)
+describes identity, timestamp, elevation, and orientation policies.
+
+```rust
+use soloc_ledger::gpx::import_gpx_into_ledger;
+use spacetimestamp::gps::gpx::{GpxImportOptions, GpxPointErrorPolicy};
+
+// `reader`, `mapper`, and `almanac` use the core GPX API. Keep the source file
+// and consume observer events when segment boundaries or provenance matter.
+let report = import_gpx_into_ledger(
+    &mut ledger,
+    reader,
+    &mapper,
+    &almanac,
+    GpxImportOptions::new(1024, GpxPointErrorPolicy::Strict)?,
+    |event| { /* stream metadata, mapping assumptions, and outcomes to a sidecar */ },
+);
+if !report.complete {
+    eprintln!("Partial import: {report:#?}");
+}
+```
+
+`Strict` stops at the first mapping failure. `SkipInvalid` records and skips those points,
+continuing to subsequent points; malformed XML and other reader errors always stop. The report
+counts complete points read, converted, confirmed submitted, skipped and failed, as well as
+rejected batches' rows and converted rows left unsubmitted. A malformed point that the reader
+could not emit is identified by the reader failure rather than counted as a complete point.
+The report and observer preserve source/object/segment/point context. Observer mapping events
+precede acceptance; only submission outcomes confirm that rows entered the ledger.
+
+Each local append either accepts its whole batch or rejects it without changing the ledger.
+Previously accepted batches remain after a later error. Pending converted points are left
+unsubmitted on a parsing or strict mapping failure. There is no whole-file transaction,
+automatic retry, or idempotency key: reimporting a file appends duplicate observations.
+Retain the source, mapping configuration, report and observer output before deciding how to
+recover a partial import. The report alone does not contain every point's provenance or policies.
+
+**Submission is not retention.** This helper preserves the existing memory limit. A configured
+rolling window can permanently evict the beginning of a journey while an import succeeds.
+For complete-route history, explicitly use adequate capacity or `ledger.set_memory_limit(None)`
+before importing. Removing a limit afterwards cannot recover evicted data. `current_state`
+returns the latest pose per entity; query history when verifying the complete route. Persist
+the ledger with `save_ipc` if it must outlive the process. Entity IPC does not include GPX segment
+boundaries or source metadata; retain those separately and keep the original input.
+
+The [minimal example](examples/import_gpx.rs) imports five synthetic Halifax observations across
+two disconnected segments in batches of two, explicitly disables eviction, and checks that
+all five observations remain queryable. It uses SIMULATED poses, explicitly ellipsoidal heights,
+recorded UTC timestamp fields, LocalEnu orientation, and the approximate ITRF93 policy. No kernel
+download is needed. The optional output is entity Arrow IPC plus its name-registry sidecar;
+Earth/frame anchors and segment-aware visualization remain Step 6.
+
+```sh
+cargo run --locked --offline -p soloc-ledger --features gpx --example import_gpx
+# Optional: persist the entity rows after verifying full history retention.
+cargo run --locked --offline -p soloc-ledger --features gpx --example import_gpx -- /tmp/halifax.arrow
+cargo test --locked --offline -p soloc-ledger --features gpx --test gpx_import
+```
+
 ## Roadmap
 
 - [x] **Core capabilities** — append, spatiotemporal & current-state queries, IPC persistence

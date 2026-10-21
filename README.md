@@ -64,9 +64,10 @@ To run the server, see [`crates/soloc-server`](crates/soloc-server/).
 GPS fixes can already be converted into complete entity observations. Enable the
 optional `spacetimestamp` **`gpx`** feature to stream GPX 1.1 tracks/routes through
 the same converter, with explicit identity, height and timing policies and preserved
-segment context. See the [GPS/GPX API and examples](crates/spacetimestamp/README.md#gpx-tracks-and-routes-optional).
-Whole-file batch submission, import reports and Earth-relative track playback remain
-separate work.
+segment context. Bounded importers now submit through a [local ledger](crates/soloc-ledger/README.md)
+or [existing Flight endpoint](crates/soloc-server/README.md), with counts and partial-failure
+reports. See the [GPS/GPX API and examples](crates/spacetimestamp/README.md#gpx-tracks-and-routes-optional).
+Correct Earth-relative track playback remains separate work.
 
 ## Roadmap
 
@@ -78,7 +79,8 @@ schema library, the tooling, and the integrations around it.
 - [x] Bounded ledger memory: a rolling-window memory limit that keeps each entity's latest state
 - [x] Arrow Flight server (proof-of-concept)
 - [x] Single GPS observation conversion and optional GPX 1.1 parsing/mapping
-- [ ] Batched GPX ingestion/results and correct Earth-relative track playback
+- [x] Batched GPX ingestion and partial-completion reports (local ledger / Flight)
+- [ ] Correct Earth-relative track playback
 - [ ] Debugging / visualizer tool for inspecting frames, chains, and poses
 - [ ] Ledger performance benchmarks and storage-organization optimizations
 - [ ] Ecosystem integrations — ROS2 [tf2](https://wiki.ros.org/tf2),

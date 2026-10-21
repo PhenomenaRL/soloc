@@ -35,5 +35,5 @@ jobs:
       # Kernel-dependent tests are #[ignore]d, so this downloads no SPICE data.
       # To run them locally: cargo test --workspace -- --ignored
       - run: cargo test --workspace
-      # The optional GPX input adapter is not built by default.
-      - run: cargo test -p spacetimestamp --features gpx
+      # Optional GPX parsing, local ingestion and Flight submission are not built by default.
+      - run: cargo test --workspace --all-features

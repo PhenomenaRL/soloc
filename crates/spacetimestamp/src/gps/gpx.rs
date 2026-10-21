@@ -10,6 +10,9 @@
 //! Names are metadata, never globally unique identities. Missing time and elevation
 //! fail unless the caller explicitly supplies the applicable policy. Conversion
 //! reuses [`convert_gps_observation`](crate::gps::convert_gps_observation) and does not append to a ledger.
+//! Use [`import_gpx`](crate::gps::gpx::import_gpx) or
+//! [`import_gpx_async`](crate::gps::gpx::import_gpx_async) to build bounded batches
+//! and submit through a caller-supplied sink, with partial-completion accounting.
 //!
 //! [`GpxEvent`](crate::gps::gpx::GpxEvent) retains object/segment boundaries and reports ignored XML. A mapped
 //! point retains its original fields, context, and selected height/time policies;
@@ -56,6 +59,14 @@
 //!         _ => {}
 //!     }
 //! }
+//! let report = import_gpx(
+//!     GpxReader::new(xml.as_slice(), "journey.gpx", WaypointPolicy::Reject),
+//!     &mapper, &Almanac::default(), GpxImportOptions::default(),
+//!     |batch| { assert_eq!(batch.num_rows(), 1); Ok(()) }, // replace with your append sink
+//!     |event| { /* stream provenance to your sidecar here */ },
+//! );
+//! assert!(report.complete);
+//! assert_eq!(report.submitted, 1);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
@@ -70,6 +81,11 @@ use crate::EstimateType;
 
 mod reader;
 pub use reader::GpxReader;
+mod import;
+pub use import::{
+    GpxBatchInfo, GpxImportEvent, GpxImportFailure, GpxImportOptions, GpxImportReport,
+    GpxPointErrorPolicy, GpxSubmitError, GpxSubmitOutcome, import_gpx, import_gpx_async,
+};
 
 /// One-based ordinal within the file, counted separately for tracks and routes.
 /// A name is not used as identity; empty objects still consume an ordinal.

@@ -89,6 +89,20 @@ pub struct GpxReader<R: BufRead> {
 }
 
 impl<R: BufRead> GpxReader<R> {
+    pub(super) fn is_started(&self) -> bool {
+        self.root_seen || self.done
+    }
+
+    /// Source label used by every event and diagnostic.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Explicit treatment of standalone waypoints selected at construction.
+    pub fn waypoint_policy(&self) -> WaypointPolicy {
+        self.waypoints
+    }
+
     pub fn new(reader: R, source: impl Into<String>, waypoints: WaypointPolicy) -> Self {
         let mut reader = NsReader::from_reader(reader);
         reader.config_mut().expand_empty_elements = true;

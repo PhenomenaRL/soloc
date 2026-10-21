@@ -427,10 +427,87 @@ so trailing malformed input is not reported as a complete file. A point mapping 
 does not mutate any builder or ledger; the caller may stop or explicitly record it as
 a skipped point. Points emitted before a later parse error are not rolled back.
 
-The reader and mapper retain one point at a time, not an entire journey. Step 5 still
-needs configurable Arrow batching, storage/Flight submission, import-result counts,
-retry rules and partial-completion reporting. Correct Earth-relative visualization
-and segment-gap playback remain Step 6.
+### Bounded ingestion and import results
+
+`import_gpx` combines a fresh `GpxReader`, an explicit `GpxMapper`, an almanac,
+`GpxImportOptions`, an append callback, and a provenance observer. The asynchronous
+`import_gpx_async` awaits each submission before reading another batch. Both reuse
+the single-observation converter and `EntityBuilder`, preserve file order and stable
+IDs, and hold one output batch plus current XML/point state. Neither requires the
+whole input or all output rows in memory. The sink and observer control their own
+memory use; the parser's individual-event buffering limits still apply.
+
+`GpxImportOptions::new(max_rows, point_errors)` accepts 1–65,536 rows, defaulting to
+1,024 with `GpxPointErrorPolicy::Strict`. This bounds builder allocation; it does not
+guarantee an encoded Flight message will fit. `SkipInvalid` explicitly skips mapping
+failures such as missing elevation/time. Reader failures, including malformed point
+coordinates and invalid XML, always stop because that reader cannot resume safely.
+The final short batch is submitted only after validated EOF. Batches may span GPX
+objects and segments; this does not join those segments into a continuous trajectory.
+
+```rust,ignore
+// With a fresh reader, mapper, almanac and ledger already constructed:
+use spacetimestamp::gps::gpx::*;
+let report = import_gpx(
+    reader, &mapper, &almanac,
+    GpxImportOptions::new(512, GpxPointErrorPolicy::Strict)?,
+    |batch| ledger.append(batch).map_err(GpxSubmitError::rejected),
+    |event| eprintln!("{event:?}"), // stream context/assumptions to a sidecar
+);
+// Inspect the report even after failure: earlier batches remain appended.
+println!("{report:#?}");
+```
+
+The [ledger adapter and runnable example](../soloc-ledger/README.md) wrap that sink;
+enable `soloc-ledger/gpx`. The [Flight helper and CLI example](../soloc-server/README.md)
+use `soloc-server/gpx` and the existing `do_put` endpoint. There is no dedicated GPS
+RPC. Flight submits one unsplit batch per request and checks the exact protobuf size
+of every message, including the schema, against the caller's configured server limit.
+Oversized batches fail before sending; explicitly reduce `max_rows` or raise both
+limits. A successful request confirms its batch. A request/response failure leaves
+that batch uncertain, since the existing protocol has no commit receipt.
+
+`GpxImportReport` keeps bounded summaries and the last skipped error:
+
+| Field | Meaning |
+|---|---|
+| `read` | Complete point events consumed; excludes a malformed point the reader could not emit. |
+| `converted` | Points successfully converted to entity rows. |
+| `submitted` | Rows whose append was acknowledged by the sink. |
+| `skipped` / `failed` | Mapping failures skipped by policy / the fatal strict mapping failure. |
+| `rejected` | Converted rows the sink guarantees it did not accept. |
+| `uncertain` | Converted rows the sink may have accepted. |
+| `unsubmitted` | Converted rows still buffered at an input/mapping failure, never sent. |
+| `last_submitted` / `pending` | Batch ordinal, row count and original first/last source contexts. |
+| `failure` | Terminal reader, mapping or submission error, with source/batch context. |
+| `complete` | Validated EOF and all output batches acknowledged; skips remain explicit. |
+
+The accounting invariants are `read = converted + skipped + failed` and
+`converted = submitted + rejected + uncertain + unsubmitted`. On early failure,
+these describe the consumed prefix; they do not claim a count for the unread file.
+A reader failure is reported even when it produced no complete point to count.
+The observer receives all original input events, mapped points with their explicit
+identity/frame/height/time/orientation/estimate policies, skipped diagnostics and
+batch outcomes. Conversion events precede acknowledgement. Store them separately
+if needed; the report retains endpoints, not an unbounded per-point log. The report
+also records the source label, batching/error policy and waypoint policy.
+Keep the original input and caller mapping configuration alongside the report and
+observer output when complete provenance is required; the report alone is not a
+per-point record of every policy and diagnostic.
+
+There is **no whole-file transaction or automatic retry**. A later failure preserves
+earlier appends and leaves a pending partial batch unsubmitted. Reimporting the same
+file with the same IDs appends duplicate observations; append-only storage is not
+idempotent. Reconcile uncertain Flight batches before a manual retry. A process
+interruption/cancelled async import can lose the in-memory report, so recovery across
+interruptions needs a caller-owned journal.
+
+Acknowledgement does not promise disk durability or historical retention. A ledger
+memory limit can permanently evict older observations even during small-batch imports.
+Use adequate capacity or explicitly disable eviction for complete-route replay, and
+check retained history with `query`, not just `current_state`. The local example
+disables eviction and checks all five observations survive its three appends. Correct
+Earth-relative visualization and segment-gap playback remain Step 6.
 
 ```bash
 cargo test --locked --offline -p spacetimestamp --features gpx
