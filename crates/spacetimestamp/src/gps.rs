@@ -23,7 +23,11 @@ use nalgebra::{Rotation3, Vector3};
 use crate::ephemeris::resolve_astronomical_frame;
 use crate::transforms::check_itrf93_coverage;
 
+/// Optional GPX 1.1 reader and explicit point-to-observation mapping.
+#[cfg(feature = "gpx")]
+pub mod gpx;
 mod observation;
+
 pub use observation::{
     ConvertedGpsObservation, GpsError, GpsObservation, GpsOptions, GpsOrientation,
     convert_gps_observation, gps_observation_to_batch,

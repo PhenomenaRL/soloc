@@ -236,8 +236,9 @@ from **J1900** (`3944678437` for this instant); row offsets must not be sent dir
 UTC conversion uses the installed hifitime leap-second table. The locked version (4.3.1)
 folds a parsed literal UTC `:60` onto `:59`, so supply inserted-second instants as TAI or
 GPST instead (e.g. `2017-01-01T00:00:36 TAI`). The integer TAI row encoding preserves that
-second and fractional nanoseconds. A later text/GPX parser must handle or reject literal
-`:60` explicitly. Existing TAI rows produced with the former UTC conversion bug cannot
+second and fractional nanoseconds. Text adapters must handle or reject literal `:60`
+explicitly; the optional GPX mapper rejects it before parsing. Existing TAI rows
+produced with the former UTC conversion bug cannot
 be identified or repaired automatically; rebuild affected rows from their original times.
 
 ## One GPS observation into the ledger
@@ -298,8 +299,142 @@ a partial observation. Private result fields preserve validation until it is app
 `GpsError` distinguishes invalid coordinates, identity, orientation, estimate policy,
 unrepresentable time, invalid frame, and transformation failures. Transform errors carry
 the target frame and epoch. A successful batch submitted to a ledger with a different
-schema receives the ledger's existing recoverable schema-mismatch error. GPX parsing
-and file-ingestion policies remain subsequent work.
+schema receives the ledger's existing recoverable schema-mismatch error.
+
+## GPX tracks and routes (optional)
+
+Enable `spacetimestamp`'s **`gpx` feature** to use `gps::gpx`. XML/calendar parsing
+dependencies are optional; the basic GPS API does not require this feature.
+
+```toml
+spacetimestamp = { path = "../spacetimestamp", features = ["gpx"] }
+```
+
+`GpxReader::new(reader, source_name, waypoint_policy)` accepts a `BufRead` and yields
+`Result<GpxEvent, GpxError>` incrementally. It supports GPX **1.1** with namespace
+`http://www.topografix.com/GPX/1/1`, required `version="1.1"` and `creator`, and the
+`trk/trkseg/trkpt` and `rte/rtept` hierarchy. Namespace prefixes are resolved; a foreign
+element named `time` or `trkpt` is not mistaken for GPX data. GPX 1.0 and unqualified
+documents are rejected. This is a reader for a supported subset, not a complete XSD
+validator (for example, it does not enforce every optional element's XSD ordering).
+It accepts UTF-8 XML 1.0 and rejects DTDs and custom entity declarations.
+The [official GPX 1.1 schema](https://www.topografix.com/GPX/1/1/) defines the format.
+
+`GpxMapper::new(source_name, mappings)` takes an explicit `GpxMapping` for each object
+used. `GpxObjectId::Track(1)` means the first track; `Route(1)` means the first route.
+These one-based ordinals include empty objects and are counted separately by kind.
+They are file context, **not entity IDs**. Supply stable Soloc entity/source IDs in each
+mapping; names never mint identities, and an unmapped object fails conversion. Several
+objects may deliberately map to the same entity if the caller knows they describe it.
+
+```rust
+use std::{fs::File, io::BufReader};
+use anise::prelude::Almanac;
+use spacetimestamp::{PrescribedId, gps::{GpsOptions, GpsOrientation, gpx::*}};
+
+let source = "journey.gpx";
+let gps = GpsOptions::new(
+    PrescribedId::new("example.org", "vessel-1")?,
+    PrescribedId::abstract_source("example.org", "gpx-receiver")?,
+);
+let mapper = GpxMapper::new(source, [(GpxObjectId::Track(1), GpxMapping {
+    gps,
+    height: GpxHeightPolicy::EllipsoidalElevation, // caller declares the datum
+    time: GpxTimePolicy::RequireTimestamp,
+    orientation: GpsOrientation::LocalEnu,
+})])?;
+let almanac = Almanac::default(); // default ITRF93 conversion needs no kernels
+for event in GpxReader::new(BufReader::new(File::open(source)?), source, WaypointPolicy::Reject) {
+    match event? {
+        GpxEvent::Point(point) => {
+            let mapped = mapper.convert(&point, &almanac)?;
+            let batch = mapped.converted.to_entity_batch();
+            // Ready for an EntitySchema ledger; keep mapped.point's context/metadata.
+        }
+        // An importer must also retain/report the non-point events as appropriate.
+        _ => {}
+    }
+}
+```
+
+Mapping always calls the existing `convert_gps_observation`: frame/epoch coverage,
+orientation, identity, estimate policy and output-schema rules stay shared. The
+converted pose uses metres and J2000 TAI; all optional state/covariance is null.
+`MappedGpxPoint` keeps the original parsed point, the resulting `GpsObservation`, the
+validated conversion, the selected height policy and whether time was recorded or
+scheduled. `converted.append_to(&mut builder)` permits reuse of an existing builder.
+
+### Explicit import policies
+
+| Input or choice | Behavior |
+|---|---|
+| Standalone `<wpt>` | Required choice: `WaypointPolicy::Reject` fails; `Ignore` reports an ignored subtree without converting it into a track observation. |
+| `EllipsoidalElevation` | Requires `<ele>` and declares it WGS84 ellipsoidal height. Negative heights are allowed. |
+| `ElevationPlusGeoidHeight` | Requires both `<ele>` and `<geoidheight>`; caller declares orthometric height H and compatible geoid undulation N, so h = H + N. The field's presence alone never selects this policy. |
+| `ElevationWithGeoidOffset(N)` | Requires `<ele>` and adds an explicit finite constant undulation. No geoid model or datum is inferred. |
+| `FixedEllipsoidalHeight(h)` | Explicitly overrides all elevations, including missing ones. Requires finite h and rejects `MEASURED` because this is an assumption. |
+| `RequireTimestamp` | Missing `<time>` fails; no current time, default time or interpolation is substituted. |
+| `FillMissing(&schedule)` | Calls a caller-provided `Fn(&GpxPoint) -> Result<Epoch, String>` only for absent times. Such points require `SIMULATED`. Existing times still parse normally, including failure on malformed text. |
+| Duplicates and out-of-order times | Retained exactly in file order. There is no sorting, deduplication or monotonic-time requirement. |
+| Disconnected/empty segments | Explicit start/end events preserve boundaries. Point ordinals restart within each track segment; routes have no segment index. |
+
+For an untimed planned route, provide a schedule explicitly and set the entire mapping
+to `SIMULATED`. For example, `GpxTimePolicy::FillMissing(&schedule)` can use this closure:
+
+```rust
+use hifitime::{Duration, Epoch};
+use spacetimestamp::gps::gpx::GpxPoint;
+let start: Epoch = "2025-01-01T00:00:00 UTC".parse()?;
+let schedule = |point: &GpxPoint| -> Result<Epoch, String> {
+    let index = point.context.point.ok_or("missing point ordinal")?;
+    Ok(start + Duration::from_seconds((index - 1) as f64 * 10.0))
+};
+// Set mapping.gps.estimate_type = EstimateType::SIMULATED;
+// mapping.time = GpxTimePolicy::FillMissing(&schedule);
+```
+
+This example declares a 10-second route schedule; it is not measured timing. A track
+schedule must also account for segment context so it does not bridge gaps accidentally.
+
+### Time, metadata and failures
+
+Point timestamps support four-digit years 0001–9999, uppercase `T`/`Z`, an explicit
+`Z` or `±HH:MM` timezone (maximum ±14:00), seconds 00–59 and 1–9 fractional digits.
+Offsets are converted to the UTC calendar before hifitime constructs the physical
+instant, including across leap-second dates. XML `-00:00` is treated as UTC. Missing
+zones, `24:00`, literal `:60`, impossible dates and precision beyond nanoseconds fail
+explicitly; the parser never truncates extra digits or silently folds a leap second.
+For an inserted-second instant, use the single-observation API with a TAI/GPST Epoch.
+
+Names/descriptions and supported scalar metadata are retained as text: object/document
+metadata as `Metadata` events, point names, descriptions and quality fields in
+`GpxPoint::metadata`. Quality is not translated into covariance, velocity or attitude.
+Unsupported outer elements, including extension subtrees, produce `Ignored` events;
+their payloads are not retained or interpreted. Keep the original file if complete
+provenance is needed. Unsupported attributes, XML comments and processing instructions
+are syntax-checked and discarded without reporting. XML nesting is limited to 128
+elements and retained scalar fields to 1 MiB; the XML reader also buffers an individual
+input event, so this is not a strict process-memory limit. The entity schema itself
+does not store GPX segments or metadata,
+so downstream import/export code must retain that context separately and avoid
+presenting disconnected segments as continuous measured motion.
+
+Malformed XML, invalid required fields and unsupported documents stop the reader after
+one contextual error. Errors identify the source label and available object, segment
+and point ordinals. Empty valid documents/objects are accepted and emit their boundary
+events; empty input is an error. `DocumentEnd` is emitted only after successful EOF,
+so trailing malformed input is not reported as a complete file. A point mapping failure
+does not mutate any builder or ledger; the caller may stop or explicitly record it as
+a skipped point. Points emitted before a later parse error are not rolled back.
+
+The reader and mapper retain one point at a time, not an entire journey. Step 5 still
+needs configurable Arrow batching, storage/Flight submission, import-result counts,
+retry rules and partial-completion reporting. Correct Earth-relative visualization
+and segment-gap playback remain Step 6.
+
+```bash
+cargo test --locked --offline -p spacetimestamp --features gpx
+```
 
 ## License
 
