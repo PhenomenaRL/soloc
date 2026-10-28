@@ -16,6 +16,10 @@ required-features = ["gpx"]
 name = "export_gpx"
 required-features = ["gpx"]
 
+[[example]]
+name = "export_flight"
+required-features = ["gpx"]
+
 [dependencies]
 spacetimestamp = { path = "../spacetimestamp" }
 anise.workspace = true

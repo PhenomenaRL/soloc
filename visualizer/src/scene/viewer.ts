@@ -35,6 +35,7 @@ import {
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import type { LedgerData } from "../arrow/loader";
 import type { NameBook } from "../core/identity";
+import { earthFrameFor } from "../core/earthFrame";
 import type { TransformTopology } from "../core/topology";
 import { buildTimelines, type EntityTimeline, type PoseState } from "../core/timeline";
 import { WorldResolver } from "../core/worldResolve";
@@ -86,13 +87,14 @@ export class Viewer {
   readonly graph: SceneGraph;
   /** Display names for the ids in `graph` — handed to the UI panels too. */
   readonly names: NameBook;
+  /** Explicitly posed ITRF93 anchor, for GPX or ordinary GPS entity exports. */
+  readonly earthFrameId?: string;
   focusedId: string | null = null;
   onFocus: ((id: string) => void) | null = null;
   /** Called once per frame with elapsed seconds — drives the playback clock. */
   onBeforeFrame: ((dtSec: number) => void) | null = null;
 
   private timelines: Map<string, EntityTimeline>;
-  private earthFrameId?: string;
   private available = new Set<string>();
   private resolver!: WorldResolver;
   private lastFrameMs = performance.now();
@@ -126,7 +128,7 @@ export class Viewer {
   ) {
     this.labelLayer = labelLayer;
     this.names = data.names;
-    this.earthFrameId = data.gpxPlayback?.earthFrameId;
+    this.earthFrameId = earthFrameFor(data);
     this.nowNs = data.minEpochNs;
     this.graph = buildSceneGraph(data.entities, topo, data.minEpochNs);
     this.timelines = buildTimelines(data.entities);
@@ -258,14 +260,15 @@ export class Viewer {
   focus(id: string, distanceKm?: number): void {
     const node = this.graph.nodes.get(id);
     if (!node) return;
+    const terrestrialPoint = this.earthFrameId !== undefined && node.row.frameId === this.earthFrameId;
     distanceKm ??= id === this.earthFrameId ? WGS84_A_KM * 3
-      : node.row.gpx ? 2 : focusDistanceKm(id, this.names);
+      : terrestrialPoint ? 2 : focusDistanceKm(id, this.names);
     this.focusedId = id; // per-frame re-rooting in tick() puts it at the origin
     this.controls.target.set(0, 0, 0);
 
     // Preserve viewing direction, animate the distance.
     const dir = this.camera.position.clone().normalize();
-    if (node.row.gpx && this.earthFrameId) {
+    if (terrestrialPoint && this.earthFrameId) {
       this.graph.root.updateMatrixWorld(true);
       node.group.getWorldPosition(dir);
       this.graph.nodes.get(this.earthFrameId)!.group.getWorldPosition(this.tmp);
@@ -470,8 +473,8 @@ export class Viewer {
         label.el.style.display = "none";
         continue;
       }
-      const focusedSurfacePoint = this.focusedId
-        ? this.graph.nodes.get(this.focusedId)?.row.gpx : undefined;
+      const focusedSurfacePoint = this.earthFrameId !== undefined && this.focusedId !== null &&
+        this.graph.nodes.get(this.focusedId)?.row.frameId === this.earthFrameId;
       // Earth centre projects behind a surface point while zoomed in; keep its
       // frame in the tree instead of overlapping the point's own label.
       if (!this.isVisible(label.id) || !this.isAvailable(label.id) ||

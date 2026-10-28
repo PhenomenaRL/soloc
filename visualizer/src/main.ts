@@ -59,7 +59,7 @@ async function boot(
   const treePanel = buildTreePanel(treepanel, data, topo, viewer);
   const inspector = buildInspector(inspectorEl, viewer);
   document.title = `soloc visualizer — ${label}`;
-  document.getElementById("btn-overview")!.textContent = data.gpxPlayback
+  document.getElementById("btn-overview")!.textContent = viewer.earthFrameId
     ? "⌂ Earth overview" : "⌂ solar system";
 
   // Compose focus listeners (hud installed its own in buildHud).

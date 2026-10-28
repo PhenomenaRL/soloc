@@ -55,11 +55,23 @@ by `soloc-server`'s own `file://`/`s3://`/`gs://`/`az://` storage. See
 
 ## GPX playback with a positioned Earth
 
+For a single location instead of a journey, the
+[Sedona GPS example](public/data/README.md#sedona-single-estimated-gps-observation)
+contains one estimated observation and one Earth-frame anchor. Open
+`http://localhost:5173/?src=/data/sedona-single-gps.arrows` and select
+**sedona-observation** to inspect its stored spacetimestamp.
+
 The small, checked-in Halifax export can be opened immediately at
 `http://localhost:5173/?src=/data/halifax-gpx.arrows` after `npm run dev`.
 Click **halifax-vessel** to inspect its source point and focus the route.
 Its Earth map is unlit because this Earth-centred export has no Sun or lighting
 model; apparent darkness must not imply an actual day/night calculation.
+
+For a longer journey, the [Ottawa–London flight example](public/data/README.md#ottawalondon-simulated-flight)
+contains seven simulated hours from Ottawa International to London Heathrow.
+Open `http://localhost:5173/?src=/data/ottawa-london-flight.arrows`, choose
+**1 h/s** for a seven-second replay, and use **Earth overview** to see the journey.
+The linked guide describes the synthetic trajectory, generated GPX and regeneration command.
 
 Use the production `export_gpx` example described in the ledger README to
 generate a GPX playback `.arrows` file and its `.names.arrow` sibling, then
