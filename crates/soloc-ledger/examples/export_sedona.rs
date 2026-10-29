@@ -167,7 +167,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Exact readable values: {}", json_output.display());
     println!("Display names are in the .names.arrow sibling.");
     println!("Demo time is assumed; the photo's actual time and camera attitude are unknown.");
-    if output == PathBuf::from(DEFAULT_OUTPUT) {
+    if output == std::path::Path::new(DEFAULT_OUTPUT) {
         println!("http://localhost:5173/?src=/data/sedona-single-gps.arrows");
     }
     Ok(())

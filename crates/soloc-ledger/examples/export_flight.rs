@@ -142,7 +142,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "Local ENU orientation is a coordinate basis, not aircraft attitude; velocity is unknown."
     );
-    if output == PathBuf::from(DEFAULT_OUTPUT) {
+    if output == std::path::Path::new(DEFAULT_OUTPUT) {
         println!("Start the viewer: npm --prefix visualizer run dev");
         println!("http://localhost:5173/?src=/data/ottawa-london-flight.arrows");
         println!("Select ottawa-london-flight, then use the timeline to play or scrub.");
