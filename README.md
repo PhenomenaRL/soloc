@@ -35,10 +35,10 @@ else's, from a robot deep underwater, to a deep-space probe or construction vehi
 - **Federated by design.** Each operator can run their own server; federation is an exchange of Arrow
   Flight streams, or even simple RecordBatches.
 
-
+## What you can build with soloc
 <p align="center">
   <img width="320" height="300" alt="{0B34A4BA-40C3-4DDD-88CA-F1C66439E499}" src="https://github.com/user-attachments/assets/44fb7dfd-97bd-4c91-94ad-f4b52c2f56f3" />  
-  <img width="320" height="300" alt="{102AE882-DE63-4156-A45F-106B33AF558D}" src="https://github.com/user-attachments/assets/774c4298-4f35-44db-af38-e010ba6cb90f" />
+  <img width="320" height="300" alt="{102AE882-DE63-4156-A45F-106B33AF558D}" src="https://github.com/user-attachments/assets/63b42c4f-c846-4c25-ae94-02cfd7a83b52" />
   <img width="320" height="300" alt="{3A5CEB01-C6CE-49CC-9BEA-ABC0CC50A1C8}" src="https://github.com/user-attachments/assets/64f53218-62dc-4964-a432-e4634ca13e8e" />
 </p>
 
@@ -46,6 +46,8 @@ else's, from a robot deep underwater, to a deep-space probe or construction vehi
   <img width="480" alt="Zooming from the solar system down to boats on Earth" src="assets/media/soloc_solar_system_to_boats_zoom.gif" />
   <img width="480" alt="Squamish forest fire simulation" src="assets/media/squamish_forest_fire.gif" />
 </p>
+
+[Read more about what soloc can enable here](https://phenomenareplicationlab.ca/journal/soloc.html)
 
 ## Crates
 
