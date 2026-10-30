@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/soloc-lockup-dark.svg">
-    <img alt="soloc" src="assets/soloc-lockup.svg" width="480">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/soloc-lockup-dark.svg">
+    <img alt="soloc" src="assets/brand/soloc-lockup.svg" width="480">
   </picture>
 </p>
 
