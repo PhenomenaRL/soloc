@@ -42,6 +42,11 @@ else's, from a robot deep underwater, to a deep-space probe or construction vehi
   <img width="320" height="300" alt="{3A5CEB01-C6CE-49CC-9BEA-ABC0CC50A1C8}" src="https://github.com/user-attachments/assets/64f53218-62dc-4964-a432-e4634ca13e8e" />
 </p>
 
+<p align="center">
+  <img width="480" alt="Zooming from the solar system down to boats on Earth" src="assets/media/soloc_solar_system_to_boats_zoom.gif" />
+  <img width="480" alt="Squamish forest fire simulation" src="assets/media/squamish_forest_fire.gif" />
+</p>
+
 ## Crates
 
 | Crate | What it is |
