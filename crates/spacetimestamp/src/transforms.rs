@@ -46,7 +46,7 @@
 //! Isometries returned by the resolver are always in kilometres, regardless of the row's
 //! `units_pos` field. Row coordinates are converted to km before the isometry is applied.
 
-use anise::constants::orientations::J2000;
+use anise::constants::orientations::{ITRF93, J2000};
 use anise::prelude::*;
 use arrow::array::{Array, Int16Builder, StructArray, UInt8Builder, UInt64Builder};
 use arrow::record_batch::RecordBatch;
@@ -96,6 +96,36 @@ fn root_display(id: PrescribedId) -> String {
         .unwrap_or_else(|| id.to_hyphenated())
 }
 
+/// ITRF93 rotation needs an Earth BPC segment covering the actual observation epoch.
+/// A kernel's aggregate date range can span gaps, so query individual segments first.
+/// Identity rotations need no orientation data, even outside any loaded coverage.
+pub(crate) fn check_itrf93_coverage(
+    almanac: &Almanac,
+    from: Frame,
+    to: Frame,
+    epoch: Epoch,
+) -> Result<(), String> {
+    if from.orientation_id == to.orientation_id
+        || (from.orientation_id != ITRF93 && to.orientation_id != ITRF93)
+        || almanac.bpc_summary_at_epoch(ITRF93, epoch).is_ok()
+    {
+        return Ok(());
+    }
+
+    match almanac.bpc_domain(ITRF93) {
+        Ok((start, end)) => Err(format!(
+            "no loaded ITRF93 BPC segment covers this epoch \
+             (loaded coverage spans {start} to {end}; gaps may exist); \
+             load an Earth binary PCK covering the observation epoch"
+        )),
+        Err(_) => Err(
+            "no Earth orientation BPC data for ITRF93 (3000) is loaded; \
+             load an Earth binary PCK covering the observation epoch"
+                .into(),
+        ),
+    }
+}
+
 /// Reprojects the `spacetimestamp` struct column of a batch into `target_frame_name`.
 ///
 /// A pure projection: the input is unmodified and only spacetimestamp struct column is
@@ -109,6 +139,10 @@ fn root_display(id: PrescribedId) -> String {
 ///   against the pose current at its own; answers are memoised per `(frame, epoch)`.
 ///   Its isometries are always km regardless of `units_pos`. A frame it declines to place
 ///   is treated as an astronomical root, whose `anise` frame is read straight from the id.
+///
+/// ITRF93 rotations require loaded Earth binary-PCK data covering each row's epoch.
+/// Same-frame projections (including unit changes) do not require kernels. Translating
+/// between different origins additionally requires the corresponding SPK ephemerides.
 pub fn transform_batch(
     batch: &RecordBatch,
     target_frame_name: &str,
@@ -116,13 +150,12 @@ pub fn transform_batch(
     target_unit: LengthUnit,
     resolve_dynamic_frame: Option<DynamicFrameResolver<'_>>,
 ) -> Result<RecordBatch, String> {
-    // Attempt to resolve the target frame in anise. We default to assuming J2000 orientation
-    // if the user simply passed a planetary center like "Mars".  Also handles "IAU_BODY" strings
-    // (e.g. "IAU_EARTH") by mapping to the corresponding anise body-fixed frame.
+    // Resolve from Soloc's catalog independently of loaded kernels. Bare body names such
+    // as Earth retain their IAU body-fixed orientation; ITRF93 is a separate frame.
     let target_frame =
         crate::ephemeris::resolve_astronomical_frame(target_frame_name).ok_or_else(|| {
             format!(
-                "Invalid target_frame_name '{}': not recognized by anise",
+                "Invalid target_frame_name '{}': not recognized by Soloc's astronomical frame catalog",
                 target_frame_name
             )
         })?;
@@ -221,23 +254,40 @@ pub fn transform_batch(
             }
         };
 
+        check_itrf93_coverage(almanac, root_frame, target_frame, epoch).map_err(|e| {
+            let root = root_display(root_frame_id);
+            format!(
+                "ITRF93 rotation error at row {i}, epoch {epoch} ('{root}' → '{target_frame_name}'): {e}"
+            )
+        })?;
+
         // almanac.translate(from, to, epoch) → radius_km is the position of `from`'s origin
         // relative to `to`'s origin, in J2000 axes whatever either frame's orientation (the
         // raw SPK data, unrotated).
-        let translation = almanac
-            .translate(root_frame, target_frame, epoch, None)
-            .map_err(|e| {
-                let root = root_display(root_frame_id);
-                format!("Anise translate error ('{root}' → '{target_frame_name}'): {e}")
-            })?;
-        let pos_root_wrt_target = translation.radius_km;
+        // Same-origin frames need no SPK data. ANISE's translate fast path only checks
+        // full frame equality, so bypass it explicitly for different Earth orientations.
+        let pos_root_wrt_target = if root_frame.ephem_origin_match(target_frame) {
+            Vector3::zeros()
+        } else {
+            almanac
+                .translate(root_frame, target_frame, epoch, None)
+                .map_err(|e| {
+                    let root = root_display(root_frame_id);
+                    format!(
+                        "Anise translate error at row {i}, epoch {epoch} \
+                         ('{root}' → '{target_frame_name}'): {e}; \
+                         check that loaded SPK ephemerides cover both origins at this epoch"
+                    )
+                })?
+                .radius_km
+        };
 
         // almanac.rotate(from, to) → DCM R such that v_target = R * v_root
         let dcm = almanac
             .rotate(root_frame, target_frame, epoch)
             .map_err(|e| {
                 let root = root_display(root_frame_id);
-                format!("Anise rotate error ('{root}' → '{target_frame_name}'): {e}")
+                format!("Anise rotate error at row {i}, epoch {epoch} ('{root}' → '{target_frame_name}'): {e}")
             })?;
         let rot_matrix: Rotation3<f64> = Rotation3::from_matrix_unchecked(dcm.rot_mat);
         let rot_quat: UnitQuaternion<f64> = UnitQuaternion::from_rotation_matrix(&rot_matrix);
@@ -254,10 +304,22 @@ pub fn transform_batch(
             match j2000_cache.get(&epoch_key) {
                 Some(rot) => *rot,
                 None => {
+                    check_itrf93_coverage(
+                        almanac,
+                        target_frame.with_orient(J2000),
+                        target_frame,
+                        epoch,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "ITRF93 rotation error at row {i}, epoch {epoch} \
+                             ('J2000' → '{target_frame_name}'): {e}"
+                        )
+                    })?;
                     let dcm = almanac
                         .rotate(target_frame.with_orient(J2000), target_frame, epoch)
                         .map_err(|e| {
-                            format!("Anise rotate error ('J2000' → '{target_frame_name}'): {e}")
+                            format!("Anise rotate error at row {i}, epoch {epoch} ('J2000' → '{target_frame_name}'): {e}")
                         })?;
                     let rot = Rotation3::from_matrix_unchecked(dcm.rot_mat);
                     j2000_cache.insert(epoch_key, rot);
@@ -459,6 +521,58 @@ mod tests {
 
     fn read_output_quat(result: &RecordBatch, row: usize) -> [f64; 4] {
         StsColumns::try_new(result).unwrap().quaternion_at(row)
+    }
+
+    #[test]
+    fn test_itrf93_missing_data_and_unknown_target_are_distinct() {
+        let almanac = Almanac::default();
+        let epoch = Epoch::from_gregorian_tai_at_midnight(2025, 1, 1);
+        let (c, n) = epoch_to_parts(epoch);
+        let itrf93 = PrescribedId::astronomical_from_name("ITRF93").unwrap();
+        let receiver = entity("receiver");
+        let resolver = fixed_resolver(vec![(receiver, itrf93, Isometry3::identity())]);
+
+        // Direct astronomical rows and a resolved entity both require Earth BPC data.
+        // Test the reverse direction as well: ITRF93 may be the target rather than root.
+        for (frame, target) in [
+            (itrf93, "GCRF"),
+            (receiver, "GCRF"),
+            (
+                PrescribedId::astronomical_from_name("GCRF").unwrap(),
+                "ITRF93",
+            ),
+        ] {
+            let mut builder = SpaceTimestampBuilder::new(1);
+            builder.append_spacetimestamp(
+                frame,
+                LengthUnit::m,
+                TimeScaleCode::TAI,
+                source(),
+                EstimateType::MEASURED,
+                [6_378_137.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                c,
+                n,
+                None,
+                None,
+            );
+            let batch = make_sts_batch(&mut builder);
+            let err = transform_batch(&batch, target, &almanac, LengthUnit::m, Some(&resolver))
+                .unwrap_err();
+            assert!(
+                err.contains("no Earth orientation BPC data for ITRF93 (3000) is loaded"),
+                "{err}"
+            );
+            assert!(err.contains("row 0"), "{err}");
+            assert!(err.contains(&epoch.to_string()), "{err}");
+            assert!(err.contains("GCRF"), "{err}");
+
+            let err = transform_batch(&batch, "UNKNOWN_FRAME", &almanac, LengthUnit::m, None)
+                .unwrap_err();
+            assert!(err.contains("UNKNOWN_FRAME"), "{err}");
+            assert!(err.contains("Soloc's astronomical frame catalog"), "{err}");
+            assert!(!err.contains("BPC"), "{err}");
+        }
     }
 
     /// A frame the resolver places one hop from its root. `bot:cam` sits at [1, 0, 0] km

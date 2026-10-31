@@ -21,10 +21,12 @@
 
 import { tableFromIPC, type Field } from "apache-arrow";
 import { partsToNs } from "../core/epoch";
-import { NameBook, idToString } from "../core/identity";
+import { NameBook, idToString, astroFrameOf, kindOfIdString, KIND_ASTRO } from "../core/identity";
 import { asArrowIPC } from "./ipc";
 
 export interface EntityRow {
+  /** Original GPX order/context. Present only in a validated playback export. */
+  gpx?: GpxProvenance;
   /** Canonical hyphenated prescribed id — the key for this entity everywhere. */
   entityId: string;
   // spacetimestamp struct fields, verbatim
@@ -48,7 +50,16 @@ export interface EntityRow {
   rowIndex: number;
 }
 
+export interface GpxProvenance {
+  source: string;
+  object: string;
+  segment: bigint | null;
+  point: bigint;
+}
+
 export interface LedgerData {
+  /** The explicitly posed terrestrial anchor used for the WGS84 surface. */
+  gpxPlayback?: { earthFrameId: string };
   rows: EntityRow[];
   /** Rows grouped per entity, sorted by epoch ascending. */
   entities: Map<string, EntityRow[]>;
@@ -154,6 +165,26 @@ export function loadLedger(
   const massKg = table.getChild("mass_kg");
   const stateCovariance = table.getChild("state_covariance");
   const dimensions = table.getChild("dimensions");
+  const gpxFields = ["gpx_source", "gpx_object", "gpx_segment", "gpx_point"] as const;
+  const gpxColumns = gpxFields.map((name) => table.getChild(name));
+  const playbackVersion = table.schema.metadata.get("soloc:gpx_playback");
+  const earthFrameId = table.schema.metadata.get("soloc:gpx_earth_frame");
+  if (playbackVersion !== undefined || earthFrameId !== undefined || gpxColumns.some(Boolean)) {
+    if (playbackVersion !== "1" || !earthFrameId || gpxColumns.some((c) => !c)) {
+      throw new Error("GPX playback needs version 1 metadata, an Earth frame, and all four provenance columns");
+    }
+    const earth = astroFrameOf(earthFrameId);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(earthFrameId) ||
+        kindOfIdString(earthFrameId) !== KIND_ASTRO || earth?.ephemerisId !== 399 || earth.orientationId !== 3000) {
+      throw new Error("GPX playback Earth frame must be ITRF93 (399, 3000)");
+    }
+    const expected = ["Utf8", "Utf8", "Uint64", "Uint64"];
+    gpxColumns.forEach((column, i) => {
+      if (column!.type.toString() !== expected[i]) {
+        throw new Error(`GPX playback column ${gpxFields[i]} must be ${expected[i]}`);
+      }
+    });
+  }
 
   const fields = stsFields(table.schema.fields);
   const decodeUnits = decoder(fields.get("units_pos"), "units_pos");
@@ -164,7 +195,10 @@ export function loadLedger(
   for (let i = 0; i < table.numRows; i++) {
     // StructRow proxy: fields by schema name.
     const s = sts.get(i) as Record<string, unknown> | null;
-    if (s === null) continue;
+    if (s === null) {
+      if (playbackVersion) throw new Error(`row ${i}: GPX playback cannot contain a null pose`);
+      continue;
+    }
 
     const timescale = decodeTimescale(s["timescale_id"]);
     if (timescale !== "TAI") {
@@ -178,8 +212,12 @@ export function loadLedger(
     if (!pos || !quat || quat.length !== 4) {
       throw new Error(`row ${i}: malformed position/quaternion`);
     }
+    if (playbackVersion && (!pos.every(Number.isFinite) || !quat.every(Number.isFinite) ||
+        Math.abs(Math.hypot(...quat) - 1) > 1e-6)) {
+      throw new Error(`row ${i}: GPX playback requires finite positions and unit quaternions`);
+    }
 
-    rows.push({
+    const row: EntityRow = {
       entityId: idToString(ids.get(i)),
       frameId: idToString(s["frame_id"]),
       unitsPos: decodeUnits(s["units_pos"]),
@@ -198,7 +236,20 @@ export function loadLedger(
       stateCovariance: nums(stateCovariance?.get(i)),
       dimensionsM: vec3(dimensions?.get(i)),
       rowIndex: i,
-    });
+    };
+    if (playbackVersion) {
+      const [source, object, segment, point] = gpxColumns.map((c) => c!.get(i));
+      if ([source, object, segment, point].some((v) => v !== null)) {
+        if (typeof source !== "string" || typeof object !== "string" || !/^(track|route):[1-9][0-9]*$/.test(object) ||
+            typeof point !== "bigint" || point <= 0n ||
+            (object.startsWith("track:") ? typeof segment !== "bigint" || segment <= 0n : segment !== null)) {
+          throw new Error(`row ${i}: incomplete or invalid GPX provenance`);
+        }
+        row.gpx = { source, object, segment: segment as bigint | null, point };
+        if (row.frameId !== earthFrameId) throw new Error(`row ${i}: GPX observation is not in the exported Earth frame`);
+      }
+    }
+    rows.push(row);
   }
 
   const entities = new Map<string, EntityRow[]>();
@@ -216,8 +267,52 @@ export function loadLedger(
   for (const list of entities.values()) {
     list.sort((a, b) => (a.epochNs < b.epochNs ? -1 : a.epochNs > b.epochNs ? 1 : 0));
   }
+  for (const row of rows) {
+    const frame = astroFrameOf(row.frameId);
+    if (kindOfIdString(row.frameId) === KIND_ASTRO && frame?.ephemerisId === 399 &&
+        frame.orientationId === 3000 && !entities.has(row.frameId)) {
+      throw new Error("ITRF93 has no pose timeline. Generate a GPX playback export with Earth-frame anchors; raw GPX ingestion IPC is not a positioned scene.");
+    }
+  }
 
   const names = namesBytes ? NameBook.fromIPC(namesBytes) : NameBook.empty();
 
-  return { rows, entities, names, numBatches: table.batches.length, minEpochNs, maxEpochNs };
+  if (playbackVersion) {
+    const observations = rows.filter((row) => row.gpx);
+    const anchors = entities.get(earthFrameId!) ?? [];
+    if (observations.length === 0 || anchors.length === 0) {
+      throw new Error("GPX playback requires observations and a posed Earth frame");
+    }
+    for (const entityRows of entities.values()) {
+      if (entityRows.some((row) => row.gpx) && entityRows.some((row) => !row.gpx)) {
+        throw new Error("GPX playback cannot mix observations and anchor rows for one entity");
+      }
+    }
+    for (const row of rows) {
+      if (row.gpx) {
+        if (row.entityId === earthFrameId) {
+          throw new Error("GPX playback cannot mix observations and anchor rows for one entity");
+        }
+      } else {
+        const parent = astroFrameOf(row.frameId);
+        if (row.entityId !== earthFrameId || kindOfIdString(row.frameId) !== KIND_ASTRO ||
+            parent?.ephemerisId !== 399 || parent.orientationId !== 1 ||
+            row.position.some((n) => n !== 0) || entities.has(row.frameId)) {
+          throw new Error("GPX playback needs zero-translation ITRF93 poses under an unposed GCRF root");
+        }
+      }
+    }
+    for (let i = 1; i < anchors.length; i++) {
+      if (anchors[i]!.epochNs <= anchors[i - 1]!.epochNs) throw new Error("GPX Earth anchor epochs must be unique");
+      if (anchors[i]!.epochNs - anchors[i - 1]!.epochNs > 300_000_000_000n) {
+        throw new Error("GPX Earth anchor samples must be no more than 300 seconds apart");
+      }
+    }
+    if (observations.some((row) => row.epochNs < anchors[0]!.epochNs || row.epochNs > anchors[anchors.length - 1]!.epochNs)) {
+      throw new Error("GPX Earth anchor timeline does not cover every observation");
+    }
+  }
+
+  return { rows, entities, names, numBatches: table.batches.length, minEpochNs, maxEpochNs,
+    ...(playbackVersion ? { gpxPlayback: { earthFrameId: earthFrameId! } } : {}) };
 }

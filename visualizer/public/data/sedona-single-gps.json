@@ -1,0 +1,48 @@
+{
+  "description": "One estimated Sedona position converted by Soloc's GPS adapter",
+  "input": {
+    "latitude_deg": 34.8697,
+    "longitude_deg": -111.7611,
+    "approximate_msl_height_m": 1326,
+    "caller_supplied_geoid_undulation_m": -24.53045742765352,
+    "ellipsoidal_height_m": 1301.4695425723464,
+    "height_conversion": "h = H + N; approximate MSL elevation treated as orthometric height",
+    "vertical_reference_assumption": "Use EGM96 as an approximate MSL reference; original elevation datum is unknown",
+    "original_observation_time": null,
+    "assumed_demo_epoch_utc": "2025-01-01T12:00:00Z"
+  },
+  "entity_id": "8fd003dd-1019-814b-aab9-f11e2367d2a8",
+  "entity_name": "soloc.example:sedona-observation",
+  "spacetimestamp": {
+    "frame_id": "0000018f-0000-8000-8000-000bb8000000",
+    "frame_name": "ITRF93",
+    "source_id": "de7fdd3f-c898-8287-9d22-0cec7a797c32",
+    "source_name": "soloc.example:user-estimated-location",
+    "units_pos": "m",
+    "timescale_id": "TAI",
+    "estimate_type": "ESTIMATED",
+    "position": [-1942579.4562112328, -4866374.452082388, 3626760.385912345],
+    "quaternion_wxyz": [0.8705487341105534, 0.454437866959714, -0.0873509630988732, -0.16733480169204956],
+    "duration_centuries": 0,
+    "duration_ns": "789004837000000000",
+    "epoch_origin": "2000-01-01T12:00:00 TAI",
+    "epoch_tai": "2025-01-01T12:00:37 TAI",
+    "position_covariance": null,
+    "orientation_covariance": null
+  },
+  "velocity": null,
+  "angular_velocity": null,
+  "acceleration": null,
+  "mass_kg": null,
+  "state_covariance": null,
+  "dimensions": null,
+  "orientation_policy": "Conventional local east/north/up axes, not measured camera attitude",
+  "frame_approximation": "WGS84 ECEF is treated as ITRF93 for ordinary tracking; no realization or station-motion correction",
+  "export": {
+    "gps_observation_rows": 1,
+    "earth_frame_anchor_rows": 1,
+    "total_rows": 2,
+    "parent_chain": "sedona-observation -> ITRF93 -> GCRF",
+    "journey": false
+  }
+}

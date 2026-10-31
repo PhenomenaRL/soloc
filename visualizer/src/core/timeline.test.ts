@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { EntityRow } from "../arrow/loader";
-import { EntityTimeline, slerp } from "./timeline";
+import { EntityTimeline, gpxContinuousRuns, slerp } from "./timeline";
 
 function makeRow(over: Partial<EntityRow>): EntityRow {
   return {
@@ -104,5 +104,49 @@ describe("slerp", () => {
   it("takes the short way around (sign flip)", () => {
     const q = slerp([1, 0, 0, 0], [-1, 0, 0, 0], 0.5); // same rotation, opposite sign
     expect(Math.abs(q[0])).toBeCloseTo(1);
+  });
+});
+
+describe("GPX observation coverage", () => {
+  function point(index: number, epoch: bigint, segment = 1n): EntityRow {
+    return makeRow({ rowIndex: index, epochNs: epoch, position: [index, 0, 0],
+      gpx: { source: "route.gpx", object: "track:1", segment, point: BigInt(index + 1) } });
+  }
+
+  it("interpolates consecutive source points and hides gaps and uncovered times", () => {
+    const rows = [point(0, 0n), point(1, 10n), point(2, 20n, 2n), point(3, 30n, 2n)];
+    const timeline = new EntityTimeline(rows);
+    expect(timeline.sampleAt(5n)?.positionKm).toEqual([0.5, 0, 0]);
+    for (const epoch of [-1n, 11n, 15n, 19n, 31n]) expect(timeline.sampleAt(epoch)).toBeNull();
+    for (const epoch of [0n, 10n, 20n, 30n]) expect(timeline.sampleAt(epoch)).not.toBeNull();
+    expect(gpxContinuousRuns(rows).map((run) => run.length)).toEqual([2, 2]);
+  });
+
+  it("does not interpolate across skipped points, objects or source files", () => {
+    const a = point(0, 0n);
+    const b = point(1, 10n);
+    for (const gpx of [
+      { ...b.gpx!, point: 3n },
+      { ...b.gpx!, object: "track:2" },
+      { ...b.gpx!, source: "other.gpx" },
+    ]) expect(new EntityTimeline([a, { ...b, gpx }]).sampleAt(5n)).toBeNull();
+  });
+
+  it("isolates duplicate epochs and picks the last file row only at that instant", () => {
+    const rows = [point(0, 0n), point(1, 10n), point(2, 10n), point(3, 20n)];
+    const timeline = new EntityTimeline(rows);
+    expect(timeline.sampleAt(5n)).toBeNull();
+    expect(timeline.sampleAt(15n)).toBeNull();
+    expect(timeline.sampleAt(10n)?.row.rowIndex).toBe(2);
+    expect(gpxContinuousRuns(rows).map((run) => run.length)).toEqual([1, 1, 1, 1]);
+    expect(new EntityTimeline([point(0, 0n), point(1, 0n)]).sampleAt(0n)?.row.rowIndex).toBe(1);
+  });
+
+  it("does not join reordered timestamps after sorting the timeline", () => {
+    const rows = [point(1, 0n), point(0, 10n), point(2, 20n)];
+    const timeline = new EntityTimeline(rows);
+    expect(timeline.sampleAt(5n)).toBeNull();
+    expect(timeline.sampleAt(15n)).toBeNull();
+    expect(gpxContinuousRuns(rows)).toHaveLength(3);
   });
 });

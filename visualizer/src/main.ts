@@ -59,6 +59,8 @@ async function boot(
   const treePanel = buildTreePanel(treepanel, data, topo, viewer);
   const inspector = buildInspector(inspectorEl, viewer);
   document.title = `soloc visualizer — ${label}`;
+  document.getElementById("btn-overview")!.textContent = viewer.earthFrameId
+    ? "⌂ Earth overview" : "⌂ solar system";
 
   // Compose focus listeners (hud installed its own in buildHud).
   const hudFocus = viewer.onFocus;
@@ -72,9 +74,10 @@ async function boot(
   // ---- playback clock (owned here; viewer just renders whatever t we set) ----
   let t = data.minEpochNs;
   let playing = false;
-  let nsPerSec = DEFAULT_SPEED.nsPerSec;
+  let nsPerSec = data.gpxPlayback ? 60e9 : DEFAULT_SPEED.nsPerSec;
 
   const controls = buildTimeControls(timebar, {
+    initialSpeed: nsPerSec,
     minNs: data.minEpochNs,
     maxNs: data.maxEpochNs,
     events: topo.events,

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx xmlns="http://www.topografix.com/GPX/1/1" version="1.1" creator="soloc-simulated-example">
+  <metadata><desc>Synthetic Halifax journey. Elevations are declared WGS84 ellipsoidal metres; every pose is SIMULATED.</desc></metadata>
+  <trk><name>Halifax vessel</name>
+    <trkseg>
+      <trkpt lat="44.6488" lon="-63.5752"><ele>10</ele><time>2025-01-01T12:00:00Z</time></trkpt>
+      <trkpt lat="44.6490" lon="-63.5750"><ele>11</ele><time>2025-01-01T12:00:10Z</time></trkpt>
+      <trkpt lat="44.6492" lon="-63.5748"><ele>12</ele><time>2025-01-01T12:00:20Z</time></trkpt>
+    </trkseg>
+    <trkseg>
+      <trkpt lat="44.6500" lon="-63.5740"><ele>13</ele><time>2025-01-01T12:05:00Z</time></trkpt>
+      <trkpt lat="44.6502" lon="-63.5738"><ele>14</ele><time>2025-01-01T12:05:10Z</time></trkpt>
+    </trkseg>
+  </trk>
+</gpx>

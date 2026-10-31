@@ -4,6 +4,22 @@ version = "0.1.0"
 edition = "2024"
 license.workspace = true
 
+[features]
+default = []
+gpx = ["spacetimestamp/gpx"]
+
+[[example]]
+name = "import_gpx"
+required-features = ["gpx"]
+
+[[example]]
+name = "export_gpx"
+required-features = ["gpx"]
+
+[[example]]
+name = "export_flight"
+required-features = ["gpx"]
+
 [dependencies]
 spacetimestamp = { path = "../spacetimestamp" }
 anise.workspace = true

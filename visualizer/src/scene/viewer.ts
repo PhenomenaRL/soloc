@@ -35,6 +35,7 @@ import {
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import type { LedgerData } from "../arrow/loader";
 import type { NameBook } from "../core/identity";
+import { earthFrameFor } from "../core/earthFrame";
 import type { TransformTopology } from "../core/topology";
 import { buildTimelines, type EntityTimeline, type PoseState } from "../core/timeline";
 import { WorldResolver } from "../core/worldResolve";
@@ -42,10 +43,12 @@ import { posToKm } from "./units";
 import type { EntityNode } from "./sceneGraph";
 import { displayInfo, focusDistanceKm } from "./registry";
 import { buildSceneGraph, type SceneGraph } from "./sceneGraph";
-import { countAtOrBefore, guideLine, type GuideLine } from "./orbits";
+import { countAtOrBefore, guideLines, type GuideLine } from "./orbits";
 import {
   applyBodyTextures,
   bodySphereGeometry,
+  earthEllipsoidGeometry,
+  WGS84_A_KM,
   makeEarthClouds,
   makeSaturnRings,
   makeSunGlow,
@@ -84,12 +87,15 @@ export class Viewer {
   readonly graph: SceneGraph;
   /** Display names for the ids in `graph` — handed to the UI panels too. */
   readonly names: NameBook;
+  /** Explicitly posed ITRF93 anchor, for GPX or ordinary GPS entity exports. */
+  readonly earthFrameId?: string;
   focusedId: string | null = null;
   onFocus: ((id: string) => void) | null = null;
   /** Called once per frame with elapsed seconds — drives the playback clock. */
   onBeforeFrame: ((dtSec: number) => void) | null = null;
 
   private timelines: Map<string, EntityTimeline>;
+  private available = new Set<string>();
   private resolver!: WorldResolver;
   private lastFrameMs = performance.now();
 
@@ -122,6 +128,7 @@ export class Viewer {
   ) {
     this.labelLayer = labelLayer;
     this.names = data.names;
+    this.earthFrameId = earthFrameFor(data);
     this.nowNs = data.minEpochNs;
     this.graph = buildSceneGraph(data.entities, topo, data.minEpochNs);
     this.timelines = buildTimelines(data.entities);
@@ -174,6 +181,11 @@ export class Viewer {
       const node = this.graph.nodes.get(id);
       if (!node) continue;
       const state = timeline.at(epochNs);
+      if (state.available) this.available.add(id);
+      else this.available.delete(id);
+      const visuals = this.visuals.get(id);
+      if (visuals) visuals.own.visible = visuals.visible && state.available;
+      if (!state.available) continue;
       const target = this.graph.frameGroup(state.frame);
       if (node.group.parent !== target) {
         target.add(node.group);
@@ -223,6 +235,11 @@ export class Viewer {
   overview(): void {
     const sun = this.idNamed("Sun");
     if (sun) this.focus(sun, 4.2e9);
+    else if (this.earthFrameId) this.focus(this.earthFrameId, WGS84_A_KM * 3);
+    else {
+      const id = this.idNamed("Earth") ?? this.graph.nodes.keys().next().value;
+      if (id) this.focus(id);
+    }
   }
 
   /** The id whose display key is `key`, if this ledger carries one. */
@@ -240,13 +257,23 @@ export class Viewer {
   }
 
   /** Fly the camera to `id`. */
-  focus(id: string, distanceKm = focusDistanceKm(id, this.names)): void {
-    if (!this.graph.nodes.has(id)) return;
+  focus(id: string, distanceKm?: number): void {
+    const node = this.graph.nodes.get(id);
+    if (!node) return;
+    const terrestrialPoint = this.earthFrameId !== undefined && node.row.frameId === this.earthFrameId;
+    distanceKm ??= id === this.earthFrameId ? WGS84_A_KM * 3
+      : terrestrialPoint ? 2 : focusDistanceKm(id, this.names);
     this.focusedId = id; // per-frame re-rooting in tick() puts it at the origin
     this.controls.target.set(0, 0, 0);
 
     // Preserve viewing direction, animate the distance.
     const dir = this.camera.position.clone().normalize();
+    if (terrestrialPoint && this.earthFrameId) {
+      this.graph.root.updateMatrixWorld(true);
+      node.group.getWorldPosition(dir);
+      this.graph.nodes.get(this.earthFrameId)!.group.getWorldPosition(this.tmp);
+      dir.sub(this.tmp).normalize(); // approach a terrestrial point from above
+    }
     if (!Number.isFinite(dir.lengthSq()) || dir.lengthSq() < 1e-12) dir.set(0.4, -1, 0.45).normalize();
     this.flyFrom = this.camera.position.clone();
     this.flyTo = dir.multiplyScalar(distanceKm);
@@ -264,7 +291,7 @@ export class Viewer {
     // Re-root the world each frame so the (possibly moving) focus target stays
     // at the origin — GPU float32 error lives far from the camera.
     const focusNode = this.focusedId ? this.graph.nodes.get(this.focusedId) : undefined;
-    if (focusNode) {
+    if (focusNode && this.isAvailable(focusNode.id)) {
       this.graph.root.position.set(0, 0, 0);
       this.graph.root.updateMatrixWorld(true);
       focusNode.group.getWorldPosition(this.tmp);
@@ -291,8 +318,11 @@ export class Viewer {
 
   private decorate(data: LedgerData, topo: TransformTopology): void {
     for (const [id, node] of this.graph.nodes) {
-      const key = this.names.key(id);
-      const info = displayInfo(id, this.names);
+      const terrestrial = id === this.earthFrameId;
+      const key = terrestrial ? "Earth" : this.names.key(id);
+      const info = terrestrial
+        ? { ...displayInfo(id, this.names), bodyRadiusKm: WGS84_A_KM, kind: "planet" as const, color: "#5aa9ff" }
+        : displayInfo(id, this.names);
       const color = new Color(info.color);
 
       // Everything this entity draws for itself goes in `own`, never straight
@@ -304,10 +334,12 @@ export class Viewer {
       if (info.bodyRadiusKm) {
         const r = info.bodyRadiusKm;
         const mat =
-          info.kind === "star"
+          // This Earth-centred profile carries no Sun/illumination model. Use
+          // a readable map rather than implying that ambient darkness is night.
+          info.kind === "star" || terrestrial
             ? new MeshBasicMaterial({ color })
             : new MeshStandardMaterial({ color, roughness: 0.9, metalness: 0 });
-        const body = new Mesh(bodySphereGeometry(r), mat);
+        const body = new Mesh(terrestrial ? earthEllipsoidGeometry() : bodySphereGeometry(r), mat);
         own.add(body);
         void applyBodyTextures(body, key);
 
@@ -320,7 +352,7 @@ export class Viewer {
         if (key === "SATURN_BARYCENTER" || key === "Saturn") {
           void makeSaturnRings(r).then((rings) => rings && own.add(rings));
         }
-        if (key === "Earth") {
+        if (key === "Earth" && !terrestrial) {
           void makeEarthClouds(r).then((clouds) => clouds && own.add(clouds));
         }
       }
@@ -346,18 +378,18 @@ export class Viewer {
       const rows = data.entities.get(id);
       if (rows) {
         for (const frame of new Set(rows.map((r) => r.frameId))) {
-          const guide = guideLine(rows, frame);
-          if (!guide) continue;
-          const geom = new BufferGeometry();
-          geom.setAttribute("position", new BufferAttribute(guide.points, 3));
-          const mat = new LineBasicMaterial({
-            color,
-            transparent: true,
-            opacity: guide.kind === "circle" ? 0.28 : 0.55,
-          });
-          const line = guide.kind === "circle" ? new LineLoop(geom, mat) : new Line(geom, mat);
-          this.graph.frameGroup(frame).add(line);
-          guides.push({ line, guide });
+          for (const guide of guideLines(rows, frame)) {
+            const geom = new BufferGeometry();
+            geom.setAttribute("position", new BufferAttribute(guide.points, 3));
+            const mat = new LineBasicMaterial({
+              color,
+              transparent: true,
+              opacity: guide.kind === "circle" ? 0.28 : 0.55,
+            });
+            const line = guide.kind === "circle" ? new LineLoop(geom, mat) : new Line(geom, mat);
+            this.graph.frameGroup(frame).add(line);
+            guides.push({ line, guide });
+          }
         }
       }
 
@@ -369,6 +401,7 @@ export class Viewer {
       this.labelLayer.append(el);
       this.labels.push({ id, el, anchor: new Vector3() });
 
+      own.visible = this.isAvailable(id);
       this.visuals.set(id, { own, guides, label: el, visible: true });
     }
     this.updateGuides();
@@ -377,6 +410,11 @@ export class Viewer {
   /** Whether `id`'s own visuals are currently drawn. */
   isVisible(id: string): boolean {
     return this.visuals.get(id)?.visible ?? false;
+  }
+
+  /** Separate from the user's visibility checkbox: gaps have no current pose. */
+  isAvailable(id: string): boolean {
+    return this.available.has(id);
   }
 
   /**
@@ -389,8 +427,8 @@ export class Viewer {
     const v = this.visuals.get(id);
     if (!v || v.visible === on) return;
     v.visible = on;
-    v.own.visible = on;
-    if (v.label) v.label.style.display = on ? "" : "none";
+    v.own.visible = on && this.isAvailable(id);
+    if (v.label) v.label.style.display = v.own.visible ? "" : "none";
     this.updateGuides();
   }
 
@@ -435,7 +473,12 @@ export class Viewer {
         label.el.style.display = "none";
         continue;
       }
-      if (!this.isVisible(label.id)) {
+      const focusedSurfacePoint = this.earthFrameId !== undefined && this.focusedId !== null &&
+        this.graph.nodes.get(this.focusedId)?.row.frameId === this.earthFrameId;
+      // Earth centre projects behind a surface point while zoomed in; keep its
+      // frame in the tree instead of overlapping the point's own label.
+      if (!this.isVisible(label.id) || !this.isAvailable(label.id) ||
+          (label.id === this.earthFrameId && focusedSurfacePoint)) {
         label.el.style.display = "none";
         continue;
       }
@@ -479,7 +522,7 @@ export class Viewer {
     );
     const counts = [0, 0];
     for (const node of this.graph.nodes.values()) {
-      if (!this.isVisible(node.id)) continue;
+      if (!this.isVisible(node.id) || !this.isAvailable(node.id)) continue;
       const parent = node.group.parent ?? this.graph.root;
       // Edge kind from the actual attachment: another entity's group → kinship
       // edge (bright); the root or any non-entity group → frame-anchor spoke (dim).

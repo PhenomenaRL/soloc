@@ -10,6 +10,7 @@ import type { TopologyEvent } from "../core/topology";
 const SLIDER_STEPS = 20_000;
 
 export interface TimeControlsOptions {
+  initialSpeed?: number;
   minNs: bigint;
   maxNs: bigint;
   events: readonly TopologyEvent[];
@@ -25,12 +26,14 @@ export interface TimeControls {
 }
 
 export const SPEEDS: { label: string; nsPerSec: number }[] = [
+  { label: "1 s/s", nsPerSec: 1e9 },
+  { label: "10 s/s", nsPerSec: 10e9 },
   { label: "1 min/s", nsPerSec: 60e9 },
   { label: "1 h/s", nsPerSec: 3_600e9 },
   { label: "6 h/s", nsPerSec: 21_600e9 },
   { label: "1 d/s", nsPerSec: 86_400e9 },
 ];
-export const DEFAULT_SPEED = SPEEDS[2]!;
+export const DEFAULT_SPEED = SPEEDS[4]!;
 
 export function buildTimeControls(bar: HTMLElement, opts: TimeControlsOptions): TimeControls {
   bar.replaceChildren();
@@ -48,7 +51,7 @@ export function buildTimeControls(bar: HTMLElement, opts: TimeControlsOptions): 
     const o = document.createElement("option");
     o.value = String(s.nsPerSec);
     o.textContent = s.label;
-    if (s === DEFAULT_SPEED) o.selected = true;
+    if (s.nsPerSec === (opts.initialSpeed ?? DEFAULT_SPEED.nsPerSec)) o.selected = true;
     speedSel.append(o);
   }
   speedSel.addEventListener("change", () => opts.onSpeedChange(Number(speedSel.value)));
