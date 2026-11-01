@@ -26,8 +26,9 @@ explicit reference frame, at an explicit instant, in native units. Tag any data 
 it becomes spatiotemporally addressable, comparable, transformable, and mergeable with everyone
 else's, from a robot deep underwater, to a deep-space probe or construction vehicles on the lunar surface.
 
-- **Store raw, reproject on demand.** Observations are kept forever in their original frame and
-  units. Transforms to any astronomical frame (ICRF, GCRF, body-fixed) happen at query time via a
+- **Store raw, reproject on demand.** Retained observations keep their original frame and
+  units; an optional memory limit evicts older history. Transforms to astronomical frames
+  (ICRF, GCRF, body-fixed) happen at query time via a
   physics engine backed by [NAIF SPICE](https://naif.jpl.nasa.gov/naif/toolkit.html) ephemerides.
 - **Arrow-native throughout.** Every observation is an [Apache Arrow](https://arrow.apache.org/)
   `RecordBatch`. Zero-copy interop with Python (`pyarrow`), Julia, and the rest of the Arrow
@@ -68,6 +69,26 @@ cargo test --workspace
 
 To run the server, see [`crates/soloc-server`](crates/soloc-server/).
 
+The [GPS/GPX workflow](crates/soloc-ledger/README.md#gpsgpx-workflow) covers a single
+fix or GPX 1.1 tracks/routes through conversion, bounded ingestion, query, transform
+and IPC persistence. Run the small Halifax example without kernels:
+
+```bash
+cargo run --locked -p soloc-ledger --features gpx --example import_gpx -- /tmp/halifax.arrow
+```
+
+It uses explicit identities, ellipsoidal heights, time and orientation policies with
+the ordinary-tracking WGS84→ITRF93 approximation. The
+[core API](crates/spacetimestamp/README.md#gps-coordinate-and-time-conversion) documents
+precision limits and failure behavior; [Flight ingestion](crates/soloc-server/README.md#batched-gpx-import)
+uses the existing server. For Earth-relative playback, the
+[exporter](crates/soloc-ledger/README.md#earth-relative-gpx-playback-export) adds
+kernel-derived frame poses and segment provenance. The
+[visualizer](visualizer/README.md#gpx-playback-with-a-positioned-earth) renders the
+WGS84 surface and preserves observation gaps. See the
+[acceptance checks](crates/soloc-ledger/README.md#gpsgpx-acceptance-checks) to reproduce
+the complete validation workflow.
+
 ## Roadmap
 
 soloc starts with a single first-party schema ("Entity") to showcase the pattern; the plan is to grow the
@@ -77,9 +98,12 @@ schema library, the tooling, and the integrations around it.
 - [x] Append-only ledger with Arrow-IPC persistence and object-store backends (S3 / GCS / Azure)
 - [x] Bounded ledger memory: a rolling-window memory limit that keeps each entity's latest state
 - [x] Arrow Flight server (proof-of-concept)
+- [x] Single GPS observation conversion and optional GPX 1.1 parsing/mapping
+- [x] Batched GPX ingestion and partial-completion reports (local ledger / Flight)
+- [x] Earth-relative GPX export and playback with explicit segment gaps
 - [ ] Debugging / visualizer tool for inspecting frames, chains, and poses
 - [ ] Ledger performance benchmarks and storage-organization optimizations
-- [ ] Ecosystem integrations — ROS2 [tf2](https://wiki.ros.org/tf2), GPS → spacetimestamp,
+- [ ] Ecosystem integrations — ROS2 [tf2](https://wiki.ros.org/tf2),
   [ArcGIS](https://www.esri.com/) / GeoArrow
 
 ## Community
