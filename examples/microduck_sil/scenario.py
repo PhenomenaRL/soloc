@@ -24,6 +24,7 @@ OUT = HERE / "out"
 LEDGER = OUT / "microduck.arrow"
 JOINTS = OUT / "microduck.joints.arrow"       # 50 Hz trunk pose + joint angles, for the gait viewer
 JOINT_HZ = 50
+ALIGNED = OUT / "microduck_aligned.arrow"     # the recording plus sightings and alignment estimates
 
 # MuJoCo +x/+y/+z are the site's east/north/up; the scene origin is this point.
 SITE = FacilitySpec("Place Jacques-Cartier", "PJC", EARTH, 45.5075, -73.5536)
@@ -64,9 +65,24 @@ STOP_M = 0.35                         # stop this far short of the item, by odom
 POINT_S = 3.0
 GOTO_TIMEOUT_S = 45.0                 # 3 m at ~0.1 m/s, plus turning
 
+# Duck-to-duck sightings (synthetic: camera bearing inside the FOV, ToF range, BLE identity) and the
+# alignment of each duck's odometry frame into the lookout's, fitted from them.
+LOOKOUT = "duck-d"
+SIGHT_RANGE_M = 4.0                   # the VL53L5CX's range
+SIGHT_HZ = 2
+REFIT_S = 10.0
+MIN_SIGHTINGS = 3
+MIN_SPREAD_M = 0.5
+EVAL_EVERY_S = 15.0                   # "b in a's frame" samples, truth via soloc exchange
+
 
 def odom_name(duck: str) -> str:
     return f"{duck}/odom"
+
+
+def estimate_name(duck: str) -> str:
+    """`duck`'s odometry frame as the lookout estimates it, posed in the lookout's odometry frame."""
+    return f"{duck}/odom~{LOOKOUT}"
 
 
 def source_name(duck: str) -> str:
@@ -86,6 +102,7 @@ def bindings(ducks: list[str]) -> list[tuple[int, str, str]]:
     out = [(KIND_SOLOC, AUTHORITY, SITE.name), (KIND_ABSTRACT, AUTHORITY, TRUTH_SOURCE_NAME),
            (KIND_ABSTRACT, AUTHORITY, "kinematic_sim_v1")]     # the reused Facility's row source
     out += [(KIND_SOLOC, AUTHORITY, t) for t in TRASH]
+    out += [(KIND_SOLOC, AUTHORITY, estimate_name(d)) for d in ducks if d != LOOKOUT]
     for d in ducks:
         out += [(KIND_SOLOC, AUTHORITY, d), (KIND_SOLOC, AUTHORITY, odom_name(d)),
                 (KIND_ABSTRACT, AUTHORITY, source_name(d))]

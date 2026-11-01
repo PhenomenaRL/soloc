@@ -2,9 +2,13 @@
 double-click. The ducks are drawn on the Old Port site over its OSM map: MuJoCo truth, and a ghost
 of where each duck's own odometry puts it (its boot frame composed with its odometry rows). The
 trash is drawn where it is, and each report where soloc resolves it: the report row, stored in the
-duck's odometry frame, exchanged to IAU_EARTH and taken into the site's ENU.
+duck's odometry frame, exchanged to IAU_EARTH and taken into the site's ENU. On an aligned ledger,
+each sighting is a short ray, and each duck has a third ghost: placed through the lookout's latest
+estimate of its odometry frame. With the joint sidecar beside the ledger, the truth duck is Pollen's
+own model, walking: its links posed by MuJoCo's forward kinematics from the recorded trunk pose and
+joint angles. The model's meshes are CC BY-NC-SA: they go into the generated page only.
 
-    ../sim_study_0/.venv/bin/python export_viewer.py           # out/microduck.arrow → out/microduck_3d.html
+    ../sim_study_0/.venv/bin/python export_viewer.py           # out/microduck_aligned.arrow if present, else out/microduck.arrow
 
 The Sun and Earth come from a running server (`serve.sh`), as in sim_study_0's viewer.
 """
@@ -13,15 +17,22 @@ import argparse
 import base64
 import json
 import math
+import sys
 import time
 import urllib.request
 from io import BytesIO
 from pathlib import Path
 
+import mujoco
 import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
 from PIL import Image
 
 import scenario as sc
+
+sys.path.insert(0, str(sc.SIM_RL / "src"))
+from mjlab_microduck.sim.body_server import JOINT_NAMES, ROBOT_ONLY  # noqa: E402
 from sim import scenario as sc0
 from sim.ephemeris import Ephemeris
 from sim.geo import EARTH, quat_from_matrix
@@ -34,6 +45,11 @@ TEMPLATE = sc.HERE / "viewer_template.html"
 EPHEMERIS_STEP_S = 10
 REACH_KM, VIEW_KM, NEAR_KM, FOLLOW_KM = 0.5, 0.012, 2e-4, 0.002
 PAD_M = 3.0                         # floor round the ducks' tracks
+RAY_S = 1.0                         # how long a sighting's ray stays drawn
+RAY_Z_M = 0.1
+GAIT_HZ = 25                        # link poses kept from the 50 Hz sidecar; the page interpolates
+VISUAL_GROUP = 2                    # the model's visual meshes (group 3 is the collision copy)
+MESH_CELL_M = 0.004                 # vertex-clustering cell for the embedded meshes
 
 # The site's ground: OSM raster tiles, fetched once into data/osm_tiles/ (OSM's tile policy: light
 # use, a real User-Agent, cached, attributed) and embedded as one mosaic.
@@ -110,9 +126,133 @@ def framed_m(rows: Rows, entity_id: bytes, frame_id: bytes):
     return rows.t_s[k], rows.pos[k] * rows.km[k][:, None] * 1000, rows.quat[k]
 
 
+def duck_model(model: mujoco.MjModel) -> list[list[dict]]:
+    """Per body (1…), its visual meshes in the body's frame, one per colour, decimated."""
+    parts: dict[tuple[int, tuple], list] = {}
+    for g in range(model.ngeom):
+        if model.geom_group[g] != VISUAL_GROUP or model.geom_type[g] != mujoco.mjtGeom.mjGEOM_MESH:
+            continue
+        mid = model.geom_dataid[g]
+        v = model.mesh_vert[model.mesh_vertadr[mid]:model.mesh_vertadr[mid] + model.mesh_vertnum[mid]]
+        f = model.mesh_face[model.mesh_faceadr[mid]:model.mesh_faceadr[mid] + model.mesh_facenum[mid]]
+        r = np.zeros(9)
+        mujoco.mju_quat2Mat(r, model.geom_quat[g])
+        v = v @ r.reshape(3, 3).T + model.geom_pos[g]
+        mat = model.geom_matid[g]
+        rgba = model.mat_rgba[mat] if mat >= 0 else model.geom_rgba[g]
+        parts.setdefault((int(model.geom_bodyid[g]), tuple(np.round(rgba[:3], 3))), []).append((v, f))
+    bodies = [[] for _ in range(model.nbody - 1)]
+    faces = 0
+    for (body, rgb), pieces in parts.items():
+        offsets = np.cumsum([0] + [len(v) for v, _ in pieces])
+        v = np.vstack([v for v, _ in pieces])
+        f = np.vstack([f + o for (_, f), o in zip(pieces, offsets)])
+        v, f = cluster_mesh(v, f, MESH_CELL_M)
+        faces += len(f)
+        bodies[body - 1].append({"color": "#%02x%02x%02x" % tuple(int(255 * c) for c in rgb),
+                                 "v": b64(v.ravel()), "i": b64(f.ravel(), np.uint32)})
+    print(f"  duck model: {model.nbody - 1} links, {faces} faces after clustering")
+    return bodies
+
+
+def cluster_mesh(v: np.ndarray, f: np.ndarray, cell: float) -> tuple[np.ndarray, np.ndarray]:
+    """Vertex clustering: vertices in one `cell`-sized voxel merge into their mean; faces that
+    collapse or repeat go; vertices no face uses go."""
+    keys, inv = np.unique(np.floor(v / cell).astype(np.int64), axis=0, return_inverse=True)
+    inv = inv.ravel()
+    merged = np.zeros((len(keys), 3))
+    np.add.at(merged, inv, v)
+    merged /= np.bincount(inv, minlength=len(keys))[:, None]
+    f = inv[f]
+    f = f[(f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])]
+    _, first = np.unique(np.sort(f, axis=1), axis=0, return_index=True)
+    f = f[np.sort(first)]
+    used, f = np.unique(f, return_inverse=True)
+    return merged[used], f.reshape(-1, 3)
+
+
+def gait(model: mujoco.MjModel, joints_path: Path) -> list[dict]:
+    """Per duck, its links' poses in the site frame at `GAIT_HZ`: the sidecar's trunk pose and
+    joint angles set on the model, then MuJoCo's forward kinematics."""
+    table = pa.ipc.open_file(joints_path).read_all()
+    data = mujoco.MjData(model)
+    free = model.jnt_qposadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")]
+    slots = [(w, model.jnt_qposadr[j]) for w, n in enumerate(JOINT_NAMES)
+             if (j := mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)) >= 0]
+    t0 = tai_ns_from_utc(sc.T0)
+    every = sc.JOINT_HZ // GAIT_HZ
+    out = []
+    for duck in sc.DUCKS:
+        rows = table.filter(pc.equal(table["duck"], duck))
+        if not rows.num_rows:
+            continue
+        t = (rows["t_tai_ns"].to_numpy()[::every] - t0) / 1e9
+        trunk = np.array(rows["trunk"].to_pylist())[::every]
+        quat = np.array(rows["quat"].to_pylist())[::every]
+        wire = np.array(rows["positions"].to_pylist())[::every]
+        p, q = np.zeros((len(t), model.nbody - 1, 3)), np.zeros((len(t), model.nbody - 1, 4))
+        for i in range(len(t)):
+            data.qpos[free:free + 3], data.qpos[free + 3:free + 7] = trunk[i], quat[i]
+            for w, adr in slots:
+                data.qpos[adr] = wire[i, w]
+            mujoco.mj_kinematics(model, data)
+            p[i], q[i] = data.xpos[1:], data.xquat[1:]
+        out.append({"name": duck, "t": b64(t), "p": b64(p.ravel()), "q": b64(q.ravel())})
+    return out
+
+
+def estimate_tracks(rows: Rows, site_id: bytes) -> list[dict]:
+    """Each duck as the lookout places it: the lookout's boot frame ∘ its latest estimate of the
+    duck's odometry frame ∘ the duck's odometry rows."""
+    look = sc.entity(sc.odom_name(sc.LOOKOUT))
+    _, boot_p, boot_q = framed_m(rows, look, site_id)
+    if not len(boot_p):
+        return []
+    rb, out = quat_matrix(boot_q[0]), []
+    for duck in sc.DUCKS:
+        te, pe, qe = framed_m(rows, sc.entity(sc.estimate_name(duck)), look)
+        if duck == sc.LOOKOUT or not len(te):
+            continue
+        t, pos, quat = framed_m(rows, sc.entity(duck), sc.entity(sc.odom_name(duck)))
+        keep = t >= te[0]
+        t, pos, quat = t[keep], pos[keep], quat[keep]
+        k = np.searchsorted(te, t, side="right") - 1
+        p_site, q_site = [], []
+        for i in range(len(t)):
+            re = quat_matrix(qe[k[i]])
+            r = rb @ re @ quat_matrix(quat[i])
+            p_site.append(boot_p[0] + rb @ (pe[k[i]] + re @ pos[i]))
+            q_site.append(quat_from_matrix(r))
+        out.append(track(f"{duck} (via {sc.LOOKOUT}'s estimate)", "estimate", t, np.array(p_site), np.array(q_site),
+                         model="duck"))
+    return out
+
+
+def sighting_rays(rows: Rows, site_id: bytes) -> dict | None:
+    """Each sighting as a segment from the observer (truth) to where it saw the target, taken into
+    the site through the observer's boot frame. Sorted by time, for the page to draw a window."""
+    odom_of = {sc.entity(sc.odom_name(d)): d for d in sc.DUCKS}
+    segs = []
+    for target in sc.DUCKS:
+        k = rows.of(sc.entity(target))
+        k = k[np.array([f in odom_of and odom_of[f] != target for f in rows.frames[k]], bool)]
+        for kk in k:
+            observer, t = odom_of[rows.frames[kk]], float(rows.t_s[kk])
+            _, bp, bq = framed_m(rows, rows.frames[kk], site_id)
+            end = bp[0] + quat_matrix(bq[0]) @ (rows.pos[kk] * rows.km[kk] * 1000)
+            ot, opos, _ = framed_m(rows, sc.entity(observer), site_id)
+            start = [np.interp(t, ot, opos[:, 0]), np.interp(t, ot, opos[:, 1])]
+            segs.append((t, *start, end[0], end[1]))
+    if not segs:
+        return None
+    segs.sort()
+    s = np.array(segs)
+    return {"t": s[:, 0].tolist(), "p": b64(s[:, 1:].ravel()), "z": RAY_Z_M, "life": RAY_S}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("path", type=Path, nargs="?", default=sc.LEDGER)
+    p.add_argument("path", type=Path, nargs="?", default=sc.ALIGNED if sc.ALIGNED.exists() else sc.LEDGER)
     p.add_argument("--out", type=Path, help="default: <path stem>_3d.html beside the ledger")
     p.add_argument("--server", default="grpc://localhost:50051")
     args = p.parse_args()
@@ -124,6 +264,7 @@ def main():
     pose = Pose(rows, site.id)
     duration = float(rows.t_s.max())
 
+    real = sc.JOINTS.exists()           # the walking model draws the truth duck; its track keeps the label
     tracks, xy = [], []
     for duck in sc.DUCKS:
         did, oid = sc.entity(duck), sc.entity(sc.odom_name(duck))
@@ -131,7 +272,7 @@ def main():
         if not len(t):
             continue
         xy.append(pos[:, :2])
-        tracks.append(track(duck, "duck", t, pos, quat, model="duck"))
+        tracks.append(track(duck, "duck", t, pos, quat, model="real" if real else "duck"))
         _, boot_p, boot_q = framed_m(rows, oid, site.id)
         r = quat_matrix(boot_q[0])
         t, pos, quat = framed_m(rows, did, oid)
@@ -140,6 +281,8 @@ def main():
                             [quat_from_matrix(r @ quat_matrix(q)) for q in quat], model="duck"))
         tracks.append(track(sc.odom_name(duck), "frame", [0.0, duration], np.tile(boot_p[0], (2, 1)),
                             np.tile(boot_q[0], (2, 1))))
+    tracks += estimate_tracks(rows, site.id)
+    rays = sighting_rays(rows, site.id)
     client = SolocClient(args.server)
     odom_of = {sc.entity(sc.odom_name(d)): d for d in sc.DUCKS}
     events = []
@@ -169,6 +312,11 @@ def main():
            "name": names.get(site.id, site.name), "frame": f"{site.name} ENU",
            "p": pose.p_km.tolist(), "q": quat_from_matrix(pose.r), "extent": extent, "machines": [],
            "reach": REACH_KM, "view": VIEW_KM, "near": NEAR_KM, "follow": FOLLOW_KM, "tracks": tracks}
+    if rays:
+        ctx["rays"] = rays
+    if real:
+        model = mujoco.MjModel.from_xml_path(str(ROBOT_ONLY))
+        ctx["articulated"] = {"bodies": duck_model(model), "ducks": gait(model, sc.JOINTS)}
     ground = osm_ground(site, extent)
     if ground:
         ctx["map"] = ground

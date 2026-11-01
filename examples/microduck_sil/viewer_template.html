@@ -91,6 +91,7 @@
     <div class="row">Orbits and cruise arcs <input type="checkbox" id="orbits" checked></div>
     <div class="row">Labels <input type="checkbox" id="labels" checked></div>
     <div class="row" id="osmrow">OSM map at sites <input type="checkbox" id="osm" checked></div>
+    <div class="row">Sighting rays <input type="checkbox" id="rays" checked></div>
     <div id="where"></div>
     <div class="note">Drag to rotate, right-drag or shift-drag to pan, wheel to zoom. Vehicles appear as you close in on their body; robots on their site. Craft between bodies (GCRF, ICRF) show from any distance.</div>
   </section>
@@ -118,6 +119,7 @@ const CATS = {
   facility:   { label: "Site",                        color: "#c98500" },
   duck:       { label: "Ducks (MuJoCo truth)",        color: "#f2b134" },
   belief:     { label: "Ducks as their odometry has them", color: "#3987e5", opacity: 0.45 },
+  estimate:   { label: "Ducks placed via the lookout's estimate", color: "#d55181", opacity: 0.45 },
   frame:      { label: "Odometry boot frames",        color: "#9085e9" },
   trash:      { label: "Trash",                       color: "#199e70" },
   report:     { label: "Trash reports, as soloc resolves them", color: "#e66767", opacity: 0.7 },
@@ -237,6 +239,7 @@ function makeModel(cat, shape = cat) {
   const o = CATS[cat].opacity, g = new THREE.Group();
   const mat = new THREE.MeshLambertMaterial({ color: CATS[cat].color, transparent: o !== undefined, opacity: o ?? 1, depthWrite: o === undefined });
   if (shape === "none") return g;                  // a fire vertex: only its place on the perimeter loop
+  if (shape === "real") return g;                  // drawn by its walking model; the track keeps label and follow
   if (shape === "ball") g.add(new THREE.Mesh(new THREE.SphereGeometry(0.3, 16, 12), mat), box(0.62, 0.04, 0.04, new THREE.MeshLambertMaterial({ color: "#3d3c37" })));
   else if (shape === "ring") { const m = new THREE.Mesh(new THREE.TorusGeometry(0.45, 0.08, 8, 32), mat); m.rotation.y = Math.PI / 2; g.add(m, box(0.04, 0.9, 0.04, mat)); }
   else if (shape === "shaft") g.add(box(1.0, 0.12, 0.12, mat), box(0.06, 0.4, 0.06, mat, 0.3));
@@ -326,6 +329,16 @@ function buildVenueLayout(ctx) {
     for (const m of s.machines) {
       const mesh = new THREE.Mesh(new THREE.BoxGeometry(...m.s), new THREE.MeshLambertMaterial({ color: m.belt ? "#55555e" : "#6b6a63" }));
       mesh.position.set(...m.c); grp.add(mesh);
+    }
+    if (s.rays) {
+      // Sightings, sorted by time: each drawn for `life` seconds after it is made.
+      const p = f32(s.rays.p), n = p.length / 4, pos = new Float32Array(n * 6), z = s.rays.z;
+      for (let i = 0; i < n; i++) pos.set([p[4 * i], p[4 * i + 1], z, p[4 * i + 2], p[4 * i + 3], z], 6 * i);
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      ctx.rays = { t: s.rays.t, life: s.rays.life, lines: new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0xe9e8e2, transparent: true, opacity: 0.8 })) };
+      ctx.rays.lines.frustumCulled = false; ctx.rays.lines.renderOrder = 21;
+      grp.add(ctx.rays.lines);
     }
     return;
   }
@@ -417,6 +430,46 @@ function updateWind(ctx, T) {
   }
   w.lines.geometry.attributes.position.needsUpdate = true;
 }
+function buildArticulated(ctx) {
+  // Pollen's microduck: each link's meshes in the link's frame, shared by every duck; each duck a
+  // set of links posed per frame from its track of link poses in the site frame.
+  const a = ctx.def.articulated;
+  const parts = a.bodies.map(meshes => meshes.map(m => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(f32(m.v), 3));
+    g.setIndex(new THREE.BufferAttribute(new Uint32Array(bytes(m.i).buffer), 1));
+    g.computeVertexNormals();
+    return { g, mat: new THREE.MeshPhongMaterial({ color: m.color, flatShading: true, shininess: 10 }) };
+  }));
+  ctx.walkers = a.ducks.map(d => {
+    const root = new THREE.Group();
+    const links = parts.map(meshes => {
+      const l = new THREE.Group();
+      for (const { g, mat } of meshes) l.add(new THREE.Mesh(g, mat));
+      l.traverse(o => { o.renderOrder = 20; });
+      root.add(l);
+      return l;
+    });
+    ctx.group.add(root);
+    return { name: d.name, t: f32(d.t), p: f32(d.p), q: f32(d.q), links, root };
+  });
+}
+function updateWalkers(ctx, T, near) {
+  for (const w of ctx.walkers) {
+    const m = w.t.length, n = w.links.length;
+    w.root.visible = near && !state.hidden.has("duck") && T >= w.t[0] && T <= w.t[m - 1];
+    if (!w.root.visible) continue;
+    const i = Math.max(0, upper(w.t, T) - 1), j = Math.min(i + 1, m - 1);
+    const f = j > i ? (T - w.t[i]) / (w.t[j] - w.t[i]) : 0, P = w.p, Q = w.q;
+    for (let k = 0; k < n; k++) {
+      const a = i * n + k, b = j * n + k;
+      w.links[k].position.set(P[3 * a] + f * (P[3 * b] - P[3 * a]), P[3 * a + 1] + f * (P[3 * b + 1] - P[3 * a + 1]),
+                              P[3 * a + 2] + f * (P[3 * b + 2] - P[3 * a + 2]));
+      tq1.set(Q[4 * a + 1], Q[4 * a + 2], Q[4 * a + 3], Q[4 * a]); tq2.set(Q[4 * b + 1], Q[4 * b + 2], Q[4 * b + 3], Q[4 * b]);
+      w.links[k].quaternion.copy(tq1).slerp(tq2, f);
+    }
+  }
+}
 function buildSiteLayout(ctx) {
   if (ctx.def.layout === "venue" || ctx.def.layout === "plant") return buildVenueLayout(ctx);
   const s = ctx.def, W = s.half * 1.25, grp = ctx.group;
@@ -454,6 +507,7 @@ for (const c of DATA.contexts) {
     ctx.anchored = c.layout === "plant";
     (ctx.anchored ? scene : body.fixed).add(ctx.group);
     buildSiteLayout(ctx);
+    if (c.articulated) buildArticulated(ctx);
     // The facility itself: its ENU axes at the site origin.
     const e = { name: c.name, cat: "facility", ctx, static: true, model: makeModel("facility"), local: V(), active: true };
     ctx.group.add(e.model); ctx.entities.push(e); entities.push(e);
@@ -501,7 +555,7 @@ function pickEntity(name, prev) { return byName[name].find(e => e.active) || pre
 
 // ---- state, focus, camera -------------------------------------------------------------------
 const state = { T: 0, playing: false, speed: 5, trail: "30", trailFrame: "fixed", size: 0.03,
-                labels: true, orbits: true, osm: true, corotate: true, hidden: new Set(), focus: { kind: "system" } };
+                labels: true, orbits: true, osm: true, rays: true, corotate: true, hidden: new Set(), focus: { kind: "system" } };
 const ctl = { az: -1.2, el: 0.5, dist: 6e8 };
 let fly = null;
 const target = V(), basis = Qt();
@@ -677,6 +731,12 @@ function update() {
     if (ctx.kind === "site") ctx.group.visible = ctxNearBody(ctx);
     if (ctx.wind) updateWind(ctx, T);
     if (ctx.perimeter || ctx.trenches) updateFire(ctx, T, near);
+    if (ctx.rays) {
+      const a = upper(ctx.rays.t, T - ctx.rays.life), b = upper(ctx.rays.t, T);
+      ctx.rays.lines.geometry.setDrawRange(2 * a, 2 * (b - a));
+      ctx.rays.lines.visible = near && state.rays;
+    }
+    if (ctx.walkers) updateWalkers(ctx, T, near);
   }
   updateLabels();
   const dt = new Date(T0 + T * 1000);
@@ -816,6 +876,7 @@ $("trailFrame").onchange = e => { state.trailFrame = e.target.value; };
 $("size").onchange = e => { state.size = Number(e.target.value); };
 $("labels").onchange = e => { state.labels = e.target.checked; };
 $("orbits").onchange = e => { state.orbits = e.target.checked; };
+$("rays").onchange = e => { state.rays = e.target.checked; };
 $("osm").onchange = e => { state.osm = e.target.checked; mapMeshes.forEach(m => { m.visible = state.osm; }); };
 if (!DATA.attribution) $("osmrow").style.display = "none";
 else { const a = document.createElement("div"); a.id = "attribution"; a.textContent = DATA.attribution; document.body.appendChild(a); }
