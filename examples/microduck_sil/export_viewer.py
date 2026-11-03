@@ -1,12 +1,15 @@
 """Writes a standalone 3D viewer of a recorded duck ledger: one HTML file, opened offline by
-double-click. The ducks are drawn on the Old Port site over its OSM map: MuJoCo truth, and a ghost
+double-click. Two local frames: the Old Port site (OSM map and buildings) and, on a 2nd floor
+inside it, Pollen's apartment with its walls and furniture. The ducks are drawn in the apartment: MuJoCo truth, and a ghost
 of where each duck's own odometry puts it (its boot frame composed with its odometry rows). The
 trash is drawn where it is, and each report where soloc resolves it: the report row, stored in the
-duck's odometry frame, exchanged to IAU_EARTH and taken into the site's ENU. On an aligned ledger,
+duck's odometry frame, exchanged to IAU_EARTH (through the apartment and the site) and taken back
+into the apartment. On an aligned ledger,
 each sighting is a short ray, and each duck has a third ghost: placed through the lookout's latest
 estimate of its odometry frame. With the joint sidecar beside the ledger, the truth duck is Pollen's
 own model, walking: its links posed by MuJoCo's forward kinematics from the recorded trunk pose and
-joint angles. The model's meshes are CC BY-NC-SA: they go into the generated page only.
+joint angles. The model's meshes are CC BY-NC-SA: they go into the generated page only. The OSM
+buildings round the site (`buildings.py`) stand on the map as faint volumes.
 
     ../sim_study_0/.venv/bin/python export_viewer.py           # out/microduck_aligned.arrow if present, else out/microduck.arrow
 
@@ -29,7 +32,9 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from PIL import Image
 
+import apartment as ap
 import scenario as sc
+from buildings import buildings
 
 sys.path.insert(0, str(sc.SIM_RL / "src"))
 from mjlab_microduck.sim.body_server import JOINT_NAMES, ROBOT_ONLY  # noqa: E402
@@ -43,7 +48,7 @@ from tools.view_sim import load
 
 TEMPLATE = sc.HERE / "viewer_template.html"
 EPHEMERIS_STEP_S = 10
-REACH_KM, VIEW_KM, NEAR_KM, FOLLOW_KM = 0.5, 0.012, 2e-4, 0.002
+REACH_KM, VIEW_KM, NEAR_KM, FOLLOW_KM = 0.5, 0.012, 3e-5, 0.002
 PAD_M = 3.0                         # floor round the ducks' tracks
 RAY_S = 1.0                         # how long a sighting's ray stays drawn
 RAY_Z_M = 0.1
@@ -252,28 +257,34 @@ def sighting_rays(rows: Rows, site_id: bytes) -> dict | None:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("path", type=Path, nargs="?", default=sc.ALIGNED if sc.ALIGNED.exists() else sc.LEDGER)
+    p.add_argument("path", type=Path, nargs="?", help="default: the run's aligned ledger if present, else its recording")
     p.add_argument("--out", type=Path, help="default: <path stem>_3d.html beside the ledger")
     p.add_argument("--server", default="grpc://localhost:50051")
+    p.add_argument("--run", type=int, default=1, help="which recording (see scenario.set_run)")
     args = p.parse_args()
+    sc.set_run(args.run)
+    args.path = args.path or (sc.ALIGNED if sc.ALIGNED.exists() else sc.LEDGER)
 
     ledger, names = load(args.path)
     rows = Rows(ledger)
     rows.t_s = rows.t_s - (tai_ns_from_utc(sc.T0) - tai_ns_from_utc(sc0.T0)) / 1e9   # Rows counts from sim_study_0's T0
     site = Facility(sc.SITE)
     pose = Pose(rows, site.id)
+    apt = sc.entity(sc.APARTMENT)
+    _, apt_p, apt_q = framed_m(rows, apt, site.id)          # the apartment's pose in the site, from the ledger
+    apt_t, apt_r = apt_p[0], quat_matrix(apt_q[0])
     duration = float(rows.t_s.max())
 
     real = sc.JOINTS.exists()           # the walking model draws the truth duck; its track keeps the label
     tracks, xy = [], []
     for duck in sc.DUCKS:
         did, oid = sc.entity(duck), sc.entity(sc.odom_name(duck))
-        t, pos, quat = framed_m(rows, did, site.id)
+        t, pos, quat = framed_m(rows, did, apt)
         if not len(t):
             continue
         xy.append(pos[:, :2])
         tracks.append(track(duck, "duck", t, pos, quat, model="real" if real else "duck"))
-        _, boot_p, boot_q = framed_m(rows, oid, site.id)
+        _, boot_p, boot_q = framed_m(rows, oid, apt)
         r = quat_matrix(boot_q[0])
         t, pos, quat = framed_m(rows, did, oid)
         belief = boot_p[0] + pos @ r.T
@@ -281,14 +292,14 @@ def main():
                             [quat_from_matrix(r @ quat_matrix(q)) for q in quat], model="duck"))
         tracks.append(track(sc.odom_name(duck), "frame", [0.0, duration], np.tile(boot_p[0], (2, 1)),
                             np.tile(boot_q[0], (2, 1))))
-    tracks += estimate_tracks(rows, site.id)
-    rays = sighting_rays(rows, site.id)
+    tracks += estimate_tracks(rows, apt)
+    rays = sighting_rays(rows, apt)
     client = SolocClient(args.server)
     odom_of = {sc.entity(sc.odom_name(d)): d for d in sc.DUCKS}
     events = []
     for item in sc.TRASH:
         tid = sc.entity(item)
-        _, pos, _ = framed_m(rows, tid, site.id)
+        _, pos, _ = framed_m(rows, tid, apt)
         tracks.append(track(item, "trash", [0.0, duration], np.tile(pos[0], (2, 1)), np.tile([1.0, 0, 0, 0], (2, 1))))
         tracks[-1]["solid"] = {"s": [0.15, 0.15, 0.1], "c": [0.0, 0.0, 0.05]}
         xy.append(pos[:, :2])
@@ -297,7 +308,7 @@ def main():
         if not len(k):
             continue
         out = client.exchange(ledger.take(k), EARTH.frame)
-        enu = (positions(out) - site.position_km) @ site.basis * 1000
+        enu = ((positions(out) - site.position_km) @ site.basis * 1000 - apt_t) @ apt_r   # back into the apartment
         for i, kk in enumerate(k):
             duck, t = odom_of[rows.frames[kk]], float(rows.t_s[kk])
             tracks.append(track(f"{item} as {duck} reported it", "report", [t, duration], np.tile(enu[i], (2, 1)),
@@ -305,21 +316,31 @@ def main():
             tracks[-1]["solid"] = {"s": [0.04, 0.04, 0.4], "c": [0.0, 0.0, 0.2]}
             events.append({"t": t, "label": f"{duck} points out {item}"})
             print(f"  {item} reported by {duck}: {np.linalg.norm(enu[i, :2] - pos[0, :2]) * 100:.1f} cm from the item")
+    # Two local frames: the site (OSM map and buildings) and, inside it, the apartment (Pollen's
+    # scene, the ducks and the trash), each a context placed on the Earth.
+    corners = np.array([[x, y, 0.0] for x in (-4.0, 4.0) for y in (-3.0, 3.0)]) @ apt_r.T + apt_t
+    extent = [float(corners[:, 0].min() - PAD_M), float(corners[:, 0].max() + PAD_M),
+              float(corners[:, 1].min() - PAD_M), float(corners[:, 1].max() + PAD_M)]
+    common = {"kind": "site", "layout": "plant", "body": EARTH.name, "machines": [],
+              "reach": REACH_KM, "view": VIEW_KM, "near": NEAR_KM, "follow": FOLLOW_KM}
+    site_ctx = {**common, "id": sc.SITE.code.lower(), "name": names.get(site.id, site.name),
+                "frame": f"{site.name} ENU", "p": pose.p_km.tolist(), "q": quat_from_matrix(pose.r),
+                "extent": extent, "tracks": []}
     xy = np.vstack(xy)
-    extent = [float(xy[:, 0].min() - PAD_M), float(xy[:, 0].max() + PAD_M),
-              float(xy[:, 1].min() - PAD_M), float(xy[:, 1].max() + PAD_M)]
-    ctx = {"id": sc.SITE.code.lower(), "kind": "site", "layout": "plant", "body": EARTH.name,
-           "name": names.get(site.id, site.name), "frame": f"{site.name} ENU",
-           "p": pose.p_km.tolist(), "q": quat_from_matrix(pose.r), "extent": extent, "machines": [],
-           "reach": REACH_KM, "view": VIEW_KM, "near": NEAR_KM, "follow": FOLLOW_KM, "tracks": tracks}
+    apt_ctx = {**common, "id": "apt", "name": names.get(apt, sc.APARTMENT), "frame": "apartment (Pollen's scene)",
+               "p": (pose.p_km + pose.r @ apt_t / 1000).tolist(), "q": quat_from_matrix(pose.r @ apt_r),
+               "extent": [float(xy[:, 0].min() - PAD_M), float(xy[:, 0].max() + PAD_M),
+                          float(xy[:, 1].min() - PAD_M), float(xy[:, 1].max() + PAD_M)],
+               "noFloor": True, "room": ap.viewer_geoms(), "tracks": tracks}
     if rays:
-        ctx["rays"] = rays
+        apt_ctx["rays"] = rays
     if real:
         model = mujoco.MjModel.from_xml_path(str(ROBOT_ONLY))
-        ctx["articulated"] = {"bodies": duck_model(model), "ducks": gait(model, sc.JOINTS)}
+        apt_ctx["articulated"] = {"bodies": duck_model(model), "ducks": gait(model, sc.JOINTS)}
     ground = osm_ground(site, extent)
     if ground:
-        ctx["map"] = ground
+        site_ctx["map"] = ground
+        site_ctx["buildings"] = [{"name": b["name"], "ring": b["ring"], "h": b["h"]} for b in buildings(site)]
 
     eph = Ephemeris(client)
     eph.t0_ns = tai_ns_from_utc(sc.T0)
@@ -333,7 +354,7 @@ def main():
 
     data = {"t0": sc.T0.isoformat() + "Z", "duration": duration, "source": args.path.name,
             "ephemerisStep": EPHEMERIS_STEP_S, "bodies": bodies, "orbits": [], "arcs": [],
-            "coast": coastlines(), "contexts": [ctx], "events": sorted(events, key=lambda e: e["t"]),
+            "coast": coastlines(), "contexts": [site_ctx, apt_ctx], "events": sorted(events, key=lambda e: e["t"]),
             "attribution": OSM_ATTRIBUTION if ground else ""}
     html = (TEMPLATE.read_text()
             .replace("/*THREE_JS*/", THREE_JS.read_text())

@@ -5,7 +5,7 @@ lookout's, then scores "where is duck b in duck a's frame?" against truth.
     ../sim_study_0/.venv/bin/python align.py                  # out/microduck.arrow → out/microduck_aligned.arrow
 
 Sightings are synthetic, from truth plus noise: a duck sees another inside its camera's view and
-its ToF range, and BLE names who it is. Each is stored in the observer's odometry frame. A pair's
+its ToF range, with no wall or furniture in between, and BLE names who it is. Each is stored in the observer's odometry frame. A pair's
 sightings, both ways, pair one physical point in two odometry frames, so a 2-D rigid fit gives one
 frame in the other. Every `REFIT_S` the fits so far are chained onto the lookout and written as
 `ESTIMATED` rows. Truth for the score goes through soloc: the ducks' truth rows exchanged to
@@ -18,6 +18,7 @@ from collections import deque
 
 import numpy as np
 
+import apartment as ap
 import scenario as sc
 from export_viewer import framed_m
 from record import rotate, wrap
@@ -65,7 +66,9 @@ def fit(pa: np.ndarray, pb: np.ndarray):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--server", default="grpc://localhost:50051")
+    p.add_argument("--run", type=int, default=1, help="which recording (see scenario.set_run)")
     args = p.parse_args()
+    sc.set_run(args.run)
 
     client = SolocClient(args.server)
     if not client.is_empty():
@@ -74,7 +77,7 @@ def main():
     table = client.query_all()
     rows = Rows(table)
     rows.t_s = rows.t_s - (tai_ns_from_utc(sc.T0) - tai_ns_from_utc(sc0.T0)) / 1e9   # Rows counts from sim_study_0's T0
-    site = sc.entity(sc.SITE.name)
+    apt = sc.entity(sc.APARTMENT)       # MuJoCo's world: truth and boot frames are posed in it
     ducks = [d for d in sc.DUCKS if len(rows.of(sc.entity(d)))]
     if sc.LOOKOUT not in ducks:
         raise SystemExit(f"the run has no {sc.LOOKOUT}, the lookout")
@@ -82,9 +85,9 @@ def main():
     truth, odom, boot = {}, {}, {}
     for d in ducks:
         did, oid = sc.entity(d), sc.entity(sc.odom_name(d))
-        truth[d] = Track(*framed_m(rows, did, site))
+        truth[d] = Track(*framed_m(rows, did, apt))
         odom[d] = Track(*framed_m(rows, did, oid))
-        _, bp, bq = framed_m(rows, oid, site)
+        _, bp, bq = framed_m(rows, oid, apt)
         boot[d] = (bp[0, 0], bp[0, 1], float(yaws(bq)[0]))
     duration = float(min(tr.t[-1] for tr in truth.values()))
     t0_tai = tai_ns_from_utc(sc.T0)
@@ -104,7 +107,7 @@ def main():
                 bx, by, _ = truth[b].at(t)
                 r = math.hypot(bx - ax, by - ay)
                 beta = wrap(math.atan2(by - ay, bx - ax) - ayaw)
-                if r > sc.SIGHT_RANGE_M or abs(beta) > half_fov:
+                if r > sc.SIGHT_RANGE_M or abs(beta) > half_fov or not ap.clear_line((ax, ay), (bx, by)):
                     continue
                 r += rng.normal(0, sc.RANGE_SIGMA_M)
                 beta += rng.normal(0, math.radians(sc.BEARING_SIGMA_DEG))
@@ -163,7 +166,7 @@ def main():
     picks = {}
     for d in ducks:
         k = rows.of(sc.entity(d))
-        k = k[np.array([f == site for f in rows.frames[k]], bool)]
+        k = k[np.array([f == apt for f in rows.frames[k]], bool)]
         picks[d] = k[np.clip(np.searchsorted(rows.t_s[k], times), 0, len(k) - 1)]
     order = [d for d in ducks]
     out = client.exchange(table.take(np.concatenate([picks[d] for d in order])), EARTH.frame)

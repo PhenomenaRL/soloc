@@ -74,6 +74,9 @@
   <h1>microduck_sil 3D</h1><span class="src" id="src"></span>
   <div class="group" id="places"><span class="cap">Go to</span></div>
   <div class="group"><span class="cap">Follow</span><select id="follow"></select></div>
+  <div class="group"><span class="cap">Camera</span><select id="camMode">
+    <option value="site">site axes</option><option value="heading">turns with the duck</option>
+    <option value="shoulder">over the shoulder</option><option value="odom">duck's odometry frame</option></select></div>
 </div>
 <div id="side" class="panel">
   <section><h2>Legend (click to hide)</h2><div id="legend"></div></section>
@@ -91,6 +94,7 @@
     <div class="row">Orbits and cruise arcs <input type="checkbox" id="orbits" checked></div>
     <div class="row">Labels <input type="checkbox" id="labels" checked></div>
     <div class="row" id="osmrow">OSM map at sites <input type="checkbox" id="osm" checked></div>
+    <div class="row" id="bldgrow">OSM buildings <input type="checkbox" id="bldg" checked></div>
     <div class="row">Sighting rays <input type="checkbox" id="rays" checked></div>
     <div id="where"></div>
     <div class="note">Drag to rotate, right-drag or shift-drag to pan, wheel to zoom. Vehicles appear as you close in on their body; robots on their site. Craft between bodies (GCRF, ICRF) show from any distance.</div>
@@ -288,7 +292,7 @@ function trailLine(buf, cat) {
   l.frustumCulled = false; l.renderOrder = 19;
   return l;
 }
-const mapMeshes = [];
+const mapMeshes = [], buildingMeshes = [];
 function groundMap(m) {
   // The site's OSM mosaic, warped onto an n × n mesh whose vertices the export placed in the
   // site's frame (rows from the mosaic's top), dimmed to sit under the dark theme.
@@ -316,16 +320,41 @@ function underlay(layers) {
   // Coplanar underlay: drawn in order after the globe, testing depth but not writing it.
   layers.forEach((o, i) => { o.renderOrder = 10 + i; [].concat(o.material).forEach(m => { m.depthWrite = false; }); });
 }
+const roomWalls = [];
+function buildRoom(geoms, grp) {
+  // A MuJoCo scene's primitives at true size: walls faint with edges so the ducks show through,
+  // everything else solid. MuJoCo's cylinders and capsules run along z, three.js's along y.
+  const wallMat = new THREE.MeshLambertMaterial({ color: "#d8d2c4", transparent: true, opacity: 0.12, depthWrite: false, side: THREE.DoubleSide });
+  const edge = new THREE.LineBasicMaterial({ color: 0xe0dcd2, transparent: true, opacity: 0.45, depthWrite: false });
+  for (const g of geoms) {
+    const [a, b, c] = g.s;
+    const geo = g.kind === "box" ? new THREE.BoxGeometry(2 * a, 2 * b, 2 * c)
+      : g.kind === "cylinder" ? new THREE.CylinderGeometry(a, a, 2 * b, 20).rotateX(Math.PI / 2)
+      : g.kind === "capsule" ? new THREE.CapsuleGeometry(a, 2 * b, 6, 16).rotateX(Math.PI / 2)
+      : g.kind === "ellipsoid" ? new THREE.SphereGeometry(1, 20, 14).scale(a, b, c)
+      : new THREE.SphereGeometry(a, 20, 14);
+    const m = new THREE.Mesh(geo, g.wall ? wallMat : new THREE.MeshLambertMaterial({ color: g.c }));
+    m.position.set(...g.p); m.quaternion.set(g.q[1], g.q[2], g.q[3], g.q[0]);
+    grp.add(m);
+    if (g.wall) {
+      const l = new THREE.LineSegments(new THREE.EdgesGeometry(geo), edge);
+      l.position.copy(m.position); l.quaternion.copy(m.quaternion);
+      m.renderOrder = l.renderOrder = 22;
+      grp.add(l); roomWalls.push(m, l);
+    }
+  }
+}
 function buildVenueLayout(ctx) {
   const s = ctx.def, [e0, e1, n0, n1] = s.extent, grp = ctx.group, layers = [];
   const add = o => { grp.add(o); layers.push(o); return o; };
   if (s.machines) {
     // The floor (over the site's OSM map, if it has one), then any machines at true size.
     if (s.map) add(groundMap(s.map));
-    add(new THREE.Mesh(new THREE.PlaneGeometry(e1 - e0, n1 - n0),
+    if (!s.noFloor) add(new THREE.Mesh(new THREE.PlaneGeometry(e1 - e0, n1 - n0),
                        new THREE.MeshLambertMaterial(s.map ? { color: "#26262b", transparent: true, opacity: 0.35 } : { color: "#26262b" })))
       .position.set((e0 + e1) / 2, (n0 + n1) / 2, 0);
     underlay(layers);
+    if (s.room) buildRoom(s.room, grp);
     for (const m of s.machines) {
       const mesh = new THREE.Mesh(new THREE.BoxGeometry(...m.s), new THREE.MeshLambertMaterial({ color: m.belt ? "#55555e" : "#6b6a63" }));
       mesh.position.set(...m.c); grp.add(mesh);
@@ -339,6 +368,17 @@ function buildVenueLayout(ctx) {
       ctx.rays = { t: s.rays.t, life: s.rays.life, lines: new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0xe9e8e2, transparent: true, opacity: 0.8 })) };
       ctx.rays.lines.frustumCulled = false; ctx.rays.lines.renderOrder = 21;
       grp.add(ctx.rays.lines);
+    }
+    if (s.buildings) {
+      // OSM footprints extruded to their heights, faint enough to see the ducks through.
+      const mat = new THREE.MeshLambertMaterial({ color: "#c9c4b8", transparent: true, opacity: 0.06, depthWrite: false, side: THREE.DoubleSide });
+      const edge = new THREE.LineBasicMaterial({ color: 0xd8d4ca, transparent: true, opacity: 0.3, depthWrite: false });
+      for (const b of s.buildings) {
+        const g = new THREE.ExtrudeGeometry(new THREE.Shape(b.ring.map(([x, y]) => new THREE.Vector2(x, y))), { depth: b.h, bevelEnabled: false });
+        const m = new THREE.Mesh(g, mat), l = new THREE.LineSegments(new THREE.EdgesGeometry(g), edge);
+        m.renderOrder = l.renderOrder = 22;            // after the opaque ducks
+        grp.add(m, l); buildingMeshes.push(m, l);
+      }
     }
     return;
   }
@@ -555,7 +595,7 @@ function pickEntity(name, prev) { return byName[name].find(e => e.active) || pre
 
 // ---- state, focus, camera -------------------------------------------------------------------
 const state = { T: 0, playing: false, speed: 5, trail: "30", trailFrame: "fixed", size: 0.03,
-                labels: true, orbits: true, osm: true, rays: true, corotate: true, hidden: new Set(), focus: { kind: "system" } };
+                labels: true, orbits: true, osm: true, rays: true, corotate: true, cam: "site", hidden: new Set(), focus: { kind: "system" } };
 const ctl = { az: -1.2, el: 0.5, dist: 6e8 };
 let fly = null;
 const target = V(), basis = Qt();
@@ -572,12 +612,41 @@ function focusTarget(f) {
   if (f.kind === "site") return icrfOf(f.ctx, V());
   // Between two of its tracks (or aboard a craft, which is not drawn) it holds its last place.
   const e = f.entity;
-  return e.active || e.seen ? icrfOf(e.ctx, e.local) : (e.ctx.kind === "site" ? icrfOf(e.ctx, V()) : e.ctx.body.pos.clone());
+  return e.active || e.seen ? icrfOf(e.ctx, camLocal(e)) : (e.ctx.kind === "site" ? icrfOf(e.ctx, V()) : e.ctx.body.pos.clone());
+}
+// Camera modes for a followed site entity: the frame the camera turns with, and where it aims.
+const SHOULDER_KM = 0.0008, SHOULDER_AIM = [0.35, 0, 0.06];   // aim: metres ahead of and above the duck
+const CAM_EASE_S = 0.4;              // the camera eases toward a walking duck, so its gait sway doesn't shake the view
+function yawOf(q) { return Math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z)); }
+function easeCamera(e, dt) {
+  // Exponential easing of the followed duck's heading and position; a jump (scrubbing) snaps.
+  const yaw = yawOf(e.model.quaternion), k = 1 - Math.exp(-dt / CAM_EASE_S);
+  const dy = Math.atan2(Math.sin(yaw - (e.camYaw ?? yaw)), Math.cos(yaw - (e.camYaw ?? yaw)));
+  if (e.camYaw === undefined || Math.abs(dy) > 1.0 || e.camPos.distanceTo(e.local) > 0.3) { e.camYaw = yaw; e.camPos.copy(e.local); return; }
+  e.camYaw += dy * k;
+  e.camPos.lerp(e.local, k);
+}
+function headingQ(e) {
+  return Qt().setFromAxisAngle(new THREE.Vector3(0, 0, 1), e.camYaw ?? yawOf(e.model.quaternion));
+}
+function camTurn(e) {          // site frame → the camera's frame
+  if (state.cam === "heading" || state.cam === "shoulder") return headingQ(e);
+  if (state.cam === "odom") {
+    const f = (byName[e.name.split(" ")[0] + "/odom"] || [])[0];
+    if (f && f.active) return f.model.quaternion.clone();
+  }
+  return Qt();
+}
+function camLocal(e) {
+  const v = (state.cam !== "site" && e.camYaw !== undefined ? e.camPos : e.local).clone();
+  if (state.cam === "shoulder" && e.ctx.kind === "site") v.add(new THREE.Vector3(...SHOULDER_AIM).applyQuaternion(headingQ(e)));
+  return v;
 }
 function focusBasis(f) {
   const ctx = f.kind === "site" ? f.ctx : f.kind === "entity" ? f.entity.ctx : null;
   const body = f.kind === "body" ? f.body : ctx ? ctx.body : null;
   if (ctx && ctx.kind === "inertial") return Qt();
+  if (ctx && ctx.kind === "site" && f.kind === "entity") return body.quat.clone().multiply(ctx.q).multiply(camTurn(f.entity));
   if (ctx && ctx.kind === "site") return body.quat.clone().multiply(ctx.q);   // a site's own up
   return body && state.corotate ? body.quat.clone() : Qt();
 }
@@ -668,6 +737,7 @@ function update() {
     // Crossing into another frame changes the camera's basis; blend instead of snapping.
     if (e.ctx !== followed.entity.ctx && !fly) fly = { t0: performance.now(), from: target.clone(), fromDist: ctl.dist, fromBasis: basis.clone(), toDist: ctl.dist };
     followed.entity = e;
+    if (e.ctx.kind === "site" && e.active) { e.camPos ||= V(); easeCamera(e, frameDt); }
   }
 
   // Camera target and basis, blended while flying to a new focus.
@@ -688,7 +758,7 @@ function update() {
     // where its origin is, which is only coarse when the camera is far off anyway.
     const f = state.focus, g = ctx.group;
     g.quaternion.copy(ctx.body.quat).multiply(ctx.q);
-    if (!fly && f.kind === "entity" && f.entity.ctx === ctx) g.position.copy(f.entity.local).multiplyScalar(-1e-3).applyQuaternion(g.quaternion);
+    if (!fly && f.kind === "entity" && f.entity.ctx === ctx) g.position.copy(camLocal(f.entity)).multiplyScalar(-1e-3).applyQuaternion(g.quaternion);
     else g.position.copy(icrfOf(ctx, V())).sub(target);
     g.updateMatrixWorld(true);
   }
@@ -818,8 +888,9 @@ function updateWhere() {
   const f = state.focus;
   const frame = f.kind === "system" ? "ICRF, centred on the Sun"
     : f.kind === "body" ? `${f.body.name}; camera ${state.corotate ? "turns with its IAU frame" : "fixed in ICRF"}`
-    : f.kind === "site" ? `${f.ctx.name} (site ENU: x east, y north, z up)`
-    : `${f.entity.name} in ${f.entity.ctx.kind === "site" ? f.entity.ctx.name + " ENU" : f.entity.ctx.def.frame}`;
+    : f.kind === "site" ? `${f.ctx.name} (${f.ctx.def.frame})`
+    : `${f.entity.name} in ${f.entity.ctx.def.frame}`
+      + (f.kind === "entity" && state.cam !== "site" ? `; camera: ${$("camMode").selectedOptions[0].text}` : "");
   $("where").textContent = "Viewing: " + frame + ". Distance " + fmtDist(ctl.dist) + ".";
 }
 function fmtDist(km) {
@@ -878,6 +949,14 @@ $("labels").onchange = e => { state.labels = e.target.checked; };
 $("orbits").onchange = e => { state.orbits = e.target.checked; };
 $("rays").onchange = e => { state.rays = e.target.checked; };
 $("osm").onchange = e => { state.osm = e.target.checked; mapMeshes.forEach(m => { m.visible = state.osm; }); };
+$("bldg").onchange = e => { buildingMeshes.forEach(m => { m.visible = e.target.checked; }); };
+if (!buildingMeshes.length) $("bldgrow").style.display = "none";
+$("camMode").onchange = e => {
+  state.cam = e.target.value;
+  if (state.cam === "shoulder") { ctl.az = Math.PI; ctl.el = 0.3; }
+  fly = { t0: performance.now(), from: target.clone(), fromDist: ctl.dist, fromBasis: basis.clone(),
+          toDist: state.cam === "shoulder" ? SHOULDER_KM : ctl.dist };
+};
 if (!DATA.attribution) $("osmrow").style.display = "none";
 else { const a = document.createElement("div"); a.id = "attribution"; a.textContent = DATA.attribution; document.body.appendChild(a); }
 $("corotate").onchange = e => { state.corotate = e.target.checked; fly = { t0: performance.now(), from: target.clone(), fromDist: ctl.dist, fromBasis: basis.clone(), toDist: ctl.dist }; };
@@ -889,9 +968,10 @@ function resize() {
 window.addEventListener("resize", resize);
 resize();
 
-let last = performance.now();
+let last = performance.now(), frameDt = 0;
 function loop(now) {
   const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  frameDt = dt * (state.playing ? state.speed : 1);   // easing runs on the duck's clock while playing
   if (state.playing) {
     state.T = Math.min(DATA.duration, state.T + dt * state.speed);
     if (state.T >= DATA.duration) { state.playing = false; $("play").textContent = "▶ Play"; }
