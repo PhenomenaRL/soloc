@@ -49,7 +49,7 @@ def events_from_rows(table: pa.Table) -> tuple[list[tuple[bytes, bytes, int]], d
     for s in stats.values():
         s["last"] = s["times"][-1]
         steps = np.diff(s.pop("times"))
-        s["cadence_s"] = int(np.median(steps)) // 10**9 if len(steps) else None
+        s["cadence_s"] = float(np.median(steps)) / 1e9 if len(steps) else None
     return events, stats
 
 
@@ -62,9 +62,12 @@ def tree_at(events, tai_ns: int) -> dict[bytes, bytes]:
     return parent
 
 
-def cadence(seconds: int | None) -> str:
+def cadence(seconds: float | None) -> str:
     if seconds is None:
         return "1 row"
+    if seconds < 1:
+        return f"{seconds * 1000:.0f} ms"
+    seconds = int(seconds)
     return f"{seconds // 3600} h" if seconds % 3600 == 0 else (
         f"{seconds // 60} min" if seconds % 60 == 0 else f"{seconds} s")
 

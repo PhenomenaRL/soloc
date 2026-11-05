@@ -15,11 +15,30 @@
 | `aircraft.png` | aircraft tracks over the land polygons |
 | `flight_altitudes.png` | each aircraft's altitude over the 5 days |
 | `ships.png` | ship tracks over the land polygons, with every full lane dotted and the canal boxes outlined |
+| `regatta.png` | the race in venue ENU over the water polygons: each boat from the warning to its finish, and the whole race day from the docks; the fleet in one colour, SAIL-10 (the `--regatta-policy` boat) highlighted |
+| `regatta_speed.png` | each boat's stored speed while sailing against the polar bound for the wind at its row, one panel per boat; drops are tacks, gybes and luffs |
+| `wildfire.png` | the fire's perimeter every 2 h over the fuel map, the finished line coloured by when each piece was finished, the crews' tracks and the ICP |
+| `wildfire_crews.png` | each crew's distance to the nearest spreading vertex over time, one panel per crew, against the 30 m rule and the 40 m escape distance |
+| `factory_boxes.png` | per line, boxes spawned and delivered over the shift, and the belt speed from the shaft's stored `angular_velocity` (start, break, stop) |
+| `factory_bearing.png` | the 20 Hz burst: the shaft's, a cage's and a ball's stored angles (unwrapped) against the bearing model's slipped ratios; and bearing 1's balls resolved through the ledger to IAU_EARTH, seen along the shaft |
+| `factory_bearing_analysis.png` | line 1 bearing 1: shaft/cage/ball speeds and their ratios against pure rolling (the gap is the slip), the defect frequencies (FTF, BPFO, BPFI, BSF), burst orientation with speed taken from the quaternion against the stored `angular_velocity`, and cumulative revolutions and ball passes |
+| `arm_joints.png` | the six joint angles decoded from the 125 Hz link quaternions, and the stored joint speeds against the ±90°/s limit, with each grasp and release marked |
+| `arm_tcp.png` | the tip's path in the cell from above and from the east, composed from the stored link rows, with soloc's answer every 3 s (L6 rows exchanged through 7 frames, then into the cell) and the grasps and releases coloured by box |
+| `arm_boxes.png` | per box, its parent frame over the episode (PALLET-A, the gripper, PALLET-B), and its height in the cell through both reparents, with soloc's answer at four rows per box |
+
+`python -m tools.bearing_eval out/sim_study_0.arrow` (~1 min) prints the bearing evaluation
+([bearing_dynamics.md](bearing_dynamics.md)) and writes three more:
+
+| File | Shows |
+|---|---|
+| `bearing_orbit.png` | each shaft's centre in its stator in µm, one panel per line on one scale: the 08:15 CEST capture's orbit over every quasi-static row of the shift |
+| `bearing_capture.png` | the first 3 s of that capture's stored acceleration per line, each on its own scale, with L3's spalled-ball race contacts dotted |
+| `bearing_envelope.png` | envelope spectra (200–2000 Hz band) of the stored captures, averaged over all eight per line, with FTF, BSF, BPFO, 2×BSF and BPFI marked |
 
 ## 3D viewer
 
 `python -m tools.export_viewer out/sim_study_0.arrow` turns a saved ledger into one standalone
-HTML file, `out/sim_study_0_3d.html` (~43 MB). The tracks, the body ephemerides, the Earth
+HTML file, `out/sim_study_0_3d.html` (~72 MB). The tracks, the body ephemerides, the Earth
 coastlines and three.js are inlined into `tools/viewer_template.html`, so the page opens offline by double-click
 in any WebGL browser. Building it needs a running server.
 
@@ -33,6 +52,36 @@ It is one scene, nested the way the ledger's frames are:
   in body-fixed km as stored.
 - **Each site's ENU frame:** sits on its body at the facility's stored pose, with its robots in
   metres over the road grid.
+- **The regatta venue:** sits on Earth the same way. It shows:
+  - the Bedford Bay and Basin water, the start line and the met buoys
+  - the marks, while they are laid
+  - the sailboats and the RC boat
+  - arrows for the wind from `out/wind.arrow`, refreshed each minute on race day and hidden
+    outside it
+
+  "Go to" puts the camera 4 km away. The boats show within 12 km.
+- **The wildfire venue:** sits on Earth the same way. It shows:
+  - the fuel map as its ground (grey, darker burns faster; the river in blue)
+  - the fire's perimeter as a red loop through its vertices, in the ring order replayed from
+    the rows
+  - the finished line, appearing piece by piece
+  - the crews
+  - the wind arrows
+
+  "Go to" puts the camera 2.5 km away. The crews show within 15 km.
+- **The Steyr plant:** shows the three lines' machines at true size and the boxes riding the
+  belts.
+  - **Parts:** every drive and bearing part is a model you can Follow, down to 2 cm from the
+    camera. The page composes each part through its stored parents (ball → cage → ring →
+    stator → B → line → plant) and turns it on by its row's `angular_velocity`. At 5 s rows a
+    ball would otherwise jump 11.6 turns.
+  - **Precision:** the scene graph holds positions to about 3 cm at solar-system scale, too
+    coarse for a 5 cm bearing. So the plant hangs off the scene root, placed against the camera
+    target each frame, which keeps its parts within 0.01 mm of where the ledger puts them.
+- **The Odense cell:** the arm, pallets and boxes at true size. Each link is a bar to its
+  child's joint, composed by the page through its stored parents (gripper → L6 … L1 → base →
+  cell), from the link rows thinned to 25 Hz. A box has one track per parent (PALLET-A, the
+  gripper, PALLET-B), so the reparents show. It hangs off the scene root like the plant.
 
 Body positions and orientations come from the server: a zero offset in each body frame is
 exchanged to ICRF at 5 min steps over the window. That is the same resolution the ledger does.
@@ -50,10 +99,13 @@ a facility (a craft on its pad or landed) are composed through the facility's st
 - Floating-origin rendering keeps it precise from 4 AU down to a metre.
 
 Every entity is a small model with its body axes (x red, y green, z blue) at its interpolated
-pose; models keep a constant size on screen. The controls:
+pose; models keep a constant size on screen, except the arm cell's, which are true size. The
+controls:
 - a time slider with ticks at the launches, burns, hand-offs, touchdowns, boardings and
-  disembarks, and at Parker's perihelion
-- play at 1 min/s up to 3 h/s
+  disembarks, at Parker's perihelion, at the regatta's marks laid, warning, gun, first and last
+  finish and marks lifted, at the wildfire's ignition, first orders, last line finished and
+  containment, at the factory's shift start, burst and shift end, and at the arm's start and park
+- play at 5 s/s up to 3 h/s
 - trails from 15 min to the whole track
 - labels, a hover readout (position in the entity's own frame), and a clickable legend that
   hides a category
@@ -62,6 +114,68 @@ Robots riding a craft are left out (crawlers on a hull, CARGO-01 in flight), sin
 is invisible at orbit scale; following CARGO-01 holds at the pad until it steps off. On Earth sites
 the survey tracks look jagged: a robot moves up to 45 m between its 30 s rows, and the survey
 rows are 10 m apart, so straight lines between samples cut the corners.
+
+## Wind: out/wind.arrow
+
+`run_sim.py` also samples each venue's analytic wind (`sim/wind.py`) onto a 250 m grid every
+minute over the venue's window, an Arrow IPC file with columns `venue`, `t` (UTC), `lat`, `lon`,
+`u` and `v` (m/s east and north, the way the air moves). The regatta's field is sampled every
+minute and the wildfire's every 10 min, 383,237 rows (~24 MB) in all. It is a side table, not
+ledger rows.
+
+## Fuel: out/fuel.arrow
+
+The wildfire's fuel map (`sim/fuel.py`) on a 50 m grid over the venue: `venue`, `lat`, `lon`,
+`class` (river, riparian, corridor, slash, conifer) and `r0_factor`, the multiplier on the
+no-wind spread rate. That is 16,761 rows (~0.8 MB).
+
+## Arm truth: out/arm_truth.arrow
+
+The arm model's state at every 125 Hz sample of the episode: `arm`, `t_ns` (since T0), `q` and
+`qd` (the six joint angles in rad and speeds in rad/s), `tip` (cell ENU, m, from the model's
+forward kinematics) and `box` (the box held, else null). That is 43,750 rows (~6 MB). The ledger
+stores link poses, not joint values, so `check_sim` decodes q from the link quaternions and
+compares it with this table.
+
+## Situation snapshots: tools/snapshot_sim.py
+
+`tools.snapshot_sim` draws an arena as a decision maker would see it at an instant. It reads the
+saved ledger and `wind.arrow` beside it, with no server needed, and writes one PNG per instant
+to `out/snapshots/`. Each PNG has three panels:
+- the whole venue
+- the course, with 5-minute tails, headings, marks while laid, the RC boat and the met buoys over
+  the wind quivers
+- the standings: legs done, next mark, distance and speed, or finishing time, from replaying the
+  stored rows through the referee
+
+```bash
+python -m tools.snapshot_sim out/sim_study_0.arrow --scenario regatta --at 2026-09-05T17:20:00
+python -m tools.snapshot_sim out/sim_study_0.arrow --scenario regatta --every 10m   # 13:00–18:00 ADT
+python -m tools.snapshot_sim out/sim_study_0.arrow --scenario wildfire --every 2h   # ignition to contained
+python -m tools.snapshot_sim out/sim_study_0.arrow --scenario factory --at 2026-09-02T06:00:16.350
+python -m tools.snapshot_sim out/sim_study_0.arrow --scenario arm --at 2026-09-03T06:00:07
+```
+
+For the arm, the panels are:
+- the cell from above and from the east: the arm as a stick through its joint origins, composed
+  from each part's latest stored row, the tip's last 5 s, and every box where its latest row puts
+  it (the held one in orange)
+- the stats: the six joint angles decoded from the link quaternions, the tip, the box held and
+  the counts on each pallet
+
+For the factory, the panels are:
+- the plant floor with the boxes on the belts
+- line 1's Machine B from the side, with its drive pulley
+- bearing 1 along the shaft: rings, the cage's balls and each ball's spin
+- the stats: boxes per line, belt speed, shaft, cage and ball rates
+
+`--at` takes fractional seconds, for instants inside the 20 Hz burst.
+
+For the wildfire, the panels are:
+- the fuel map, the burning area and the finished line
+- the crews with 30 min tails
+- the burnt area, the vertices still spreading, the km of line, the wind at the ICP, and each
+  crew's distance to the nearest spreading front
 
 ## Rows: tools/view_sim.py
 

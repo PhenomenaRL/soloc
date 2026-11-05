@@ -22,16 +22,27 @@ per frame, under one name.
 import argparse
 import base64
 import json
+import math
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
 
 from sim import DATA
 from sim import scenario as sc
 from sim.ephemeris import Ephemeris
 from sim.geo import EARTH, GCRF, ICRF, MARS, MOON, SUN, quat_from_matrix
 from sim.land import outlines
+from sim.models import arm as am
+from sim.models import factory as fm
+from sim.models import regatta as rg
+from sim.models import wildfire as wf
 from sim.roster import roster
+from sim.wind import read_table
+from tools.snapshot_sim import FireView, arm_rows, factory_rows, fuel_grid
+from tools.snapshot_sim import Rows as SnapRows
 from soloc_client import CENTURY_NS, SolocClient, astronomical, id_bytes, sts_field, tai_ns_from_utc
 from tools.view_sim import load
 
@@ -39,6 +50,19 @@ THREE_JS = DATA / "three.min.js"
 TEMPLATE = Path(__file__).parent / "viewer_template.html"
 EPHEMERIS_STEP_S = 300
 DAY_S = 86400
+VENUE_REACH_KM = 12.0           # the camera distance under which the venue's boats show
+VENUE_VIEW_KM = 4.0             # "Go to" distance
+FIRE_REACH_KM = 15.0
+FIRE_VIEW_KM = 2.5
+PLANT_REACH_KM = 0.5
+PLANT_VIEW_KM = 0.045
+PLANT_NEAR_KM = 2e-5                # a bearing is 5 cm across: let the camera come within 2 cm
+PLANT_FOLLOW_KM = 3e-4
+ARM_REACH_KM = 0.5
+ARM_VIEW_KM = 0.006
+ARM_NEAR_KM = 2e-4
+ARM_FOLLOW_KM = 0.003
+ARM_VIEW_HZ = 25                    # the links' rows kept in the episode; the page slerps between them
 
 # (name, NAIF id, mean radius km, colour, draw orbit)
 BODIES = (
@@ -136,14 +160,184 @@ def framed(rows: Rows, entity_id: bytes, frame_id: bytes):
     return rows.t_s[k], rows.pos[k] * rows.km[k][:, None], rows.quat[k]
 
 
-def track(name: str, cat: str, t, xyz, quat, wide: bool = False) -> dict | None:
+def track(name: str, cat: str, t, xyz, quat, wide: bool = False, model: str | None = None) -> dict | None:
     """Quaternions are `[w, x, y, z]`, rotating the entity's body axes into its context frame.
-    `wide` keeps positions as float64, for tracks far from their context's centre."""
+    `wide` keeps positions as float64, for tracks far from their context's centre. `model`
+    picks a shape other than the category's."""
     if len(t) == 0:
         return None
-    return {"name": name, "cat": cat, "t": b64(t), "wide": wide,
+    return {"name": name, "cat": cat, "model": model or cat, "t": b64(t), "wide": wide,
             "p": b64(np.asarray(xyz).ravel(), np.float64 if wide else np.float32),
             "q": b64(np.asarray(quat).ravel())}
+
+
+def venue_context(g, rows: Rows, name, wind_path: Path) -> dict:
+    """The regatta venue: a site context with the water, the line and the wind as its layout."""
+    pose, c, vid = Pose(rows, g.venue.id), g.course, g.venue.id
+    tracks = [track(name(b), "sailboat", *on_site(rows, b.id, vid), model="motorboat" if b is g.rc else None)
+              for b in (g.rc, *g.boats)]
+    tracks += [track(name(m), "marker", *on_site(rows, m.id, vid), model="mark") for m in g.marks]
+    tracks += [track(name(b), "marker", *on_site(rows, b.id, vid), model="buoy") for b in g.buoys]
+    ctx = {"id": g.venue.spec.code.lower(), "kind": "site", "layout": "venue", "body": EARTH.name,
+           "name": name(g.venue), "frame": f"{name(g.venue)} ENU",
+           "p": pose.p_km.tolist(), "q": quat_from_matrix(pose.r),
+           "extent": list(sc.REGATTA_WIND.extent_m), "reach": VENUE_REACH_KM, "view": VENUE_VIEW_KM,
+           "water": [[g.venue.enu(a, o)[:2].round(1).tolist() for a, o in ring] for ring in sc.BASIN_WATER],
+           "line": [c.rc.tolist(), c.marks["MARK-PIN"].tolist()],
+           "tracks": [t for t in tracks if t]}
+    if wind_path.exists():
+        ctx["wind"] = wind_block(g.venue, wind_path)
+    return ctx
+
+
+def wind_block(venue, wind_path: Path) -> dict:
+    """The venue's rows of the wind table: the grid in venue ENU, and (u, v) per time, time-major."""
+    w = read_table(wind_path)
+    w = w.filter(pc.equal(w["venue"], venue.name))
+    t = w["t"].cast(pa.int64()).to_numpy() - int((sc.T0 - datetime(1970, 1, 1)).total_seconds())
+    times = np.unique(t)
+    first = t == times[0]
+    xy = np.array([venue.enu(a, o)[:2] for a, o in zip(w["lat"].to_numpy()[first], w["lon"].to_numpy()[first])])
+    uv = np.column_stack([w["u"].to_numpy(), w["v"].to_numpy()])
+    return {"t0": float(times[0]), "step": float(times[1] - times[0]), "n": len(times),
+            "xy": b64(xy.ravel()), "uv": b64(uv.ravel())}
+
+
+PART_SHAPES = {"STATOR": "stator", "SHAFT": "shaft", "ROTOR": "rotor", "IR": "ring", "OR": "ring",
+               "CAGE": "ring", "BALL": "ball"}
+
+
+def factory_context(fac, table, ledger_rows: Rows, name) -> dict:
+    """The plant: machines and belts as its floor layout; the parts as tracks in their parents'
+    frames, which the page composes (ball → cage → ring → stator → B → line → plant) and turns on
+    by each row's spin; the boxes composed onto the plant floor here (their parents are static)."""
+    rows = factory_rows(fac, table)
+    order = {p.id: k for k, p in enumerate(fac.parts)}
+    first = lambda n: rows.index[n][0]
+
+    def to_plant(part) -> tuple[np.ndarray, np.ndarray]:
+        """A static part's pose on the plant floor, from its stored rows."""
+        r, p = np.eye(3), np.zeros(3)
+        chain = []
+        while part is not None:
+            chain.append(part)
+            part = next((q for q in fac.parts if q.id == part.parent_id), None)
+        for q in reversed(chain):
+            k = first(q.name)
+            p = p + r @ rows.pos3[k]
+            r = r @ quat_matrix(rows.quat[k])
+        return p, r
+
+    tracks, machines = [], []
+    for p in fac.parts:
+        k = rows.index[p.name]
+        k = k[np.isclose(rows.t_s[k] % sc.PART_CADENCE_S, 0) | np.isclose(rows.t_s[k] % sc.PART_CADENCE_S, sc.PART_CADENCE_S)]
+        shape = next((s for key, s in PART_SHAPES.items() if f"-{key}" in p.name), "none")
+        tr = track(name(p), "part", rows.t_s[k], rows.pos3[k], rows.quat[k], model=shape)
+        tr["parent"] = order.get(p.parent_id, -1)
+        if p.rotating:
+            tr["w"] = b64(rows.spin[k])
+        tracks.append(tr)
+    for line in fac.lines:
+        for key, m in line["machines"].items():
+            pos, r = to_plant(m)
+            lx, ly, lz = sc.MACHINE_DIMENSIONS_M[key]
+            centre = pos + r @ np.array([lx / 2 if key == "B" else 0.0, 0.0, lz / 2])
+            machines.append({"c": centre.tolist(), "s": [lx, ly, lz], "belt": key == "B"})
+        b_pos, b_r = to_plant(line["machines"]["B"])
+        c_pos, c_r = to_plant(line["machines"]["C"])
+        for b in line["boxes"]:
+            k = rows.index[b.name]
+            on_c = np.array([f == b.c_id for f in rows.frames[k]])
+            xyz = np.where(on_c[:, None], c_pos + rows.pos3[k] @ c_r.T, b_pos + rows.pos3[k] @ b_r.T)
+            tracks.append(track(name(b), "box", rows.t_s[k], xyz, np.tile([1.0, 0, 0, 0], (len(k), 1))))
+    pose = Pose(ledger_rows, fac.plant.id)
+    ys = [l["line"].offset[1] for l in fac.lines]
+    return {"id": fac.plant.spec.code.lower(), "kind": "site", "layout": "plant", "body": EARTH.name,
+            "name": name(fac.plant), "frame": f"{name(fac.plant)} ENU",
+            "p": pose.p_km.tolist(), "q": quat_from_matrix(pose.r),
+            "extent": [-6.0, sc.MACHINE_C_M[0] + 3, min(ys) - 4, max(ys) + 4], "machines": machines,
+            "reach": PLANT_REACH_KM, "view": PLANT_VIEW_KM, "near": PLANT_NEAR_KM, "follow": PLANT_FOLLOW_KM,
+            "tracks": tracks}
+
+
+def arm_context(arm, table, ledger_rows: Rows, name) -> dict:
+    """The cell: the arm's parts at true size as tracks in their parents' frames, which the page
+    composes (box → gripper → L6 … L1 → base → cell). Links are thinned to `ARM_VIEW_HZ` in the
+    episode. A box has one track per parent at its stored local pose, from its first row there
+    to its first row on the next."""
+    rows = arm_rows(arm, table)
+    order = {p.id: k for k, p in enumerate(arm.parts)}
+    every = sc.ARM_HZ // ARM_VIEW_HZ
+    child = {**{l.id: n.offset for l, n in zip(arm.links, arm.links[1:])}, arm.links[-1].id: arm.gripper.offset}
+    tracks = []
+    for p in arm.parts:
+        k = rows.index[p.name]
+        tick = np.rint((rows.t_s[k] - am.EPISODE_S0) * sc.ARM_HZ)
+        k = k[~np.array([arm.motion.episode(int(t)) for t in rows.t_s[k] // sc.BASE_TICK_S * sc.BASE_TICK_S])
+              | (tick % every == 0)]
+        tr = track(name(p), "arm", rows.t_s[k], rows.pos3[k], rows.quat[k])
+        tr["parent"] = order.get(p.parent_id, -1)
+        if p.id in child:
+            tr["seg"], tr["width"] = child[p.id], p.dimensions_m[1]
+        else:
+            lz = p.dimensions_m[2]            # the pedestal hangs below the base frame; the rest stand on theirs
+            tr["solid"] = {"s": p.dimensions_m, "c": [0.0, 0.0, -lz / 2 if p is arm.base else lz / 2]}
+        tracks.append(tr)
+    for b in arm.boxes:
+        k = rows.index[b.name]
+        first = np.flatnonzero(np.r_[True, rows.frames[k][1:] != rows.frames[k][:-1]])
+        for n, i in enumerate(first):
+            last = first[n + 1] if n + 1 < len(first) else len(k)
+            j = [k[i], k[last - 1]]
+            t = rows.t_s[j].tolist() + ([float(rows.t_s[k[last]])] if last < len(k) else [])
+            pos, quat = rows.pos3[j], rows.quat[j]
+            if len(t) > 2:
+                pos, quat = np.vstack([pos, pos[-1:]]), np.vstack([quat, quat[-1:]])
+            tr = track(name(b), "box", t, pos, quat)
+            tr["parent"] = order[rows.frames[k[i]]]
+            tr["solid"] = {"s": list(sc.CELL_BOX_DIMENSIONS_M), "c": [0.0, 0.0, 0.0]}
+            tracks.append(tr)
+    pose = Pose(ledger_rows, arm.cell.id)
+    return {"id": arm.cell.spec.code.lower(), "kind": "site", "layout": "plant", "body": EARTH.name,
+            "name": name(arm.cell), "frame": f"{name(arm.cell)} ENU",
+            "p": pose.p_km.tolist(), "q": quat_from_matrix(pose.r),
+            "extent": [-1.6, 1.6, -1.6, 1.6], "machines": [],
+            "reach": ARM_REACH_KM, "view": ARM_VIEW_KM, "near": ARM_NEAR_KM, "follow": ARM_FOLLOW_KM,
+            "tracks": tracks}
+
+
+def fire_context(w, table, rows: Rows, name, wind_path: Path, fuel_path: Path) -> tuple[dict, list]:
+    """The wildfire venue: the fuel map as its ground, the perimeter as a loop through the vertex
+    tracks in replayed ring order, trenches appearing as they are finished, the crews, the wind.
+    Also returns its timeline events."""
+    pose, vid = Pose(rows, w.venue.id), w.venue.id
+    view = FireView(w, SnapRows(table, w.names, vid, tai_ns_from_utc(sc.T0)))
+    vertices = [v for v in w.vertices if len(rows.of(v.id))]
+    order = {v.name: k for k, v in enumerate(vertices)}
+    tracks = [track(name(c), "crew", *on_site(rows, c.id, vid)) for c in w.crews]
+    tracks += [track(name(v), "fire", *on_site(rows, v.id, vid), model="none") for v in vertices]
+    lines = sorted(view.lines, key=lambda l: l[0])
+    ctx = {"id": w.venue.spec.code.lower(), "kind": "site", "layout": "venue", "body": EARTH.name,
+           "name": name(w.venue), "frame": f"{name(w.venue)} ENU",
+           "p": pose.p_km.tolist(), "q": quat_from_matrix(pose.r),
+           "extent": list(sc.FIRE_WIND.extent_m), "reach": FIRE_REACH_KM, "view": FIRE_VIEW_KM,
+           # Ring order over time, as indices into this context's tracks (the crews come first).
+           "rings": [{"t": t, "i": [len(w.crews) + order[n] for n in ring]} for t, ring in view.replay.history],
+           "trenches": {"t": [float(b) for b, _, _ in lines], "p": b64(np.array([[*a, *b] for _, a, b in lines]).ravel())},
+           "tracks": [t for t in tracks if t]}
+    if fuel_path.exists():
+        fuel = fuel_grid(fuel_path, w.venue)
+        ctx["fuel"] = {"step": sc.FUEL_GRID_M, "cols": fuel.shape[1], "f": b64(fuel.ravel())}
+    if wind_path.exists():
+        ctx["wind"] = wind_block(w.venue, wind_path)
+    events = [{"t": wf.IGNITION_S, "label": "wildfire ignition"},
+              {"t": wf.DISPATCH_S, "label": "wildfire: first crew orders"}]
+    if lines:
+        events.append({"t": float(lines[-1][0]), "label": "wildfire: last line finished"})
+    if math.isfinite(view.end):
+        events.append({"t": view.end, "label": "wildfire contained"})
+    return ctx, events
 
 
 def ephemeris(eph: Ephemeris, naif: int, t_s: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -174,8 +368,8 @@ def main():
     p.add_argument("--seed", type=int, default=sc.SEED)
     args = p.parse_args()
 
-    table, names = load(args.path)
-    rows = Rows(table)
+    ledger, names = load(args.path)
+    rows = Rows(ledger)
     client = SolocClient(args.server)
     world = roster(args.seed, client)
     name = lambda e: names.get(e.id, e.name)
@@ -252,8 +446,28 @@ def main():
                          "p": poses[f.id].p_km.tolist(), "q": quat_from_matrix(poses[f.id].r),
                          "half": sc.SITE_HALF_WIDTH_M, "roads": list(sc.SITE_ROADS_M),
                          "depot": list(sc.DEPOT_M), "tracks": [t for t in tracks if t]})
-
+    g = world.regatta
+    if len(rows.of(g.venue.id)):
+        contexts.append(venue_context(g, rows, name, args.path.with_name("wind.arrow")))
     events = []
+    w = world.wildfire
+    if len(rows.of(w.venue.id)):
+        ctx, fire_events = fire_context(w, ledger, rows, name, args.path.with_name("wind.arrow"),
+                                        args.path.with_name("fuel.arrow"))
+        contexts.append(ctx)
+        events += fire_events
+    fac = world.factory
+    if len(rows.of(fac.plant.id)):
+        contexts.append(factory_context(fac, ledger, rows, name))
+        events += [{"t": float(fm.SHIFT_S[0]), "label": "factory shift starts"},
+                   {"t": float(fm.BURST_S[0]), "label": f"factory {sc.BURST_HZ} Hz burst"},
+                   {"t": float(fm.SHIFT_S[1]), "label": "factory shift ends"}]
+    arm = world.arm
+    if len(rows.of(arm.cell.id)):
+        contexts.append(arm_context(arm, ledger, rows, name))
+        events += [{"t": float(am.EPISODE_S0), "label": f"{sc.ARM_NAME} starts unstacking PALLET-A"},
+                   {"t": float(arm.motion.end_s), "label": f"{sc.ARM_NAME} parked, PALLET-B stacked"}]
+
     for c in world.spacecraft:
         for key, label in EVENT_LABELS.items():
             if key in c.events:
@@ -268,6 +482,20 @@ def main():
         k = int(np.argmin(np.linalg.norm(p.p - p.sun_p, axis=1)))
         if 0 < k < len(p.t_s) - 1:
             events.append({"t": float(p.t_s[k]), "label": f"{name(p)} perihelion"})
+    if len(rows.of(g.venue.id)):
+        finishes = []
+        for b in g.boats:
+            k = rows.of(b.id)
+            r, _ = rg.replay(g.course, rows.t_s[k], rows.pos[k, :2])
+            if r.finish_s is not None:
+                finishes.append(r.finish_s)
+        events += [{"t": rg.LAID_S[0], "label": "regatta marks laid"},
+                   {"t": rg.WARNING_S, "label": "regatta warning signal"},
+                   {"t": rg.GUN_S, "label": "regatta start gun"},
+                   {"t": rg.LAID_S[1], "label": "regatta marks lifted"}]
+        if finishes:
+            events += [{"t": min(finishes), "label": "regatta first finish"},
+                       {"t": max(finishes), "label": "regatta last finish"}]
 
     data = {"t0": sc.T0.isoformat() + "Z", "duration": sc.DURATION_S, "source": args.path.name,
             "ephemerisStep": EPHEMERIS_STEP_S, "bodies": bodies, "orbits": orbits, "arcs": arcs,

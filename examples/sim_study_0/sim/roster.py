@@ -1,19 +1,28 @@
 """Builds every entity in the scenario, in the order the driver appends them."""
 
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 
 from sim import scenario as sc
 from sim.ephemeris import Ephemeris
 from sim.models.aircraft import aircraft
+from sim.models.arm import Arm
 from sim.models.facility import Facility
+from sim.models.factory import Factory
 from sim.models.probe import Probe
+from sim.models.regatta import Regatta
+from sim.models.wildfire import Wildfire
 from sim.models.robot import CargoRobot, Crawler, Robot
 from sim.models.ship import ship
 from sim.models.spacecraft import Spacecraft, lander, launcher, moonshot, orbiter, transfer
 from sim.models.track import Track
 from soloc_client import SolocClient
+
+# The units `run_sim.py --scenario` runs on their own, in the order the parts are merged.
+GROUPS = ("space", "aircraft", "ships", "regatta", "wildfire", "factory", "arm")
+ARENAS = ("regatta", "wildfire")
 
 
 @dataclass
@@ -26,16 +35,36 @@ class Roster:
     cargo: list[CargoRobot]
     aircraft: list[Track]
     ships: list[Track]
+    regatta: Regatta
+    wildfire: Wildfire
+    factory: Factory
+    arm: Arm
+
+    @property
+    def groups(self) -> dict[str, list]:
+        """Each of `GROUPS` and its entities. The space fleets share hosts, so they run as one."""
+        return {"space": [*self.facilities, *self.spacecraft, *self.probes, *self.robots,
+                          *self.crawlers, *self.cargo],
+                "aircraft": self.aircraft, "ships": self.ships, "regatta": self.regatta.entities,
+                "wildfire": self.wildfire.entities, "factory": self.factory.entities,
+                "arm": self.arm.entities}
 
     @property
     def entities(self) -> list:
         """Parents before their children, so a tick's rows are appended in that order."""
-        return [*self.facilities, *self.spacecraft, *self.probes, *self.robots, *self.crawlers,
-                *self.cargo, *self.aircraft, *self.ships]
+        return [e for members in self.groups.values() for e in members]
+
+    @property
+    def arenas(self) -> list:
+        """Groups the driver hands decision ticks to (`decide_at`, `decide`)."""
+        return [getattr(self, g) for g in ARENAS]
 
 
-def roster(seed: int, client: SolocClient) -> Roster:
-    """The client is for the kernels only (body ephemerides); the ledger is not read."""
+def roster(seed: int, client: SolocClient, regatta_policy: Callable | None = None,
+           wildfire_policy: Callable | None = None) -> Roster:
+    """The client is for the kernels only (body ephemerides); the ledger is not read. The
+    regatta policy drives the last boat (default: the tactician the others use), the wildfire
+    policy the incident commander."""
     ephemeris = Ephemeris(client)
     facilities = [Facility(spec) for spec in sc.FACILITIES]
     site = {f.name: f for f in facilities}
@@ -78,4 +107,5 @@ def roster(seed: int, client: SolocClient) -> Roster:
         cargo.append(CargoRobot(sc.cargo_name(i), craft, seed))
 
     probes = [Probe(s, ephemeris) for s in sc.PROBES]
-    return Roster(facilities, spacecraft, probes, robots, crawlers, cargo, planes, ships)
+    return Roster(facilities, spacecraft, probes, robots, crawlers, cargo, planes, ships,
+                  Regatta(seed, regatta_policy), Wildfire(seed, wildfire_policy), Factory(), Arm())
