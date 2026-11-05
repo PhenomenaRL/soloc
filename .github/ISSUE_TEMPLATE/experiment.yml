@@ -1,0 +1,35 @@
+name: Experiment
+description: Use soloc to run a scenario end to end, and turn it into an example others can follow
+labels: [experiment]
+body:
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Scenario
+      description: What are you simulating or modelling, and what question should it answer?
+      placeholder: Simulate a boat crossing the Atlantic and log its position over time in the ledger.
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Setup
+      description: Which crates and APIs it uses, plus any data it needs (kernels, frames, epochs, inputs).
+    validations:
+      required: true
+  - type: input
+    id: example
+    attributes:
+      label: Example location
+      description: Where the finished, runnable example will live.
+      placeholder: examples/boating-sim/
+  - type: textarea
+    id: takeaway
+    attributes:
+      label: What a reader should learn
+      description: What someone following the example should come away knowing how to do.
+  - type: textarea
+    id: findings
+    attributes:
+      label: Findings
+      description: Fill in when done. What worked, and any rough edges in soloc it exposed (link follow-up bug or feature issues).

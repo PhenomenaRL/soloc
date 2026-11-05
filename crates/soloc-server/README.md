@@ -1,4 +1,4 @@
-<img src="../../assets/soloc-icon.svg" width="72" align="right" alt="soloc">
+<img src="../../assets/brand/soloc-icon.svg" width="72" align="right" alt="soloc">
 
 # soloc-server
 
