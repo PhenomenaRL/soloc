@@ -96,7 +96,7 @@ pub struct Ledger {
     /// Parent graph derived from appended rows. Topology only, never a pose value.
     transform_tree: TransformTree,
     /// Highest-epoch pose seen for each entity, so the common "where is X now" lookup
-    /// does not have to scan every batch. See [`LatestPose`].
+    /// needs no index search. See [`LatestPose`].
     latest_pose: IdMap<LatestPose>,
     /// Display names for the ids this ledger has been told about.
     names: NameRegistry,
@@ -630,8 +630,8 @@ impl Ledger {
             tail => arrow::compute::concat_batches(&self.schema, tail.iter().map(|s| &s.batch))
                 .map_err(|e| e.to_string()),
         };
-        let Ok(sealed) = merged.and_then(|batch| split_oversized(&batch, target, &self.id_column))
-        else {
+        let sealed = merged.and_then(|batch| split_oversized(&batch, target, &self.id_column));
+        let Ok(sealed) = sealed else {
             return;
         };
         let sealed_bytes: usize = sealed.iter().map(|s| s.bytes).sum();
@@ -2682,12 +2682,12 @@ mod tests {
         assert_eq!(cached.0, before.0);
         assert!((cached.1.translation.vector.x - before.1.translation.vector.x).abs() < 1e-9);
 
-        // Drop the cache and make the scan answer instead: the fast path and the fallback
+        // Drop the cache and make the index answer instead: the fast path and the fallback
         // read the same columns, so they must not be able to disagree.
         reloaded.clear_pose_cache();
-        let scanned = reloaded.resolve_frame_at(demo("robot"), j2000()).unwrap();
-        assert_eq!(scanned.0, cached.0);
-        assert!((scanned.1.translation.vector.x - cached.1.translation.vector.x).abs() < 1e-9);
+        let indexed = reloaded.resolve_frame_at(demo("robot"), j2000()).unwrap();
+        assert_eq!(indexed.0, cached.0);
+        assert!((indexed.1.translation.vector.x - cached.1.translation.vector.x).abs() < 1e-9);
     }
 
     #[test]
@@ -3157,20 +3157,20 @@ mod tests {
     // pose cache tests
     // -----------------------------------------------------------------------
 
-    /// Checks that `resolve_frame_at`'s cache fast path and its scan fallback give the same
+    /// Checks that `resolve_frame_at`'s cache fast path and its indexed fallback give the same
     /// answer, including on the epoch-tie rule, where both must keep the *first* row seen.
-    fn assert_cache_agrees_with_scan(ledger: &Ledger, entity_id: PrescribedId, queries: &[Epoch]) {
+    fn assert_cache_agrees_with_index(ledger: &Ledger, entity_id: PrescribedId, queries: &[Epoch]) {
         let bytes = ledger.save_ipc_to_bytes().unwrap();
-        let mut scanned = Ledger::load_ipc_from_bytes(&bytes, "entity_id").unwrap();
-        scanned.clear_pose_cache();
+        let mut indexed = Ledger::load_ipc_from_bytes(&bytes, "entity_id").unwrap();
+        indexed.clear_pose_cache();
 
         for &epoch in queries {
             let cached = ledger.resolve_frame_at(entity_id, epoch);
-            let scanned = scanned.resolve_frame_at(entity_id, epoch);
+            let indexed = indexed.resolve_frame_at(entity_id, epoch);
             assert_eq!(
                 cached.as_ref().map(|(f, i)| (f, i.translation.vector)),
-                scanned.as_ref().map(|(f, i)| (f, i.translation.vector)),
-                "cache and scan disagree for {entity_id} at {epoch}"
+                indexed.as_ref().map(|(f, i)| (f, i.translation.vector)),
+                "cache and index disagree for {entity_id} at {epoch}"
             );
         }
     }
@@ -3200,7 +3200,7 @@ mod tests {
         let (_, iso) = ledger.resolve_frame_at(demo("A"), far_future).unwrap();
         assert_eq!(iso.translation.vector.x, 3.0);
 
-        assert_cache_agrees_with_scan(&ledger, demo("A"), &[at_latest, far_future]);
+        assert_cache_agrees_with_index(&ledger, demo("A"), &[at_latest, far_future]);
     }
 
     #[test]
@@ -3219,7 +3219,7 @@ mod tests {
         }
 
         // Between rows: the cached epoch (2000) is after the query, so this must fall back
-        // to the scan and find the row at 1000 rather than returning the cached pose.
+        // to the index and find the row at 1000 rather than returning the cached pose.
         let midpoint = j2000() + Duration::from_parts(0, 1_500);
         let (_, iso) = ledger.resolve_frame_at(demo("A"), midpoint).unwrap();
         assert_eq!(iso.translation.vector.x, 2.0);
@@ -3231,7 +3231,7 @@ mod tests {
                 .is_none()
         );
 
-        assert_cache_agrees_with_scan(
+        assert_cache_agrees_with_index(
             &ledger,
             demo("A"),
             &[j2000(), midpoint, j2000() + Duration::from_parts(0, 1_000)],
@@ -3268,11 +3268,11 @@ mod tests {
             "backfilled older row must not overwrite the cached newer pose"
         );
 
-        // The backfilled row is still findable at its own epoch, via the scan path.
+        // The backfilled row is still findable at its own epoch, via the indexed path.
         let (_, iso) = ledger.resolve_frame_at(demo("A"), j2000()).unwrap();
         assert_eq!(iso.translation.vector.x, 1.0);
 
-        assert_cache_agrees_with_scan(&ledger, demo("A"), &[j2000(), latest]);
+        assert_cache_agrees_with_index(&ledger, demo("A"), &[j2000(), latest]);
     }
 
     /// Two rows at the same epoch: the first one appended wins, in both code paths.
@@ -3294,11 +3294,11 @@ mod tests {
         let (_, iso) = ledger.resolve_frame_at(demo("A"), j2000()).unwrap();
         assert_eq!(iso.translation.vector.x, 1.0);
 
-        assert_cache_agrees_with_scan(&ledger, demo("A"), &[j2000()]);
+        assert_cache_agrees_with_index(&ledger, demo("A"), &[j2000()]);
     }
 
     /// Poses are cached in km regardless of the units the row was written in, matching
-    /// what the scan path returns.
+    /// what the indexed path returns.
     #[test]
     fn test_pose_cache_normalises_units_to_km() {
         use crate::schemas::entity::EntityBuilder;
@@ -3327,7 +3327,7 @@ mod tests {
         let (_, iso) = ledger.resolve_frame_at(demo("A"), j2000()).unwrap();
         assert_eq!(iso.translation.vector.x, 2.0);
 
-        assert_cache_agrees_with_scan(&ledger, demo("A"), &[j2000()]);
+        assert_cache_agrees_with_index(&ledger, demo("A"), &[j2000()]);
     }
 
     /// Independent entities each keep their own cache entry.
@@ -3376,8 +3376,8 @@ mod tests {
         );
         assert!(ledger.resolve_frame_at(demo("missing"), at_b).is_none());
 
-        assert_cache_agrees_with_scan(&ledger, demo("A"), &[j2000(), at_b]);
-        assert_cache_agrees_with_scan(&ledger, demo("B"), &[j2000(), at_b]);
+        assert_cache_agrees_with_index(&ledger, demo("A"), &[j2000(), at_b]);
+        assert_cache_agrees_with_index(&ledger, demo("B"), &[j2000(), at_b]);
     }
 
     // -----------------------------------------------------------------------

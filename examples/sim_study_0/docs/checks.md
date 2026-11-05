@@ -66,9 +66,9 @@ was recorded under a small `memory_limit` or the server's limit evicted part of 
 Rotating factory parts have rows at sub-second epochs in the burst, and arm links and held boxes
 at 125 Hz, so their schedules are checked to the nanosecond against `epochs_ns`.
 
-Resolving rows through the ledger at historical epochs scans for the parent's pose once per
-`(frame, epoch)`. The resolution checks therefore run on a few epochs, and the per-row checks
-run on the stored values.
+Resolving rows through the ledger at historical epochs costs a few ms per row (an indexed lookup
+per hop, per `(frame, epoch)`). The resolution checks therefore run on a few epochs, and the
+per-row checks run on the stored values.
 
 ## tests/smoke_test.py
 
