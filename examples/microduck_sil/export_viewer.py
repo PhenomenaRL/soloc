@@ -13,7 +13,7 @@ buildings round the site (`buildings.py`) stand on the map as faint volumes.
 
     ../sim_study_0/.venv/bin/python export_viewer.py           # out/microduck_aligned.arrow if present, else out/microduck.arrow
 
-The Sun and Earth come from a running server (`serve.sh`), as in sim_study_0's viewer.
+The Sun, planets, Moon and their orbits come from a running server (`serve.sh`), as in sim_study_0's viewer.
 """
 
 import argparse
@@ -42,8 +42,9 @@ from sim import scenario as sc0
 from sim.ephemeris import Ephemeris
 from sim.geo import EARTH, quat_from_matrix
 from sim.models.facility import Facility
-from soloc_client import SolocClient, positions, tai_ns_from_utc
-from tools.export_viewer import THREE_JS, Pose, Rows, b64, coastlines, ephemeris, quat_matrix, track
+from soloc_client import SolocClient, astronomical, id_bytes, positions, tai_ns_from_utc
+from tools.export_viewer import (BODIES, FLATTENING, THREE_JS, Pose, Rows, b64, coastlines, ephemeris,
+                                 quat_matrix, track)
 from tools.view_sim import load
 
 TEMPLATE = sc.HERE / "viewer_template.html"
@@ -54,7 +55,7 @@ RAY_S = 1.0                         # how long a sighting's ray stays drawn
 RAY_Z_M = 0.1
 GAIT_HZ = 25                        # link poses kept from the 50 Hz sidecar; the page interpolates
 VISUAL_GROUP = 2                    # the model's visual meshes (group 3 is the collision copy)
-MESH_CELL_M = 0.004                 # vertex-clustering cell for the embedded meshes
+CREASE_DEG = 35.0                   # face normals further apart than this stay a hard edge
 
 # The site's ground: OSM raster tiles, fetched once into data/osm_tiles/ (OSM's tile policy: light
 # use, a real User-Agent, cached, attributed) and embedded as one mosaic.
@@ -132,7 +133,7 @@ def framed_m(rows: Rows, entity_id: bytes, frame_id: bytes):
 
 
 def duck_model(model: mujoco.MjModel) -> list[list[dict]]:
-    """Per body (1…), its visual meshes in the body's frame, one per colour, decimated."""
+    """Per body (1…), its visual meshes in the body's frame, one per colour, at full detail."""
     parts: dict[tuple[int, tuple], list] = {}
     for g in range(model.ngeom):
         if model.geom_group[g] != VISUAL_GROUP or model.geom_type[g] != mujoco.mjtGeom.mjGEOM_MESH:
@@ -152,28 +153,37 @@ def duck_model(model: mujoco.MjModel) -> list[list[dict]]:
         offsets = np.cumsum([0] + [len(v) for v, _ in pieces])
         v = np.vstack([v for v, _ in pieces])
         f = np.vstack([f + o for (_, f), o in zip(pieces, offsets)])
-        v, f = cluster_mesh(v, f, MESH_CELL_M)
+        v, n, f = crease_normals(v, f, CREASE_DEG)
         faces += len(f)
         bodies[body - 1].append({"color": "#%02x%02x%02x" % tuple(int(255 * c) for c in rgb),
-                                 "v": b64(v.ravel()), "i": b64(f.ravel(), np.uint32)})
-    print(f"  duck model: {model.nbody - 1} links, {faces} faces after clustering")
+                                 "v": b64(v.ravel()), "n": b64(n.ravel()),
+                                 "i": b64(f.ravel(), np.uint32)})
+    print(f"  duck model: {model.nbody - 1} links, {faces} faces")
     return bodies
 
 
-def cluster_mesh(v: np.ndarray, f: np.ndarray, cell: float) -> tuple[np.ndarray, np.ndarray]:
-    """Vertex clustering: vertices in one `cell`-sized voxel merge into their mean; faces that
-    collapse or repeat go; vertices no face uses go."""
-    keys, inv = np.unique(np.floor(v / cell).astype(np.int64), axis=0, return_inverse=True)
-    inv = inv.ravel()
-    merged = np.zeros((len(keys), 3))
-    np.add.at(merged, inv, v)
-    merged /= np.bincount(inv, minlength=len(keys))[:, None]
-    f = inv[f]
-    f = f[(f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])]
-    _, first = np.unique(np.sort(f, axis=1), axis=0, return_index=True)
-    f = f[np.sort(first)]
-    used, f = np.unique(f, return_inverse=True)
-    return merged[used], f.reshape(-1, 3)
+def crease_normals(v: np.ndarray, f: np.ndarray, crease_deg: float):
+    """Smooth vertex normals that keep hard edges: each face corner averages (area-weighted) the
+    normals of the faces at its vertex within `crease_deg` of its own face; a vertex whose corners
+    disagree is split. Returns (vertices, normals, faces)."""
+    fn = np.cross(v[f[:, 1]] - v[f[:, 0]], v[f[:, 2]] - v[f[:, 0]])
+    unit = fn / np.maximum(np.linalg.norm(fn, axis=1), 1e-30)[:, None]
+    vid, fid = f.ravel(), np.repeat(np.arange(len(f)), 3)
+    order = np.argsort(vid, kind="stable")
+    count = np.bincount(vid, minlength=len(v))
+    size = count[vid[order]]                                        # group size per sorted corner
+    start = np.repeat(np.cumsum(count) - count, count)              # group start per sorted corner
+    # every (corner, corner of the same vertex) pair, in sorted order
+    a = np.repeat(np.arange(len(order)), size)
+    b = start[a] + (np.arange(len(a)) - np.repeat(np.cumsum(size) - size, size))
+    ca, cb = order[a], order[b]
+    keep = np.einsum("ij,ij->i", unit[fid[ca]], unit[fid[cb]]) >= math.cos(math.radians(crease_deg))
+    n = np.zeros((len(vid), 3))
+    np.add.at(n, ca[keep], fn[fid[cb[keep]]])
+    n /= np.maximum(np.linalg.norm(n, axis=1), 1e-30)[:, None]
+    key = np.column_stack([vid, np.round(n * 1000).astype(np.int64)])
+    _, first, inv = np.unique(key, axis=0, return_index=True, return_inverse=True)
+    return v[vid[first]], n[first], inv.ravel().reshape(-1, 3)
 
 
 def gait(model: mujoco.MjModel, joints_path: Path) -> list[dict]:
@@ -233,11 +243,12 @@ def estimate_tracks(rows: Rows, site_id: bytes) -> list[dict]:
     return out
 
 
-def sighting_rays(rows: Rows, site_id: bytes) -> dict | None:
+def sighting_rays(rows: Rows, site_id: bytes) -> list[dict]:
     """Each sighting as a segment from the observer (truth) to where it saw the target, taken into
-    the site through the observer's boot frame. Sorted by time, for the page to draw a window."""
+    the site through the observer's boot frame. Per observer, sorted by time, for the page to draw
+    a window."""
     odom_of = {sc.entity(sc.odom_name(d)): d for d in sc.DUCKS}
-    segs = []
+    segs = {d: [] for d in sc.DUCKS}
     for target in sc.DUCKS:
         k = rows.of(sc.entity(target))
         k = k[np.array([f in odom_of and odom_of[f] != target for f in rows.frames[k]], bool)]
@@ -247,12 +258,14 @@ def sighting_rays(rows: Rows, site_id: bytes) -> dict | None:
             end = bp[0] + quat_matrix(bq[0]) @ (rows.pos[kk] * rows.km[kk] * 1000)
             ot, opos, _ = framed_m(rows, sc.entity(observer), site_id)
             start = [np.interp(t, ot, opos[:, 0]), np.interp(t, ot, opos[:, 1])]
-            segs.append((t, *start, end[0], end[1]))
-    if not segs:
-        return None
-    segs.sort()
-    s = np.array(segs)
-    return {"t": s[:, 0].tolist(), "p": b64(s[:, 1:].ravel()), "z": RAY_Z_M, "life": RAY_S}
+            segs[observer].append((t, *start, end[0], end[1]))
+    out = []
+    for observer, ss in segs.items():
+        if ss:
+            s = np.array(sorted(ss))
+            out.append({"observer": observer, "t": s[:, 0].tolist(), "p": b64(s[:, 1:].ravel()),
+                        "z": RAY_Z_M, "life": RAY_S})
+    return out
 
 
 def main():
@@ -331,7 +344,8 @@ def main():
                "p": (pose.p_km + pose.r @ apt_t / 1000).tolist(), "q": quat_from_matrix(pose.r @ apt_r),
                "extent": [float(xy[:, 0].min() - PAD_M), float(xy[:, 0].max() + PAD_M),
                           float(xy[:, 1].min() - PAD_M), float(xy[:, 1].max() + PAD_M)],
-               "noFloor": True, "room": ap.viewer_geoms(), "tracks": tracks}
+               "noFloor": True, "room": ap.viewer_geoms(), "tracks": tracks,
+               "fov": {"deg": sc.FOV_DEG, "range": sc.SIGHT_RANGE_M, "z": sc.SIGHT_Z_M}}
     if rays:
         apt_ctx["rays"] = rays
     if real:
@@ -345,15 +359,22 @@ def main():
     eph = Ephemeris(client)
     eph.t0_ns = tai_ns_from_utc(sc.T0)
     grid = np.arange(0, duration + EPHEMERIS_STEP_S, EPHEMERIS_STEP_S, dtype=float)
+    # sim_study_0's bodies and their orbits, so the page zooms in from the inner solar system
     bodies = []
-    for body_name, naif, radius, colour in (("Sun", 10, 695700.0, "#ffcc66"), ("Earth", 399, EARTH.a_km, "#2c5a8f")):
+    for body_name, naif, radius, colour, _ in BODIES:
         pos, q = ephemeris(eph, naif, grid)
         bodies.append({"name": body_name, "radius": radius, "color": colour,
-                       "flattening": EARTH.f if body_name == "Earth" else 0.0,
+                       "flattening": FLATTENING.get(body_name, 0.0),
                        "p": b64(pos.ravel(), np.float64), "q": b64(q.ravel())})
+    by_id = {astronomical(naif, naif): body_name for body_name, naif, *_ in BODIES}
+    table = client.orbits([astronomical(naif, naif) for _, naif, *_, orbit in BODIES if orbit],
+                          tai_ns_from_utc(sc.T0) + int(duration / 2) * 10**9)
+    orbits = [{"name": by_id[b], "centre": by_id[c], "p": b64(np.array(path).ravel())}
+              for b, c, path in zip(id_bytes(table.column("body_id")), id_bytes(table.column("centre_id")),
+                                    table.column("path_km").to_pylist())]
 
     data = {"t0": sc.T0.isoformat() + "Z", "duration": duration, "source": args.path.name,
-            "ephemerisStep": EPHEMERIS_STEP_S, "bodies": bodies, "orbits": [], "arcs": [],
+            "ephemerisStep": EPHEMERIS_STEP_S, "bodies": bodies, "orbits": orbits, "arcs": [],
             "coast": coastlines(), "contexts": [site_ctx, apt_ctx], "events": sorted(events, key=lambda e: e["t"]),
             "attribution": OSM_ATTRIBUTION if ground else ""}
     html = (TEMPLATE.read_text()

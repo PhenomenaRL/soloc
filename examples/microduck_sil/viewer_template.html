@@ -48,6 +48,8 @@
   #where { color: var(--text-2); font-size: 12px; margin-top: 8px; }
   #bottom { left: 12px; right: 12px; bottom: 12px; padding: 10px 12px; display: grid;
     grid-template-columns: auto auto 1fr auto; align-items: center; gap: 12px; }
+  #bottom.bare { grid-template-columns: 1fr auto; }
+  #bottom.bare #play, #bottom.bare #speed { display: none; }
   #clock { font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap; }
   #track { position: relative; height: 30px; }
   #slider { position: absolute; left: 0; right: 0; top: 0; width: 100%; margin: 0; accent-color: var(--accent); }
@@ -96,8 +98,10 @@
     <div class="row" id="osmrow">OSM map at sites <input type="checkbox" id="osm" checked></div>
     <div class="row" id="bldgrow">OSM buildings <input type="checkbox" id="bldg" checked></div>
     <div class="row">Sighting rays <input type="checkbox" id="rays" checked></div>
+    <div class="row">Only the followed duck's rays <input type="checkbox" id="raysOwn"></div>
+    <div class="row" id="fovrow">Detector view (followed duck) <input type="checkbox" id="fov" checked></div>
     <div id="where"></div>
-    <div class="note">Drag to rotate, right-drag or shift-drag to pan, wheel to zoom. Vehicles appear as you close in on their body; robots on their site. Craft between bodies (GCRF, ICRF) show from any distance.</div>
+    <div class="note">Drag to rotate, right-drag or shift-drag to pan, wheel to zoom, C to copy the view. Vehicles appear as you close in on their body; robots on their site. Craft between bodies (GCRF, ICRF) show from any distance.</div>
   </section>
 </div>
 <div id="bottom" class="panel">
@@ -359,15 +363,26 @@ function buildVenueLayout(ctx) {
       const mesh = new THREE.Mesh(new THREE.BoxGeometry(...m.s), new THREE.MeshLambertMaterial({ color: m.belt ? "#55555e" : "#6b6a63" }));
       mesh.position.set(...m.c); grp.add(mesh);
     }
-    if (s.rays) {
-      // Sightings, sorted by time: each drawn for `life` seconds after it is made.
-      const p = f32(s.rays.p), n = p.length / 4, pos = new Float32Array(n * 6), z = s.rays.z;
+    if (s.rays) ctx.rays = s.rays.map(r => {
+      // One observer's sightings, sorted by time: each drawn for `life` seconds after it is made.
+      const p = f32(r.p), n = p.length / 4, pos = new Float32Array(n * 6), z = r.z;
       for (let i = 0; i < n; i++) pos.set([p[4 * i], p[4 * i + 1], z, p[4 * i + 2], p[4 * i + 3], z], 6 * i);
       const g = new THREE.BufferGeometry();
       g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-      ctx.rays = { t: s.rays.t, life: s.rays.life, lines: new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0xe9e8e2, transparent: true, opacity: 0.8 })) };
-      ctx.rays.lines.frustumCulled = false; ctx.rays.lines.renderOrder = 21;
-      grp.add(ctx.rays.lines);
+      const lines = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0xe9e8e2, transparent: true, opacity: 0.8 }));
+      lines.frustumCulled = false; lines.renderOrder = 21; grp.add(lines);
+      return { observer: r.observer, t: r.t, life: r.life, lines };
+    });
+    if (s.fov) {
+      // The followed duck's detector reach (align.py's rule): a flat sector at camera height.
+      const a = s.fov.deg * Math.PI / 180, g = new THREE.CircleGeometry(s.fov.range, 48, -a / 2, a);
+      const wedge = new THREE.Group();
+      wedge.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xe9e8e2, transparent: true, opacity: 0.28, side: THREE.DoubleSide, depthWrite: false })));
+      wedge.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(
+        [V(), ...Array.from({ length: 49 }, (_, i) => { const t = -a / 2 + a * i / 48; return new THREE.Vector3(s.fov.range * Math.cos(t), s.fov.range * Math.sin(t), 0); })]),
+        new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 })));
+      wedge.traverse(o => { o.renderOrder = 22; });
+      ctx.fov = { wedge, z: s.fov.z }; grp.add(wedge);
     }
     if (s.buildings) {
       // OSM footprints extruded to their heights, faint enough to see the ducks through.
@@ -478,8 +493,8 @@ function buildArticulated(ctx) {
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.BufferAttribute(f32(m.v), 3));
     g.setIndex(new THREE.BufferAttribute(new Uint32Array(bytes(m.i).buffer), 1));
-    g.computeVertexNormals();
-    return { g, mat: new THREE.MeshPhongMaterial({ color: m.color, flatShading: true, shininess: 10 }) };
+    g.setAttribute("normal", new THREE.BufferAttribute(f32(m.n), 3));
+    return { g, mat: new THREE.MeshPhongMaterial({ color: m.color, shininess: 10 }) };
   }));
   ctx.walkers = a.ducks.map(d => {
     const root = new THREE.Group();
@@ -595,7 +610,7 @@ function pickEntity(name, prev) { return byName[name].find(e => e.active) || pre
 
 // ---- state, focus, camera -------------------------------------------------------------------
 const state = { T: 0, playing: false, speed: 5, trail: "30", trailFrame: "fixed", size: 0.03,
-                labels: true, orbits: true, osm: true, rays: true, corotate: true, cam: "site", hidden: new Set(), focus: { kind: "system" } };
+                labels: true, orbits: true, osm: true, rays: true, fov: true, corotate: true, cam: "site", hidden: new Set(), focus: { kind: "system" } };
 const ctl = { az: -1.2, el: 0.5, dist: 6e8 };
 let fly = null;
 const target = V(), basis = Qt();
@@ -659,7 +674,7 @@ function focusDist(f) {
 function minDist() {
   const f = state.focus;
   if (f.kind === "body") return f.body.radius * 1.02;
-  if (f.kind === "site") return 0.01;
+  if (f.kind === "site") return f.ctx.def.near || 0.01;
   if (f.kind === "entity") return f.entity.ctx.kind === "site" ? (f.entity.ctx.def.near || 0.003) : 0.05;
   return 1e5;
 }
@@ -802,9 +817,18 @@ function update() {
     if (ctx.wind) updateWind(ctx, T);
     if (ctx.perimeter || ctx.trenches) updateFire(ctx, T, near);
     if (ctx.rays) {
-      const a = upper(ctx.rays.t, T - ctx.rays.life), b = upper(ctx.rays.t, T);
-      ctx.rays.lines.geometry.setDrawRange(2 * a, 2 * (b - a));
-      ctx.rays.lines.visible = near && state.rays;
+      const f = state.focus, followed = f.kind === "entity" ? f.name : null;
+      for (const r of ctx.rays) {
+        const a = upper(r.t, T - r.life), b = upper(r.t, T);
+        r.lines.geometry.setDrawRange(2 * a, 2 * (b - a));
+        r.lines.visible = near && state.rays && (!state.raysOwn || r.observer === followed);
+      }
+    }
+    if (ctx.fov) {
+      const f = state.focus, e = f.kind === "entity" ? f.entity : null;
+      const on = near && state.fov && e && e.ctx === ctx && e.cat === "duck" && e.active;
+      ctx.fov.wedge.visible = !!on;
+      if (on) { ctx.fov.wedge.position.set(e.local.x, e.local.y, ctx.fov.z); ctx.fov.wedge.rotation.set(0, 0, yawOf(e.model.quaternion)); }
     }
     if (ctx.walkers) updateWalkers(ctx, T, near);
   }
@@ -948,6 +972,9 @@ $("size").onchange = e => { state.size = Number(e.target.value); };
 $("labels").onchange = e => { state.labels = e.target.checked; };
 $("orbits").onchange = e => { state.orbits = e.target.checked; };
 $("rays").onchange = e => { state.rays = e.target.checked; };
+$("fov").onchange = e => { state.fov = e.target.checked; };
+$("raysOwn").onchange = e => { state.raysOwn = e.target.checked; };
+if (!contexts.some(c => c.fov)) $("fovrow").style.display = "none";
 $("osm").onchange = e => { state.osm = e.target.checked; mapMeshes.forEach(m => { m.visible = state.osm; }); };
 $("bldg").onchange = e => { buildingMeshes.forEach(m => { m.visible = e.target.checked; }); };
 if (!buildingMeshes.length) $("bldgrow").style.display = "none";
@@ -968,8 +995,20 @@ function resize() {
 window.addEventListener("resize", resize);
 resize();
 
-let last = performance.now(), frameDt = 0;
+let last = performance.now(), frameDt = 0, stepping = false;
+// render_media.py drives the page frame by frame: sim time T, camera easing advanced by dt, and
+// optionally the orbit camera {az, el, dist} and view toggles (keyframed views).
+window.stepTo = (T, dt, cam, toggles) => {
+  stepping = true; state.playing = false; state.T = T; frameDt = dt;
+  if (cam) { fly = null; ctl.az = cam.az; ctl.el = cam.el; ctl.dist = cam.dist; }
+  for (const [id, v] of Object.entries(toggles || {})) {
+    const el = $(id), prop = el.type === "checkbox" ? "checked" : "value";
+    if (el[prop] !== v) { el[prop] = v; el.dispatchEvent(new Event("change")); }
+  }
+  update(); renderer.render(scene, camera);
+};
 function loop(now) {
+  if (stepping) return;
   const dt = Math.min(0.1, (now - last) / 1000); last = now;
   frameDt = dt * (state.playing ? state.speed : 1);   // easing runs on the duck's clock while playing
   if (state.playing) {
@@ -980,9 +1019,42 @@ function loop(now) {
   renderer.render(scene, camera);
   requestAnimationFrame(loop);
 }
+// ---- views: C copies the current one; #view=<json> in the URL restores it ----------------------
+const VIEW_TOGGLES = ["trail", "labels", "rays", "raysOwn", "bldg", "fov"];
+function currentView() {
+  const f = state.focus;
+  const v = { T: +state.T.toFixed(2), focus: f.kind === "entity" ? "e:" + f.name : focusKey(f), cam: state.cam,
+              az: +ctl.az.toFixed(4), el: +ctl.el.toFixed(4), dist: +ctl.dist.toPrecision(4), hidden: [...state.hidden] };
+  for (const id of VIEW_TOGGLES) v[id] = $(id).type === "checkbox" ? $(id).checked : $(id).value;
+  return v;
+}
+function applyView(v) {
+  for (const id of VIEW_TOGGLES) if (v[id] !== undefined) {
+    if ($(id).type === "checkbox") $(id).checked = v[id]; else $(id).value = v[id];
+    $(id).dispatchEvent(new Event("change"));
+  }
+  state.hidden = new Set(v.hidden || []); buildLegend();
+  for (const id of ["top", "side"]) $(id).style.display = v.ui === false ? "none" : "";   // doc renders keep the timeline,
+  $("bottom").classList.toggle("bare", v.ui === false);                                   // without play and speed
+  state.T = v.T; state.cam = v.cam || "site"; $("camMode").value = state.cam;
+  const k = v.focus || "system";
+  const f = k === "system" ? { kind: "system" }
+    : k.startsWith("b:") ? { kind: "body", body: bodyByName[k.slice(2)] }
+    : k.startsWith("s:") ? { kind: "site", ctx: contexts.find(c => String(c.id) === k.slice(2)) }
+    : { kind: "entity", name: k.slice(2), entity: pickEntity(k.slice(2)) };
+  setFocus(f); if (f.kind === "entity") $("follow").value = f.name;
+  fly = null; ctl.az = v.az; ctl.el = v.el; ctl.dist = v.dist;
+}
+window.addEventListener("keydown", e => {
+  if (e.key !== "c" && e.key !== "C" || e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  const text = "view: " + JSON.stringify(currentView());
+  navigator.clipboard.writeText(text).catch(() => prompt("Copy this view:", text));
+});
+
 update();
 const firstSite = contexts.find(c => c.kind === "site");
 setFocus(firstSite ? { kind: "site", ctx: firstSite } : { kind: "system" }); fly = null; ctl.dist = focusDist(state.focus);
+if (location.hash.startsWith("#view=")) applyView(JSON.parse(decodeURIComponent(location.hash.slice(6))));
 requestAnimationFrame(loop);
 </script>
 </body>

@@ -57,6 +57,7 @@ FIT_SIGMA_M, FIT_SIGMA_RAD = 0.10, math.radians(5.0)    # a pair fit's own 1σ, 
 AMBIGUOUS_M, AMBIGUOUS_RAD, AMBIGUOUS_CHI2 = 0.3, math.radians(10.0), 9.0   # a rival minimum this far off and this close in χ²
 GROWTH_MAX_S = 180.0                  # error-growth fit over gaps up to this
 RESIGHT_CAP_S = 600.0                 # plotted ceiling for "re-sight within" (no growth = never stale)
+PLOT_DPI = 260                        # 2× for docs/img
 SIGHTINGS_SCHEMA = pa.schema([("t_tai_ns", pa.int64()), ("observer", pa.string()), ("target", pa.string()),
                               ("range_m", pa.float64()), ("bearing_rad", pa.float64())])
 
@@ -464,7 +465,7 @@ def plots(results: dict, specs: dict):
         ax2.legend(fontsize=7)
         fig.tight_layout()
         path = sc.OUT / f"sweep_{axis}.png"
-        fig.savefig(path, dpi=130)
+        fig.savefig(path, dpi=PLOT_DPI)
         plt.close(fig)
         out.append(path)
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -486,7 +487,7 @@ def plots(results: dict, specs: dict):
     ax.legend(fontsize=8)
     fig.tight_layout()
     path = sc.OUT / "sweep_staleness.png"
-    fig.savefig(path, dpi=130)
+    fig.savefig(path, dpi=PLOT_DPI)
     plt.close(fig)
     return out + [path]
 

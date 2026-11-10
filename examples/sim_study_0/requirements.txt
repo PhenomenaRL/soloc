@@ -2,3 +2,4 @@ numpy==2.5.3
 pyarrow==25.0.1
 matplotlib==3.11.2
 mujoco==3.10.0
+websockets==15.0.1

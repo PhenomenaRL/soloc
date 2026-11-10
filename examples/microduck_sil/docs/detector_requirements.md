@@ -4,20 +4,22 @@ Microduck's social behaviours (greeting, follow-the-leader) need to answer "wher
 duck's odometry starts wherever it booted, with no magnetometer to tie headings together, so
 something has to sense the other ducks. We ran Pollen's own digital twin alongside Soloc to perform an initial detector requirements study.
 
-![four ducks on a trash-spotting mission in the apartment](img/mission.gif)
+![duck-c keeps duck-d in view: each ray is one sighting](img/spotting.webp)
+
+*duck-c (front) sees duck-d whenever duck-d is inside its camera's 45° view, within 4 m, with nothing
+in between (the wedge). Each ray is one sighting: a range and bearing that put duck-d in duck-c's
+own odometry frame.*
 
 ## Setup
 
 - `duck-sim` with four ducks in the `apartment` scene, real `robotd`, velstand walking. Each duck is given a mission to patrol a room
-  and point out virtual trash.
+  and point out virtual trash ([appendix](#appendix-the-trash-spotting-mission)).
 - Recorded: MuJoCo truth, each duck's raw odometry in its own boot frame, joint angles at 50 Hz.
 - Afterwards, the recording is replayed through the scene to find, at each moment, which pairs had
   a clear line of sight and whether one duck's VL53L5CX zones (`tof.py` model) landed on the
   other duck.
 - Four detector designs with parameters: range, field of view, rate, noise & heading drift. 44 designs × 10 noise seeds × 2 runs in total were simulated. Each duck's frame is fitted into a lookout's
   from sightings, and "b in a's frame" is scored against truth every second.
-
-![duck-c points out trash; ghosts are where its odometry and the lookout's estimate put it](img/duck_points_out.png)
 
 ## Findings
 
@@ -58,4 +60,24 @@ and soloc resolves duck → apartment → site → Earth.
 One recording fed all 44 designs after the fact: each design is its own set of frames in its own
 ledger, and all of them merge into one for viewing and analysis.
 
-![the apartment, placed in a real Old Montreal building](img/old_montreal.png)
+![from the inner solar system down to the apartment, placed in a real Old Montreal building](img/zoom.webp)
+
+## Appendix: the trash-spotting mission
+
+The mission gives the ducks a reason to walk around and meet. Eight pieces of virtual trash sit in
+the rooms (they aren't in MuJoCo). Each duck patrols its own rooms: duck-a the kitchen and living
+room, duck-b the bedroom and office, duck-c the bathroom, and duck-d the corridor, where it is also
+the lookout the others are aligned to. A grid planner routes them round furniture and through
+doorways, and the twin's own ToF stops them short of bumps.
+
+When trash comes within 3 m and 45° of a duck's head camera, with a clear line of sight, the duck
+turns to it, walks up to it by its own odometry and points it out for 3 s. Its report is the
+trash's position in its own boot frame, and soloc resolves it to the apartment through
+duck → apartment → site → Earth. All 8 pieces were reported within 100 s, 2.4–12.2 cm from where
+they are (median 6 cm): odometry drift plus detector noise.
+
+![duck-c spots trash-7, walks over and points it out](img/mission_find.webp)
+
+*duck-c spots trash-7 (green), walks over and points it out; the pillar is its report, resolved by soloc.*
+
+![duck-c beside trash-7 and its report](img/duck_points_out.png)
