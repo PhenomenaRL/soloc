@@ -1,0 +1,28 @@
+name: Spike
+description: Time-boxed investigation to answer a question or unblock a decision
+labels: [spike]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What do we need to find out? Phrase it so the answer can be written down.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it matters
+      description: What decision or work is blocked on this?
+  - type: input
+    id: timebox
+    attributes:
+      label: Time-box
+      placeholder: e.g. 2 days
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Output
+      description: What "done" looks like, e.g. a write-up on this issue, a recommendation, a throwaway prototype branch.

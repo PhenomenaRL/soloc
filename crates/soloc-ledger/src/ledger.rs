@@ -96,7 +96,7 @@ pub struct Ledger {
     /// Parent graph derived from appended rows. Topology only, never a pose value.
     transform_tree: TransformTree,
     /// Highest-epoch pose seen for each entity, so the common "where is X now" lookup
-    /// does not have to scan every batch. See [`LatestPose`].
+    /// needs no index search. See [`LatestPose`].
     latest_pose: IdMap<LatestPose>,
     /// Display names for the ids this ledger has been told about.
     names: NameRegistry,
@@ -111,14 +111,16 @@ struct Segment {
     min_epoch: Duration,
     /// Latest row epoch, as an offset from J2000 TAI.
     max_epoch: Duration,
-    /// [`allocated_bytes`] of `batch`.
+    /// Each entity's row numbers, sorted by (epoch, row). See [`build_index`].
+    index: IdMap<Vec<u32>>,
+    /// [`allocated_bytes`] of `batch`, plus the index's [`index_bytes`].
     bytes: usize,
 }
 
 impl Segment {
-    /// Measures `batch`. Epochs honour each row's `timescale_id`, so the range is right even
-    /// for a loaded batch that was never normalised to TAI.
-    fn new(batch: RecordBatch) -> Result<Self, String> {
+    /// Measures and indexes `batch`. Epochs honour each row's `timescale_id`, so the range is
+    /// right even for a loaded batch that was never normalised to TAI.
+    fn new(batch: RecordBatch, id_column: &str) -> Result<Self, String> {
         let (mut min_epoch, mut max_epoch) = (Duration::MAX, Duration::MIN);
         let sts = StsColumns::try_new(&batch)?;
         for row in 0..batch.num_rows() {
@@ -130,11 +132,13 @@ impl Segment {
             min_epoch = min_epoch.min(epoch);
             max_epoch = max_epoch.max(epoch);
         }
-        let bytes = allocated_bytes(&batch);
+        let index = build_index(&batch, id_column);
+        let bytes = allocated_bytes(&batch) + index_bytes(&index);
         Ok(Self {
             batch,
             min_epoch,
             max_epoch,
+            index,
             bytes,
         })
     }
@@ -143,6 +147,36 @@ impl Segment {
     fn overlaps(&self, start: Duration, end: Duration) -> bool {
         self.min_epoch <= end && self.max_epoch >= start
     }
+}
+
+/// Each entity's row numbers in `batch`, sorted by (epoch, row). Rows whose id does not decode
+/// are left out, and a batch without a readable id column gets an empty index.
+fn build_index(batch: &RecordBatch, id_column: &str) -> IdMap<Vec<u32>> {
+    let mut index: IdMap<Vec<u32>> = IdMap::default();
+    let Some(cols) = PoseColumns::try_new(batch, id_column) else {
+        return index;
+    };
+    for row in 0..batch.num_rows() {
+        if let Some(id) = cols.id_at(row) {
+            index.entry(id).or_default().push(row as u32);
+        }
+    }
+    for rows in index.values_mut() {
+        // Stable, so equal epochs stay in row order.
+        rows.sort_by_key(|&r| cols.epoch_at(r as usize));
+    }
+    index
+}
+
+/// Estimated heap bytes of an index: each map slot (id, `Vec` header, control byte) plus the
+/// row numbers.
+fn index_bytes(index: &IdMap<Vec<u32>>) -> usize {
+    let slot = size_of::<PrescribedId>() + size_of::<Vec<u32>>() + 1;
+    let rows: usize = index
+        .values()
+        .map(|r| r.capacity() * size_of::<u32>())
+        .sum();
+    index.capacity() * slot + rows
 }
 
 /// Every allocation `batch`'s buffers live in: its start address → its capacity in bytes.
@@ -183,10 +217,14 @@ fn within_target(bytes: usize, target: usize) -> bool {
 /// Each chunk is copied into its own buffers, so evicting one frees its memory. A zero-copy
 /// slice would keep the whole original allocation alive, and so would a single-input
 /// `concat`, which arrow returns as a slice.
-fn split_oversized(batch: &RecordBatch, max_bytes: usize) -> Result<Vec<Segment>, String> {
+fn split_oversized(
+    batch: &RecordBatch,
+    max_bytes: usize,
+    id_column: &str,
+) -> Result<Vec<Segment>, String> {
     let (bytes, rows) = (allocated_bytes(batch), batch.num_rows());
     if within_target(bytes, max_bytes) || rows < 2 {
-        return Ok(vec![Segment::new(batch.clone())?]);
+        return Ok(vec![Segment::new(batch.clone(), id_column)?]);
     }
     // Rounded down, so a chunk's share of the bytes stays within `max_bytes`.
     let chunk_rows = (rows * max_bytes / bytes).max(1);
@@ -197,7 +235,7 @@ fn split_oversized(batch: &RecordBatch, max_bytes: usize) -> Result<Vec<Segment>
             let indices = UInt64Array::from_iter_values(start as u64..end);
             let chunk = arrow::compute::take_record_batch(batch, &indices)
                 .map_err(|e| format!("failed to split a batch: {e}"))?;
-            Segment::new(chunk)
+            Segment::new(chunk, id_column)
         })
         .collect()
 }
@@ -309,7 +347,7 @@ impl Ledger {
         let batch = conform_to_schema(batch, &self.schema)?;
         validate_spacetimestamp_batch(&batch)?;
         // Measured before anything is mutated, so a failure here leaves the ledger unchanged.
-        let segment = Segment::new(normalize_batch_to_tai(&batch)?)?;
+        let segment = Segment::new(normalize_batch_to_tai(&batch)?, &self.id_column)?;
 
         // Topology is derived from the *normalised* rows so every epoch compared is on the
         // TAI scale. A batch that would introduce a cycle, or that names a frame which
@@ -364,7 +402,7 @@ impl Ledger {
             .map(|s| &s.batch)
     }
 
-    /// Drops the pose cache, forcing [`Ledger::resolve_frame_at`] down its scan path.
+    /// Drops the pose cache, forcing [`Ledger::resolve_frame_at`] down its indexed path.
     /// Test-only: lets a test compare the fast path against the fallback.
     #[cfg(test)]
     fn clear_pose_cache(&mut self) {
@@ -383,8 +421,8 @@ impl Ledger {
         for (id, row) in latest_rows {
             let epoch = cols.epoch_at(row);
             // Strictly-greater, so an equal epoch keeps the entry already cached. This
-            // matches resolve_frame_at's scan, which walks batches in insertion order and
-            // only replaces its best on a strictly later row. The two must never disagree.
+            // matches resolve_frame_at's indexed path, which walks segments in insertion order
+            // and only replaces its best on a strictly later row. The two must never disagree.
             // It also means a backfilled older batch cannot clobber a newer cached pose.
             if self
                 .latest_pose
@@ -466,7 +504,7 @@ impl Ledger {
                 self.segments.push(segment);
                 continue;
             }
-            match split_oversized(&segment.batch, target) {
+            match split_oversized(&segment.batch, target, &self.id_column) {
                 Ok(chunks) => {
                     let chunk_bytes: usize = chunks.iter().map(|c| c.bytes).sum();
                     self.resident_bytes = self.resident_bytes - segment.bytes + chunk_bytes;
@@ -533,7 +571,7 @@ impl Ledger {
         };
         let pinned = match pinned.num_rows() {
             0 => None,
-            _ => Some(Segment::new(pinned)?),
+            _ => Some(Segment::new(pinned, &self.id_column)?),
         };
 
         let victim = self.segments.remove(idx);
@@ -592,7 +630,8 @@ impl Ledger {
             tail => arrow::compute::concat_batches(&self.schema, tail.iter().map(|s| &s.batch))
                 .map_err(|e| e.to_string()),
         };
-        let Ok(sealed) = merged.and_then(|batch| split_oversized(&batch, target)) else {
+        let sealed = merged.and_then(|batch| split_oversized(&batch, target, &self.id_column));
+        let Ok(sealed) = sealed else {
             return;
         };
         let sealed_bytes: usize = sealed.iter().map(|s| s.bytes).sum();
@@ -745,47 +784,49 @@ impl Ledger {
 
         // Fast path. The cached epoch is the highest ever ingested for this entity, so if
         // it is already at or before the query there cannot be a later row to find, and
-        // the scan below would settle on exactly this pose.
+        // the lookup below would settle on exactly this pose.
         if let Some(cached) = self.latest_pose.get(&entity_id)
             && cached.epoch <= target_dur
         {
             return Some((cached.parent_frame_id, cached.isometry_km));
         }
 
-        // Slow path: the query predates the entity's latest row, or the cache was never
-        // populated (a ledger loaded from IPC).
-        let mut best_dur: Option<Duration> = None;
-        let mut best: Option<ResolvedFrame> = None;
+        // Slow path: the query predates the entity's latest row. Each segment's index gives
+        // the entity's last decodable row at or before the query. Segments go in insertion
+        // order and only a strictly later epoch replaces `best`, so an equal-epoch tie keeps
+        // the first row stored.
+        let mut best: Option<(Duration, ResolvedFrame)> = None;
 
-        for batch in self.all_batches() {
-            let Some(cols) = PoseColumns::try_new(batch, &self.id_column) else {
+        for segment in self.all_segments() {
+            let Some(rows) = segment.index.get(&entity_id) else {
                 continue;
             };
+            let Some(cols) = PoseColumns::try_new(&segment.batch, &self.id_column) else {
+                continue;
+            };
+            let epoch_of = |r: &u32| cols.epoch_at(*r as usize);
 
-            for i in 0..batch.num_rows() {
-                if cols.id_at(i) != Some(entity_id) {
-                    continue;
+            // Walk back one run of equal epochs at a time, so a row that cannot decode falls
+            // back to the next-best one rather than shadowing it.
+            let mut end = rows.partition_point(|r| epoch_of(r) <= target_dur);
+            while end > 0 {
+                let epoch = epoch_of(&rows[end - 1]);
+                if best.as_ref().is_some_and(|(b, _)| epoch <= *b) {
+                    break;
                 }
-
-                let row_dur = cols.epoch_at(i);
-                if row_dur > target_dur {
-                    continue;
+                let start = rows[..end].partition_point(|r| epoch_of(r) < epoch);
+                if let Some(pose) = rows[start..end]
+                    .iter()
+                    .find_map(|&r| cols.pose_at(r as usize))
+                {
+                    best = Some((epoch, pose));
+                    break;
                 }
-                if best_dur.is_some_and(|b| row_dur <= b) {
-                    continue;
-                }
-
-                // Read the pose before advancing `best_dur`: a row this cannot decode must
-                // not shadow an earlier row that it beats on epoch alone.
-                let Some(pose) = cols.pose_at(i) else {
-                    continue;
-                };
-                best_dur = Some(row_dur);
-                best = Some(pose);
+                end = start;
             }
         }
 
-        best
+        best.map(|(_, pose)| pose)
     }
 
     /// Builds a dynamic frame map for use with [`spacetimestamp::transforms::transform_batch`].
@@ -1144,7 +1185,7 @@ impl Ledger {
         }
         let mut ledger = Self::from_parts(schema, id_column);
         for batch in batches {
-            let segment = Segment::new(batch)?;
+            let segment = Segment::new(batch, id_column)?;
             ledger.resident_bytes += segment.bytes;
             ledger.segments.push(segment);
         }
@@ -1234,8 +1275,8 @@ enum RowKey {
 
 /// The identity and pose columns of one batch.
 ///
-/// Shared by [`Ledger::resolve_frame_at`]'s scan and [`Ledger::update_pose_cache`] so the
-/// two can never drift in how they read a row. Every accessor is indexed by row number.
+/// Shared by [`build_index`], [`Ledger::resolve_frame_at`] and [`Ledger::update_pose_cache`]
+/// so they can never drift in how they read a row. Every accessor is indexed by row number.
 struct PoseColumns<'a> {
     ids: &'a FixedSizeBinaryArray,
     sts: StsColumns<'a>,
@@ -1745,7 +1786,7 @@ mod tests {
     fn test_split_oversized_copies_chunks_within_the_cap() {
         let batch = timeline(1000);
         let cap = allocated_bytes(&batch) / 4;
-        let chunks = split_oversized(&batch, cap).unwrap();
+        let chunks = split_oversized(&batch, cap, "entity_id").unwrap();
 
         assert!(chunks.len() >= 4, "{} chunks", chunks.len());
         let rejoined =
@@ -1769,7 +1810,7 @@ mod tests {
     #[test]
     fn test_split_oversized_keeps_a_batch_within_the_cap() {
         let batch = timeline(10);
-        let chunks = split_oversized(&batch, allocated_bytes(&batch)).unwrap();
+        let chunks = split_oversized(&batch, allocated_bytes(&batch), "entity_id").unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(allocations(&chunks[0].batch), allocations(&batch));
     }
@@ -2641,12 +2682,12 @@ mod tests {
         assert_eq!(cached.0, before.0);
         assert!((cached.1.translation.vector.x - before.1.translation.vector.x).abs() < 1e-9);
 
-        // Drop the cache and make the scan answer instead: the fast path and the fallback
+        // Drop the cache and make the index answer instead: the fast path and the fallback
         // read the same columns, so they must not be able to disagree.
         reloaded.clear_pose_cache();
-        let scanned = reloaded.resolve_frame_at(demo("robot"), j2000()).unwrap();
-        assert_eq!(scanned.0, cached.0);
-        assert!((scanned.1.translation.vector.x - cached.1.translation.vector.x).abs() < 1e-9);
+        let indexed = reloaded.resolve_frame_at(demo("robot"), j2000()).unwrap();
+        assert_eq!(indexed.0, cached.0);
+        assert!((indexed.1.translation.vector.x - cached.1.translation.vector.x).abs() < 1e-9);
     }
 
     #[test]
@@ -3116,20 +3157,20 @@ mod tests {
     // pose cache tests
     // -----------------------------------------------------------------------
 
-    /// Checks that `resolve_frame_at`'s cache fast path and its scan fallback give the same
+    /// Checks that `resolve_frame_at`'s cache fast path and its indexed fallback give the same
     /// answer, including on the epoch-tie rule, where both must keep the *first* row seen.
-    fn assert_cache_agrees_with_scan(ledger: &Ledger, entity_id: PrescribedId, queries: &[Epoch]) {
+    fn assert_cache_agrees_with_index(ledger: &Ledger, entity_id: PrescribedId, queries: &[Epoch]) {
         let bytes = ledger.save_ipc_to_bytes().unwrap();
-        let mut scanned = Ledger::load_ipc_from_bytes(&bytes, "entity_id").unwrap();
-        scanned.clear_pose_cache();
+        let mut indexed = Ledger::load_ipc_from_bytes(&bytes, "entity_id").unwrap();
+        indexed.clear_pose_cache();
 
         for &epoch in queries {
             let cached = ledger.resolve_frame_at(entity_id, epoch);
-            let scanned = scanned.resolve_frame_at(entity_id, epoch);
+            let indexed = indexed.resolve_frame_at(entity_id, epoch);
             assert_eq!(
                 cached.as_ref().map(|(f, i)| (f, i.translation.vector)),
-                scanned.as_ref().map(|(f, i)| (f, i.translation.vector)),
-                "cache and scan disagree for {entity_id} at {epoch}"
+                indexed.as_ref().map(|(f, i)| (f, i.translation.vector)),
+                "cache and index disagree for {entity_id} at {epoch}"
             );
         }
     }
@@ -3159,7 +3200,7 @@ mod tests {
         let (_, iso) = ledger.resolve_frame_at(demo("A"), far_future).unwrap();
         assert_eq!(iso.translation.vector.x, 3.0);
 
-        assert_cache_agrees_with_scan(&ledger, demo("A"), &[at_latest, far_future]);
+        assert_cache_agrees_with_index(&ledger, demo("A"), &[at_latest, far_future]);
     }
 
     #[test]
@@ -3178,7 +3219,7 @@ mod tests {
         }
 
         // Between rows: the cached epoch (2000) is after the query, so this must fall back
-        // to the scan and find the row at 1000 rather than returning the cached pose.
+        // to the index and find the row at 1000 rather than returning the cached pose.
         let midpoint = j2000() + Duration::from_parts(0, 1_500);
         let (_, iso) = ledger.resolve_frame_at(demo("A"), midpoint).unwrap();
         assert_eq!(iso.translation.vector.x, 2.0);
@@ -3190,7 +3231,7 @@ mod tests {
                 .is_none()
         );
 
-        assert_cache_agrees_with_scan(
+        assert_cache_agrees_with_index(
             &ledger,
             demo("A"),
             &[j2000(), midpoint, j2000() + Duration::from_parts(0, 1_000)],
@@ -3227,11 +3268,11 @@ mod tests {
             "backfilled older row must not overwrite the cached newer pose"
         );
 
-        // The backfilled row is still findable at its own epoch, via the scan path.
+        // The backfilled row is still findable at its own epoch, via the indexed path.
         let (_, iso) = ledger.resolve_frame_at(demo("A"), j2000()).unwrap();
         assert_eq!(iso.translation.vector.x, 1.0);
 
-        assert_cache_agrees_with_scan(&ledger, demo("A"), &[j2000(), latest]);
+        assert_cache_agrees_with_index(&ledger, demo("A"), &[j2000(), latest]);
     }
 
     /// Two rows at the same epoch: the first one appended wins, in both code paths.
@@ -3253,11 +3294,11 @@ mod tests {
         let (_, iso) = ledger.resolve_frame_at(demo("A"), j2000()).unwrap();
         assert_eq!(iso.translation.vector.x, 1.0);
 
-        assert_cache_agrees_with_scan(&ledger, demo("A"), &[j2000()]);
+        assert_cache_agrees_with_index(&ledger, demo("A"), &[j2000()]);
     }
 
     /// Poses are cached in km regardless of the units the row was written in, matching
-    /// what the scan path returns.
+    /// what the indexed path returns.
     #[test]
     fn test_pose_cache_normalises_units_to_km() {
         use crate::schemas::entity::EntityBuilder;
@@ -3286,7 +3327,7 @@ mod tests {
         let (_, iso) = ledger.resolve_frame_at(demo("A"), j2000()).unwrap();
         assert_eq!(iso.translation.vector.x, 2.0);
 
-        assert_cache_agrees_with_scan(&ledger, demo("A"), &[j2000()]);
+        assert_cache_agrees_with_index(&ledger, demo("A"), &[j2000()]);
     }
 
     /// Independent entities each keep their own cache entry.
@@ -3335,8 +3376,133 @@ mod tests {
         );
         assert!(ledger.resolve_frame_at(demo("missing"), at_b).is_none());
 
-        assert_cache_agrees_with_scan(&ledger, demo("A"), &[j2000(), at_b]);
-        assert_cache_agrees_with_scan(&ledger, demo("B"), &[j2000(), at_b]);
+        assert_cache_agrees_with_index(&ledger, demo("A"), &[j2000(), at_b]);
+        assert_cache_agrees_with_index(&ledger, demo("B"), &[j2000(), at_b]);
+    }
+
+    // -----------------------------------------------------------------------
+    // time index tests (the cache is cleared, so every lookup takes the indexed path)
+    // -----------------------------------------------------------------------
+
+    /// `entity`'s x (km) at `ns`, or `None`.
+    fn x_at(ledger: &Ledger, entity: PrescribedId, ns: u64) -> Option<f64> {
+        ledger
+            .resolve_frame_at(entity, at_ns(ns))
+            .map(|(_, iso)| iso.translation.x)
+    }
+
+    /// Interleaved entities with older batches appended after newer ones.
+    #[test]
+    fn test_index_finds_interleaved_and_backfilled_rows() {
+        let earth = PrescribedId::astronomical_from_name("Earth").unwrap();
+        let (a, b) = (demo("a"), demo("b"));
+        let mut ledger = make_entity_ledger();
+        for t in [10, 20, 30] {
+            let rows = [(a, earth, t as f64), (b, earth, 100.0 + t as f64)];
+            ledger.append(entity_rows(&rows, t)).unwrap();
+        }
+        for t in [15, 5] {
+            ledger
+                .append(entity_rows(&[(a, earth, t as f64)], t))
+                .unwrap();
+        }
+        ledger.clear_pose_cache();
+
+        for (ns, x) in [(5, 5.0), (14, 10.0), (15, 15.0), (29, 20.0), (1000, 30.0)] {
+            assert_eq!(x_at(&ledger, a, ns), Some(x), "a at {ns}");
+        }
+        assert_eq!(x_at(&ledger, b, 15), Some(110.0));
+        assert_eq!(x_at(&ledger, a, 4), None, "before a's first row");
+        assert_eq!(x_at(&ledger, b, 9), None, "before b's first row");
+        assert_eq!(x_at(&ledger, demo("ghost"), 20), None);
+    }
+
+    /// Lookups after a seal, after a split and eviction under a memory limit, and after a
+    /// save and reload of the evicted ledger.
+    #[test]
+    fn test_index_survives_seal_split_eviction_and_reload() {
+        let earth = PrescribedId::astronomical_from_name("Earth").unwrap();
+        let a = demo("bot");
+
+        let mut sealed = make_entity_ledger();
+        let steps = 3 * (SEGMENT_THRESHOLD as u64 + 1);
+        for t in 0..steps {
+            sealed
+                .append(entity_rows(&[(a, earth, t as f64)], t))
+                .unwrap();
+        }
+        assert!(!sealed.segments.is_empty());
+        sealed.clear_pose_cache();
+        for ns in [0, 7, SEGMENT_THRESHOLD as u64 + 3, steps - 2] {
+            assert_eq!(x_at(&sealed, a, ns), Some(ns as f64), "sealed, at {ns}");
+        }
+
+        // `timeline` holds `bot` at x = epoch for epochs 0..1000.
+        let batch = timeline(1000);
+        let mut evicted = make_entity_ledger();
+        evicted
+            .set_memory_limit(Some(allocated_bytes(&batch) / 2))
+            .unwrap();
+        evicted.append(batch).unwrap();
+        let first = evicted.window_start().unwrap().to_parts().1;
+        assert!(first > 0, "nothing was evicted");
+
+        let mut reloaded =
+            Ledger::load_ipc_from_bytes(&evicted.save_ipc_to_bytes().unwrap(), "entity_id")
+                .unwrap();
+        evicted.clear_pose_cache();
+        reloaded.clear_pose_cache();
+        for (name, ledger) in [("evicted", &evicted), ("reloaded", &reloaded)] {
+            for ns in [first, first + 3, 998] {
+                assert_eq!(x_at(ledger, a, ns), Some(ns as f64), "{name}, at {ns}");
+            }
+            assert_eq!(
+                x_at(ledger, a, first - 1),
+                None,
+                "{name}: evicted rows are gone"
+            );
+        }
+    }
+
+    /// Equal-epoch rows: the first stored wins, within one segment and across segments.
+    #[test]
+    fn test_index_epoch_tie_keeps_first_stored() {
+        let earth = PrescribedId::astronomical_from_name("Earth").unwrap();
+        let (a, b) = (demo("a"), demo("b"));
+        let mut ledger = make_entity_ledger();
+        ledger
+            .append(entity_rows(&[(a, earth, 1.0), (a, earth, 2.0)], 10))
+            .unwrap();
+        ledger.append(entity_rows(&[(b, earth, 3.0)], 10)).unwrap();
+        ledger.append(entity_rows(&[(b, earth, 4.0)], 10)).unwrap();
+        ledger
+            .append(entity_rows(&[(a, earth, 9.0), (b, earth, 9.0)], 20))
+            .unwrap();
+        ledger.clear_pose_cache();
+
+        assert_eq!(x_at(&ledger, a, 15), Some(1.0), "within one segment");
+        assert_eq!(x_at(&ledger, b, 15), Some(3.0), "across segments");
+    }
+
+    /// The index's bytes count toward `resident_bytes`.
+    #[test]
+    fn test_resident_bytes_include_the_index() {
+        let earth = PrescribedId::astronomical_from_name("Earth").unwrap();
+        let mut ledger = make_entity_ledger();
+        for t in 0..10 {
+            ledger
+                .append(entity_rows(
+                    &[(demo("a"), earth, 0.0), (demo("b"), earth, 0.0)],
+                    t,
+                ))
+                .unwrap();
+        }
+        let batches: usize = ledger.all_batches().map(allocated_bytes).sum();
+        assert!(
+            ledger.resident_bytes() > batches,
+            "{} resident, {batches} in batches",
+            ledger.resident_bytes()
+        );
     }
 
     // -----------------------------------------------------------------------

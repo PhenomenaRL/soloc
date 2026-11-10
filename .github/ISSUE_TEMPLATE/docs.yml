@@ -1,0 +1,22 @@
+name: Documentation
+description: Missing, wrong or unclear docs
+labels: [documentation]
+body:
+  - type: input
+    id: where
+    attributes:
+      label: Where
+      description: File, crate, page or doc comment.
+      placeholder: crates/soloc-ledger/README.md
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's missing or wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested change
