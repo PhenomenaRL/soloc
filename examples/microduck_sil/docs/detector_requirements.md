@@ -79,3 +79,14 @@ they are (median 6 cm, accounting for simulated detection noise).
 ![duck-c spots trash-7, walks over and points it out](img/mission_find.webp)
 
 *duck-c spots trash-7 (green), walks over and points it out; the pillar is its report, resolved by soloc.*
+
+## Appendix: Misc Notes on Soloc as a Software-in-the-loop Tool 
+
+What worked surprisingly well:
+- Surprisingly seamless when running as a software-in-the-loop sim
+- Raw measurements stay in the frame they were taken in, next to the twin's truth, so scoring a design is a query
+- One twin recording fed all 44 designs; each design's ledger merges with the others for side-by-side analysis
+
+What the Soloc team should focus on as next features:
+- Querying entity-to-entity transforms directly ("b in a's frame" currently goes through Earth-fixed coordinates) would be very helpful as originally expected
+- More geospatial data in the mix will make for more interesting missions than one apartment (microduck on the moon next?)
