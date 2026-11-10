@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="soloc-test" xmlns="http://www.topografix.com/GPX/1/1">
+  <metadata><name>Identity and order fixture</name></metadata>
+  <rte>
+    <name>Same display name</name>
+    <rtept lat="0" lon="90"><ele>12</ele><time>2025-01-01T00:00:00Z</time></rtept>
+  </rte>
+  <trk>
+    <name>Same display name</name>
+    <desc>Recorded path with duplicates, reversed timestamps, and a gap</desc>
+    <trkseg>
+      <trkpt lat="0" lon="0"><ele>10</ele><time>2025-01-01T00:00:02.123456789Z</time></trkpt>
+      <trkpt lat="0" lon="0"><ele>10</ele><time>2025-01-01T00:00:02.123456789Z</time></trkpt>
+      <trkpt lat="0" lon="1"><ele>10</ele><time>2025-01-01T00:00:01Z</time></trkpt>
+    </trkseg>
+    <trkseg/>
+    <trkseg>
+      <trkpt lat="0" lon="2"><ele>-5</ele><time>2025-01-01T01:00:00Z</time></trkpt>
+    </trkseg>
+  </trk>
+  <trk>
+    <name>Same display name</name>
+    <trkseg>
+      <trkpt lat="90" lon="0"><ele>0</ele><time>2025-01-01T00:00:03Z</time></trkpt>
+    </trkseg>
+  </trk>
+</gpx>
