@@ -108,7 +108,7 @@ DESIGNS = {
 _CAMS = ("cam-tof-ble", "cam-ble", "marker")
 SWEEP_AXES = {
     "range": {d: ("r50", (1.0, 2.0, 3.0), "range") for d in _CAMS},
-    "fov": {d: ("fov", (45.0, 90.0, 160.0), "fov") for d in _CAMS},
+    "fov": {d: ("fov", (45.0, 62.0, 90.0, 160.0), "fov") for d in _CAMS},   # 62°: the IMX219 head camera
     "rate": {**{d: ("hz", (0.5, 2.0, 10.0), "hz") for d in _CAMS}, "ble": ("hz", (0.5, 1.0, 5.0), "hz")},
     "noise": {"cam-tof-ble": ("bearing", (1.0, 2.0, 5.0), "bearing"), "cam-ble": ("bearing", (1.0, 2.0, 5.0), "bearing"),
               "marker": ("k", (0.01, 0.02, 0.05), "k"), "ble": ("sigma", (0.5, 1.0, 2.0), "sigma")},

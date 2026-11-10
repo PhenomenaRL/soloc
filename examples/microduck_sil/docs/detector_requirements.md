@@ -1,9 +1,15 @@
 # What does a microduck need to know where its friends are?
 
+**Heading drift matters more than the detector. Any camera design gets ~7 cm. At 2°/min a follower
+must re-sight its leader every minute.**
+
 Microduck's social behaviours (greeting, follow-the-leader) need an answer for "where is duck b in my frame?". Each
 duck's odometry starts in the pose from where it was booted, with no magnetometer to tie headings together, so
 something has to sense the other ducks. Pollen's digital twin as software-in-the-loop within Soloc to 
-perform an initial detector requirements study.
+perform an initial detector requirements study. It tests the camera = direction, ToF = distance,
+BLE = identity split from the fusion note in
+[`docs/ideas/autonomous_behavior.md`](https://github.com/pollen-robotics/microduck/blob/a360b3843bb49fd48a635b39eabcb835d9fffecb/docs/ideas/autonomous_behavior.md#duck-detector-camera--npu--wanted-waiting-on-mediad),
+and adds a heading-drift budget.
 
 ![duck-c keeps duck-d in view: each ray is one sighting](img/spotting.webp)
 
@@ -19,7 +25,7 @@ own odometry frame.*
 - Afterwards, the recording is replayed through the scene to find, at each moment, which pairs had
   a clear line of sight and whether one duck's VL53L5CX zones (`tof.py` model) landed on the
   other duck
-- Four detector designs were considered. Parameters were: range, field of view, rate, noise & heading drift. 44 designs × 10 noise seeds × 2 runs in total were simulated. Each duck's frame is fitted into a lookout's from sightings, and "b in a's frame" is scored against truth every second
+- Four detector designs were considered. Parameters were: range, field of view, rate, noise & heading drift. 47 designs × 10 noise seeds × 2 runs in total were simulated. Each duck's frame is fitted into a lookout's from sightings, and "b in a's frame" is scored against truth every second
 
 ## Findings
 
@@ -30,12 +36,12 @@ own odometry frame.*
 | Camera + marker on each duck | 7 cm | 18 cm | 82% | 80 s |
 | BLE RSSI only (σ 1 m) | — | — | 7% | never |
 
-1. **Heading drift defines accuracy.** At 0.5°/min a duck can go ~5 min unseen and
+1. **Heading drift defines accuracy.** At 0.5°/min a duck can go over 3 min unseen and
    stay within 25 cm of truth. At 2°/min that drops to about a minute (median 14–16 cm, p95 ~45 cm). At
    5°/min it never stays within 25 cm
 2. **Any camera-based design gives ~7 cm.** Range, field of view, rate and noise mostly change how
-   soon and how often there is an estimate. A wide view (90–160°) plus any range source reaches
-   90% coverage with everyone aligned in 30–40 s; bearing-only stays at 77–79%. However as real camera with that FOV may cause reduction in detection instances
+   soon and how often there is an estimate. A wider view (62–160°) plus any range source reaches
+   87–92% coverage with everyone aligned in 30–40 s; bearing-only stays at 73–79%. However as real camera with that FOV may cause reduction in detection instances
 3. **BLE RSSI alone can't resolve frames** Using BLE for identity instead of pose determination makes more sense
 
 ![error and re-sight interval vs heading drift](img/sweep_drift.png)
@@ -85,7 +91,7 @@ they are (median 6 cm, accounting for simulated detection noise).
 What worked surprisingly well:
 - Surprisingly seamless when running as a software-in-the-loop sim
 - Raw measurements stay in the frame they were taken in, next to the twin's truth, so scoring a design is a query
-- One twin recording fed all 44 designs; each design's ledger merges with the others for side-by-side analysis
+- One twin recording fed all 47 designs; each design's ledger merges with the others for side-by-side analysis
 
 What the Soloc team should focus on as next features:
 - Querying entity-to-entity transforms directly ("b in a's frame" currently goes through Earth-fixed coordinates) would be very helpful as originally expected

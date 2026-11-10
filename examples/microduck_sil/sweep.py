@@ -56,7 +56,6 @@ MAX_OFFSET_M = 20.0                   # no two boot frames in an 8×6 m flat are
 FIT_SIGMA_M, FIT_SIGMA_RAD = 0.10, math.radians(5.0)    # a pair fit's own 1σ, to be accepted
 AMBIGUOUS_M, AMBIGUOUS_RAD, AMBIGUOUS_CHI2 = 0.3, math.radians(10.0), 9.0   # a rival minimum this far off and this close in χ²
 GROWTH_MAX_S = 180.0                  # error-growth fit over gaps up to this
-RESIGHT_CAP_S = 600.0                 # plotted ceiling for "re-sight within" (no growth = never stale)
 PLOT_DPI = 260                        # 2× for docs/img
 SIGHTINGS_SCHEMA = pa.schema([("t_tai_ns", pa.int64()), ("observer", pa.string()), ("target", pa.string()),
                               ("range_m", pa.float64()), ("bearing_rad", pa.float64())])
@@ -438,6 +437,8 @@ def plots(results: dict, specs: dict):
     for axis, per in sc.SWEEP_AXES.items():
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
         for d, (key, values, _) in per.items():
+            if sc.DESIGNS[d]["kind"] != "cam":     # BLE alone rarely has an estimate (see the table)
+                continue
             xs, rs = [], []
             for i, v in enumerate(values):
                 did = f"{d}-base" if v == sc.DESIGNS[d][key] else f"{d}-{per[d][2]}{v:g}"
@@ -450,8 +451,14 @@ def plots(results: dict, specs: dict):
             ax1.plot(xs, col("median") * 100, "o-", color=colour[d], label=f"{d} median")
             ax1.fill_between(xs, col("median_lo") * 100, col("median_hi") * 100, color=colour[d], alpha=0.15)
             ax1.plot(xs, col("p95") * 100, "o--", color=colour[d], alpha=0.6, label=f"{d} p95")
-            resight = np.minimum(col("resight_s"), RESIGHT_CAP_S)
-            ax2.plot(xs, resight, "o-", color=colour[d], label=d)
+            # Re-sight comes from a line fitted over gaps up to GROWTH_MAX_S; longer is extrapolation,
+            # so it is drawn at the cap with ▲.
+            resight = col("resight_s")
+            over = resight > GROWTH_MAX_S
+            shown = np.minimum(resight, GROWTH_MAX_S)
+            ax2.plot(xs, shown, "-", color=colour[d], label=d)
+            ax2.plot(np.array(xs)[~over], shown[~over], "o", color=colour[d])
+            ax2.plot(np.array(xs)[over], shown[over], "^", color=colour[d], markersize=8)
         for ax in (ax1, ax2):
             style(ax)
             ax.set_xlabel(labels[axis])
@@ -460,7 +467,11 @@ def plots(results: dict, specs: dict):
                 ax.set_xticks([0, 1, 2], ["low", "baseline", "high"])
         ax1.set_ylabel('"b in a\'s frame" error (cm)')
         ax2.set_ylabel(f"re-sight within (s) to stay ≤ {sc.STALE_M * 100:.0f} cm")
-        ax2.set_ylim(0, RESIGHT_CAP_S * 1.05)
+        ax2.axhline(GROWTH_MAX_S, color="#6b6a63", lw=1, ls=":")
+        ax2.annotate(f"▲ ≥ {GROWTH_MAX_S / 60:.0f} min: longer than any gap seen", (0.02, GROWTH_MAX_S),
+                     xycoords=("axes fraction", "data"), xytext=(0, 4), textcoords="offset points",
+                     fontsize=7, color="#6b6a63")
+        ax2.set_ylim(0, GROWTH_MAX_S * 1.15)
         ax1.legend(fontsize=7)
         ax2.legend(fontsize=7)
         fig.tight_layout()
