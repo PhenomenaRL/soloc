@@ -141,6 +141,13 @@ Names are **display only**: `NameRegistry` maps an id to `(authority, common_nam
 presentation; identity, topology, and pose resolution never consult it, so a ledger with no
 registry is fully functional.
 
+### ITRF93
+
+`ITRF93` uses frame pair `(399, 3000)`, distinct from `Earth` / `IAU_EARTH` `(399, 399)`.
+Same-frame operations need no kernels. Rotations require an Earth `.bpc` covering
+the observation epoch; conversion to/from `IAU_EARTH` also needs planetary
+constants (`pck11.pca`). Missing coverage returns an error.
+
 ## Topology
 
 Topology can be thought of as a forest of transformation trees, where the root is an astronomical 
