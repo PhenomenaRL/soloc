@@ -306,6 +306,44 @@ impl EstimateType {
             Self::SIMULATED => 2,
         }
     }
+
+    /// How far a value is from a direct observation; higher is further.
+    ///
+    /// Kept apart from [`priority`](Self::priority) on purpose: the two orders agree today,
+    /// but one ranks rows for a tie-break and the other combines inputs to a derived value,
+    /// so a future member may well need different positions in each.
+    fn severity(self) -> u8 {
+        match self {
+            Self::MEASURED => 0,
+            Self::ESTIMATED => 1,
+            Self::SIMULATED => 2,
+        }
+    }
+
+    /// The less direct of `self` and `other`: what a value composed from both can claim.
+    ///
+    /// Severity order is `SIMULATED > ESTIMATED > MEASURED`, so a pose chain with one
+    /// simulated hop is simulated as a whole.
+    pub fn worst(self, other: Self) -> Self {
+        if other.severity() > self.severity() {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// The estimate type of a value *derived* from one of this type, e.g. by a frame
+    /// transform that composes poses and ephemerides.
+    ///
+    /// SIMULATED stays SIMULATED: that is provenance, which no computation changes. Anything
+    /// else becomes ESTIMATED, since the derived value carries error from every input that
+    /// went into it and is no longer a direct observation.
+    pub fn derived(self) -> Self {
+        match self {
+            Self::SIMULATED => Self::SIMULATED,
+            Self::MEASURED | Self::ESTIMATED => Self::ESTIMATED,
+        }
+    }
 }
 
 #[cfg(test)]

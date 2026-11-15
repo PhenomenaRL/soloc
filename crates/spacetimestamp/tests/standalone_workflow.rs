@@ -15,7 +15,7 @@ use spacetimestamp::ephemeris::{
 use spacetimestamp::identity::PrescribedId;
 use spacetimestamp::schemas::entity::EntityBuilder;
 use spacetimestamp::topology::TransformTree;
-use spacetimestamp::transforms::transform_batch;
+use spacetimestamp::transforms::{ResolvedFrame, transform_batch};
 use spacetimestamp::validation::validate_spacetimestamp_batch;
 use spacetimestamp::vocabulary::{EstimateType, LengthUnit, TimeScaleCode};
 
@@ -147,7 +147,7 @@ fn build_validate_derive_topology_and_transform_without_a_ledger() {
 
     // 4. Compose per-hop poses into an isometry for each entity frame. This is the caller's
     //    job. The tree supplies structure only, never a pose value.
-    let resolve = |frame: PrescribedId, at: Epoch| -> Option<(PrescribedId, Isometry3<f64>)> {
+    let resolve = |frame: PrescribedId, at: Epoch| -> Option<ResolvedFrame> {
         let chain = tree.ancestry_at(frame, at - j2000_tai()).ok()?;
         let (root, hops) = chain.split_last()?;
         // Walk inward from the root so each hop composes onto its parent's accumulated pose.
@@ -155,7 +155,7 @@ fn build_validate_derive_topology_and_transform_without_a_ledger() {
         for node in hops.iter().rev() {
             acc *= poses.get(node)?;
         }
-        Some((*root, acc))
+        Some(ResolvedFrame::new(*root, acc, EstimateType::MEASURED))
     };
 
     // 5. Transform every row into the Earth frame in one pass. An empty almanac suffices

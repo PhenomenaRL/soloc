@@ -1,29 +1,46 @@
-//! Transformation Engine for projecting spacetimestamps across astronomical frames.
+//! Transformation Engine for projecting spacetimestamps into any frame of the topology.
 //!
 //! This module provides the core transformation anywhere in the solar system, taking raw
 //! `RecordBatch` data containing embedded `spacetimestamp`s and mathematically
-//! projecting their coordinates into any target reference frame.
+//! projecting their coordinates into a target reference frame: either an astronomical frame
+//! or any entity whose pose chain the caller can resolve.
 //!
 //! It combines caller-supplied frame resolution (the ledger's derived transform tree) with
 //! dynamic, time-varying orbital traversals (using `anise::Almanac`).
 //!
 //! # Transform Pipeline
 //!
-//! For each row, the full transform is a three-stage composition:
+//! For each row, the full transform is a four-stage composition:
 //!
 //! ```text
-//! 1. Resolve: P_local  --[caller's resolver ]--> P_root   (local/entity frame → astronomical root)
-//! 2. Dynamic: P_root   --[Almanac.rotate()  ]--> P_rot    (re-orient into target frame axes)
-//! 3. Dynamic: P_rot    --[Almanac.translate()]--> P_target (shift origin to target frame origin)
+//! 1. Resolve: P_local  --[caller's resolver  ]--> P_rootA  (row frame → its astronomical root)
+//! 2. Dynamic: P_rootA  --[Almanac.rotate()   ]--> P_rot    (re-orient into rootB's axes)
+//! 3. Dynamic: P_rot    --[Almanac.translate()]--> P_rootB  (shift origin to rootB's origin)
+//! 4. Resolve: P_rootB  --[target chain⁻¹     ]--> P_target (rootB → target entity frame)
 //! ```
 //!
-//! In full: `P_target = R_root→target · P_root + R_J2000→target · r`, where `r` is the
-//! translation below.
+//! In full: `T_target←src = (T_rootB←target)⁻¹ · T_almanac(rootA→rootB, t) · T_rootA←src`.
+//!
+//! The target entity is not moved in the topology: it stays a child in its own tree, rooted
+//! at an astronomical frame, and the output simply expresses each row relative to it. An
+//! astronomical target is its own root, so stage 4 is the identity. When both chains end in
+//! the same root, stages 2 and 3 are skipped entirely: the transform is purely local, needs
+//! no almanac data, and never routes through the root's (possibly very large) coordinates.
 //!
 //! Positions use `Point3` (isometry applies translation + rotation).
 //! Orientations use `UnitQuaternion` (rotation only).
 //! Kinematic fields outside the spacetimestamp struct (velocity, angular_velocity, acceleration)
-//! are passed through unchanged; the caller is responsible for reprojecting those.
+//! are passed through unchanged; the caller is responsible for reprojecting those. The output
+//! is the **geometric** state: no light-time or aberration correction is applied.
+//!
+//! # Estimate Type
+//!
+//! A transformed row is a derived value: it folds in every pose on both chains plus the
+//! ephemeris, and its covariance is dropped. Its `estimate_type` is the worst of the source
+//! row's and every composed pose's (see [`EstimateType::worst`]), then
+//! [`derived`](EstimateType::derived): SIMULATED stays SIMULATED, everything else becomes
+//! ESTIMATED. A row already expressed in the target frame is not transformed and keeps its
+//! estimate type; only its units are converted.
 //!
 //! # Anise Convention
 //!
@@ -60,14 +77,38 @@ use crate::schema::{
     DURATION_CENTURIES_COLUMN, DURATION_NS_COLUMN, STS_COLUMN, SpaceTimestampBuilder, StsColumns,
     TIMESCALE_ID_COLUMN,
 };
-use crate::vocabulary::{LengthUnit, TimeScaleCode, Vocabulary};
+use crate::vocabulary::{EstimateType, LengthUnit, TimeScaleCode, Vocabulary};
 
-/// A resolved dynamic frame: the astronomical root its chain terminates in, plus the
-/// isometry (always in km) taking child-frame coordinates into that root.
-pub type ResolvedFrame = (PrescribedId, Isometry3<f64>);
+/// A frame resolved to the root its pose chain terminates in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedFrame {
+    /// The terminal frame of the chain: an astronomical frame or body handed to `anise`.
+    pub root: PrescribedId,
+    /// Takes coordinates in the resolved frame into `root`. Always kilometres.
+    pub iso_km: Isometry3<f64>,
+    /// The worst [`EstimateType`] of any pose composed into `iso_km`, by
+    /// [`EstimateType::worst`]. MEASURED is the neutral value for a chain with no poses.
+    pub estimate: EstimateType,
+}
 
-/// Resolves a [`KIND_SOLOC`](crate::identity::KIND_SOLOC) frame id at a given epoch: see
-/// [`transform_batch`].
+impl ResolvedFrame {
+    /// Bundles a resolved chain.
+    pub fn new(root: PrescribedId, iso_km: Isometry3<f64>, estimate: EstimateType) -> Self {
+        Self {
+            root,
+            iso_km,
+            estimate,
+        }
+    }
+
+    /// The trivial resolution of an astronomical frame: itself, with no poses composed.
+    fn identity(root: PrescribedId) -> Self {
+        Self::new(root, Isometry3::identity(), EstimateType::MEASURED)
+    }
+}
+
+/// Resolves a [`KIND_SOLOC`](crate::identity::KIND_SOLOC) frame id at a given epoch to its
+/// chain root: see [`transform_batch_to`].
 pub type DynamicFrameResolver<'a> = &'a dyn Fn(PrescribedId, Epoch) -> Option<ResolvedFrame>;
 
 /// Resolves an astronomical root id to the `anise` [`Frame`] it embeds.
@@ -87,8 +128,23 @@ fn resolve_root_frame(id: PrescribedId, epoch: Epoch) -> Result<Frame, String> {
     Ok(Frame::new(ephemeris_id, orientation_id))
 }
 
-/// A human label for an astronomical root in an error message: its canonical name from the
-/// embedded pair, or the hyphenated id if the pair is somehow unnamed.
+/// [`resolve_root_frame`], memoised per root id. A batch typically terminates in one or two
+/// roots, so this replaces a per-row resolve with a 16-byte hash.
+fn root_frame_cached(
+    cache: &mut IdMap<Frame>,
+    id: PrescribedId,
+    epoch: Epoch,
+) -> Result<Frame, String> {
+    if let Some(frame) = cache.get(&id) {
+        return Ok(*frame);
+    }
+    let frame = resolve_root_frame(id, epoch)?;
+    cache.insert(id, frame);
+    Ok(frame)
+}
+
+/// A human label for a frame in an error message: its canonical name from the embedded
+/// astronomical pair, or the hyphenated id for anything else.
 fn root_display(id: PrescribedId) -> String {
     id.astro_frame()
         .and_then(|(e, o)| crate::ephemeris::frame_name(e, o))
@@ -96,19 +152,29 @@ fn root_display(id: PrescribedId) -> String {
         .unwrap_or_else(|| id.to_hyphenated())
 }
 
-/// Reprojects the `spacetimestamp` struct column of a batch into `target_frame_name`.
+/// Resolver answers per (frame, epoch). Deliberately the default hasher, not `IdMap`: the key
+/// is a tuple, so `IdHasher` would fall back to FNV for the epoch half anyway.
+type ResolverCache = HashMap<(PrescribedId, (i16, u64)), Option<ResolvedFrame>>;
+
+/// Calls `resolve` for `frame` at `epoch`, memoised so a per-timestep snapshot batch costs
+/// one call per frame rather than one per row.
+fn resolve_cached(
+    cache: &mut ResolverCache,
+    resolve: DynamicFrameResolver<'_>,
+    frame: PrescribedId,
+    epoch: Epoch,
+    epoch_key: (i16, u64),
+) -> Option<ResolvedFrame> {
+    *cache
+        .entry((frame, epoch_key))
+        .or_insert_with(|| resolve(frame, epoch))
+}
+
+/// Reprojects the `spacetimestamp` struct column of a batch into the astronomical frame
+/// named `target_frame_name`.
 ///
-/// A pure projection: the input is unmodified and only spacetimestamp struct column is
-/// replaced in the result. Callers are responsible for transforming fields in parent
-/// schemas (for now).
-///
-/// # Arguments
-/// * `resolve_dynamic_frame`: called when a row's `frame_id` is a
-///   [`KIND_SOLOC`](crate::identity::KIND_SOLOC) id needing a pose lookup. It receives
-///   **that row's own epoch**, so a batch spanning several timesteps resolves each row
-///   against the pose current at its own; answers are memoised per `(frame, epoch)`.
-///   Its isometries are always km regardless of `units_pos`. A frame it declines to place
-///   is treated as an astronomical root, whose `anise` frame is read straight from the id.
+/// Name-based convenience over [`transform_batch_to`], which also accepts entity targets.
+/// Errors if the name is not a recognised astronomical frame.
 pub fn transform_batch(
     batch: &RecordBatch,
     target_frame_name: &str,
@@ -116,9 +182,8 @@ pub fn transform_batch(
     target_unit: LengthUnit,
     resolve_dynamic_frame: Option<DynamicFrameResolver<'_>>,
 ) -> Result<RecordBatch, String> {
-    // Attempt to resolve the target frame in anise. We default to assuming J2000 orientation
-    // if the user simply passed a planetary center like "Mars".  Also handles "IAU_BODY" strings
-    // (e.g. "IAU_EARTH") by mapping to the corresponding anise body-fixed frame.
+    // Also handles "IAU_BODY" strings (e.g. "IAU_EARTH") by mapping to the corresponding anise
+    // body-fixed frame.
     let target_frame =
         crate::ephemeris::resolve_astronomical_frame(target_frame_name).ok_or_else(|| {
             format!(
@@ -126,9 +191,57 @@ pub fn transform_batch(
                 target_frame_name
             )
         })?;
-
-    let target_frame_id =
+    let target =
         PrescribedId::astronomical(target_frame.ephemeris_id, target_frame.orientation_id)?;
+    transform_batch_to(batch, target, almanac, target_unit, resolve_dynamic_frame)
+}
+
+/// Reprojects the `spacetimestamp` struct column of a batch into `target`: an astronomical
+/// frame, or any [`KIND_SOLOC`](crate::identity::KIND_SOLOC) entity the resolver can place.
+///
+/// A pure projection: the input is unmodified and only the spacetimestamp struct column is
+/// replaced in the result. Callers are responsible for transforming fields in parent
+/// schemas (for now). Every output row has `frame_id = target`, `units_pos = target_unit`,
+/// and an estimate type set as described in the [module docs](self#estimate-type).
+///
+/// # Arguments
+/// * `resolve_dynamic_frame`: called for a row's `frame_id` that is a
+///   [`KIND_SOLOC`](crate::identity::KIND_SOLOC) id needing a pose lookup, and for an entity
+///   `target`. It receives **that row's own epoch**, so a batch spanning several timesteps
+///   resolves each row, and the target's possibly moving pose, against the pose current at
+///   that epoch; answers are memoised per `(frame, epoch)`. Its isometries are always km
+///   regardless of `units_pos`. A row frame it declines to place is treated as a root, whose
+///   `anise` frame is read straight from the id.
+///
+/// # Errors
+/// The whole batch fails if `target` is an abstract id, if `target` is an entity and either
+/// no resolver is given or it cannot place `target` at some row's epoch, or if any row's
+/// chain cannot be carried to the target's root.
+pub fn transform_batch_to(
+    batch: &RecordBatch,
+    target: PrescribedId,
+    almanac: &Almanac,
+    target_unit: LengthUnit,
+    resolve_dynamic_frame: Option<DynamicFrameResolver<'_>>,
+) -> Result<RecordBatch, String> {
+    if target.is_abstract() {
+        return Err(format!(
+            "Invalid target frame {target}: abstract ids label provenance and are never frames"
+        ));
+    }
+    // An astronomical target is its own root, fixed for the whole call. An entity target is
+    // placed per epoch below, since it may move.
+    let fixed_target = if target.is_soloc() {
+        if resolve_dynamic_frame.is_none() {
+            return Err(format!(
+                "Target frame {} is an entity, which needs a frame resolver to place it",
+                root_display(target)
+            ));
+        }
+        None
+    } else {
+        Some(ResolvedFrame::identity(target))
+    };
 
     let schema = batch.schema();
     let col_idx = schema
@@ -140,19 +253,15 @@ pub fn transform_batch(
     let num_rows = batch.num_rows();
     let mut sts_builder = SpaceTimestampBuilder::new(num_rows);
 
-    // Resolver answers per (frame, epoch), so a per-timestep snapshot batch costs one call
-    // rather than one per row. Deliberately the default hasher, not `IdMap`: the key is a
-    // tuple, so `IdHasher` would fall back to FNV for the epoch half anyway.
-    let mut dynamic_cache: HashMap<(PrescribedId, (i16, u64)), Option<ResolvedFrame>> =
-        HashMap::new();
+    // Shared by row frames and an entity target, so a target that also appears as a row
+    // frame is resolved once per epoch.
+    let mut dynamic_cache: ResolverCache = HashMap::new();
 
-    // Registry lookup and anise name resolution per root id. A batch typically terminates
-    // in one or two roots, so this replaces a per-row string resolve with a 16-byte hash.
     let mut root_cache: IdMap<Frame> = IdMap::default();
 
-    // J2000 → target rotation per epoch. The target is fixed for the call, so the epoch is
-    // the whole key.
-    let mut j2000_cache: HashMap<(i16, u64), Rotation3<f64>> = HashMap::new();
+    // J2000 → rootB rotation per (rootB, epoch). With an entity target, rootB can differ by
+    // row (the target may be re-parented mid-batch), so it is part of the key.
+    let mut j2000_cache: HashMap<(PrescribedId, (i16, u64)), Rotation3<f64>> = HashMap::new();
 
     for i in 0..num_rows {
         let original_frame_id = cols.frame_at(i)?;
@@ -170,119 +279,151 @@ pub fn transform_batch(
         // timescale. epoch_from_parts applies the correct J2000 reference for that timescale
         // so the resulting Epoch is always physically correct regardless of storage timescale.
         let epoch = epoch_from_parts(centuries, ns, ts.into());
+        let epoch_key = epoch.to_tai_duration().to_parts();
 
-        // --- Stage 1: Local frame → astronomical root ---
-        //
-        // Two possible resolutions, checked in priority order:
-        //   a) Resolver placed the frame : isometry is in km (entity pose from ledger)
-        //   b) Passthrough               : original_frame is already an astronomical root
+        // Every isometry below is in km, so coordinates are normalised to km up front.
+        let pos_km = Vector3::new(
+            current_unit.to_km(px),
+            current_unit.to_km(py),
+            current_unit.to_km(pz),
+        );
         let quat_local = UnitQuaternion::from_quaternion(Quaternion::new(qw, qx, qy, qz));
 
-        // Resolved against this row's own epoch, so a batch spanning several timesteps
-        // gets the pose that was current at each one.
-        let epoch_key = epoch.to_tai_duration().to_parts();
-        let dynamic = resolve_dynamic_frame.and_then(|resolve| {
-            *dynamic_cache
-                .entry((original_frame_id, epoch_key))
-                .or_insert_with(|| resolve(original_frame_id, epoch))
-        });
-
-        let (root_frame_id, pos_root, quat_root) = if let Some((root, iso)) = dynamic {
-            // Resolved: isometry in km; normalize coordinates to km first.
-            let pos_km = Point3::new(
-                current_unit.to_km(px),
-                current_unit.to_km(py),
-                current_unit.to_km(pz),
-            );
-            let pos_root = (iso * pos_km).coords;
-            let quat_root = iso.rotation * quat_local;
-            (root, pos_root, quat_root)
+        let (pos_target, quat_target, est_out) = if original_frame_id == target {
+            // Already in the target frame: nothing is composed, so nothing is derived. Only
+            // the units change, and the estimate type is the row's own.
+            (pos_km, quat_local, est)
         } else {
-            // Passthrough: original_frame_id is an astronomical root already.
-            let pos_root = Vector3::new(
-                current_unit.to_km(px),
-                current_unit.to_km(py),
-                current_unit.to_km(pz),
-            );
-            (original_frame_id, pos_root, quat_local)
-        };
+            // --- Stage 1: row frame → its root (rootA) ---
+            //
+            // Two possible resolutions, checked in priority order:
+            //   a) Resolver placed the frame: isometry in km (entity pose chain)
+            //   b) Passthrough: original_frame_id is a root already
+            let source = resolve_dynamic_frame
+                .and_then(|resolve| {
+                    resolve_cached(
+                        &mut dynamic_cache,
+                        resolve,
+                        original_frame_id,
+                        epoch,
+                        epoch_key,
+                    )
+                })
+                .unwrap_or_else(|| ResolvedFrame::identity(original_frame_id));
+            let pos_a = (source.iso_km * Point3::from(pos_km)).coords;
+            let quat_a = source.iso_km.rotation * quat_local;
 
-        // --- Stage 2 & 3: Dynamic transform (astronomical root → target) via Almanac ---
-        //
-        // Root ids are always terminal astronomical identifiers: "ICRF", "IAU_EARTH",
-        // "IAU_TITAN", etc. KIND_SOLOC ids are resolved before reaching this point and
-        // never appear here as a root.
-        let root_frame = match root_cache.get(&root_frame_id) {
-            Some(frame) => *frame,
-            None => {
-                let frame = resolve_root_frame(root_frame_id, epoch)?;
-                root_cache.insert(root_frame_id, frame);
-                frame
-            }
-        };
-
-        // almanac.translate(from, to, epoch) → radius_km is the position of `from`'s origin
-        // relative to `to`'s origin, in J2000 axes whatever either frame's orientation (the
-        // raw SPK data, unrotated).
-        let translation = almanac
-            .translate(root_frame, target_frame, epoch, None)
-            .map_err(|e| {
-                let root = root_display(root_frame_id);
-                format!("Anise translate error ('{root}' → '{target_frame_name}'): {e}")
-            })?;
-        let pos_root_wrt_target = translation.radius_km;
-
-        // almanac.rotate(from, to) → DCM R such that v_target = R * v_root
-        let dcm = almanac
-            .rotate(root_frame, target_frame, epoch)
-            .map_err(|e| {
-                let root = root_display(root_frame_id);
-                format!("Anise rotate error ('{root}' → '{target_frame_name}'): {e}")
-            })?;
-        let rot_matrix: Rotation3<f64> = Rotation3::from_matrix_unchecked(dcm.rot_mat);
-        let rot_quat: UnitQuaternion<f64> = UnitQuaternion::from_rotation_matrix(&rot_matrix);
-
-        // The translation is in J2000 axes, so it needs its own rotation into the target's:
-        // identity for a J2000-aligned target, unneeded when the origins coincide (the
-        // translation is zero, and an almanac without orientation data still works), else
-        // one lookup per epoch.
-        let j2000_to_target = if target_frame.orientation_id == J2000
-            || root_frame.ephem_origin_match(target_frame)
-        {
-            Rotation3::identity()
-        } else {
-            match j2000_cache.get(&epoch_key) {
-                Some(rot) => *rot,
+            // --- Target placement: target → its root (rootB) ---
+            let target_chain = match fixed_target {
+                Some(fixed) => fixed,
                 None => {
-                    let dcm = almanac
-                        .rotate(target_frame.with_orient(J2000), target_frame, epoch)
-                        .map_err(|e| {
-                            format!("Anise rotate error ('J2000' → '{target_frame_name}'): {e}")
-                        })?;
-                    let rot = Rotation3::from_matrix_unchecked(dcm.rot_mat);
-                    j2000_cache.insert(epoch_key, rot);
-                    rot
+                    // Checked non-None above whenever the target is an entity.
+                    let resolve = resolve_dynamic_frame.ok_or_else(|| {
+                        format!("No frame resolver for target {}", root_display(target))
+                    })?;
+                    resolve_cached(&mut dynamic_cache, resolve, target, epoch, epoch_key)
+                        .ok_or_else(|| {
+                            format!(
+                                "Target frame {} could not be resolved at {epoch}: no pose \
+                                 chain to an astronomical root",
+                                root_display(target)
+                            )
+                        })?
                 }
-            }
-        };
+            };
 
-        // Compose final position and orientation (all quantities in km at this point)
-        let pos_target = rot_matrix * pos_root + j2000_to_target * pos_root_wrt_target;
-        let quat_target = rot_quat * quat_root;
+            // --- Stages 2 & 3: rootA → rootB via Almanac ---
+            //
+            // A shared root means the whole transform is local to one tree: the almanac
+            // would contribute an exact identity, so it is not consulted at all.
+            let (pos_b, quat_b) = if source.root == target_chain.root {
+                (pos_a, quat_a)
+            } else {
+                let frame_a = root_frame_cached(&mut root_cache, source.root, epoch)?;
+                let frame_b = root_frame_cached(&mut root_cache, target_chain.root, epoch)?;
+                let anise_err = |op: &str, e: &dyn std::fmt::Display| {
+                    format!(
+                        "Anise {op} error ('{}' → '{}'): {e}",
+                        root_display(source.root),
+                        root_display(target_chain.root)
+                    )
+                };
+
+                // almanac.translate(from, to, epoch) → radius_km is the position of `from`'s
+                // origin relative to `to`'s origin, in J2000 axes whatever either frame's
+                // orientation (the raw SPK data, unrotated).
+                let translation = almanac
+                    .translate(frame_a, frame_b, epoch, None)
+                    .map_err(|e| anise_err("translate", &e))?;
+                let pos_a_wrt_b = translation.radius_km;
+
+                // almanac.rotate(from, to) → DCM R such that v_b = R * v_a
+                let dcm = almanac
+                    .rotate(frame_a, frame_b, epoch)
+                    .map_err(|e| anise_err("rotate", &e))?;
+                let rot_matrix: Rotation3<f64> = Rotation3::from_matrix_unchecked(dcm.rot_mat);
+                let rot_quat: UnitQuaternion<f64> =
+                    UnitQuaternion::from_rotation_matrix(&rot_matrix);
+
+                // The translation is in J2000 axes, so it needs its own rotation into rootB's:
+                // identity for a J2000-aligned rootB, unneeded when the origins coincide (the
+                // translation is zero, and an almanac without orientation data still works),
+                // else one lookup per (rootB, epoch).
+                let j2000_to_b =
+                    if frame_b.orientation_id == J2000 || frame_a.ephem_origin_match(frame_b) {
+                        Rotation3::identity()
+                    } else {
+                        match j2000_cache.get(&(target_chain.root, epoch_key)) {
+                            Some(rot) => *rot,
+                            None => {
+                                let dcm = almanac
+                                    .rotate(frame_b.with_orient(J2000), frame_b, epoch)
+                                    .map_err(|e| {
+                                        format!(
+                                            "Anise rotate error ('J2000' → '{}'): {e}",
+                                            root_display(target_chain.root)
+                                        )
+                                    })?;
+                                let rot = Rotation3::from_matrix_unchecked(dcm.rot_mat);
+                                j2000_cache.insert((target_chain.root, epoch_key), rot);
+                                rot
+                            }
+                        }
+                    };
+
+                (
+                    rot_matrix * pos_a + j2000_to_b * pos_a_wrt_b,
+                    rot_quat * quat_a,
+                )
+            };
+
+            // --- Stage 4: rootB → target, by the inverse of the target's own chain ---
+            // The identity for an astronomical target.
+            let to_target = target_chain.iso_km.inverse();
+            let pos_t = (to_target * Point3::from(pos_b)).coords;
+            let quat_t = to_target.rotation * quat_b;
+
+            let est_out = est
+                .worst(source.estimate)
+                .worst(target_chain.estimate)
+                .derived();
+            (pos_t, quat_t, est_out)
+        };
 
         // Convert position back to the requested output unit
         let pos_out = pos_target.map(|v| target_unit.from_km(v));
 
-        // TODO(covariance): transform_batch does not currently propagate position_covariance
-        // or orientation_covariance. Transforming covariance requires applying the rotation
-        // Jacobian: C' = R·C·Rᵀ. Until implemented, covariance is set to null in the output
-        // to avoid silently producing covariance expressed in the wrong frame.
+        // TODO(covariance): transform_batch_to does not currently propagate
+        // position_covariance or orientation_covariance. Transforming covariance requires
+        // applying the rotation Jacobian: C' = R·C·Rᵀ, plus each composed pose's covariance.
+        // Until implemented, covariance is set to null in the output to avoid silently
+        // producing covariance expressed in the wrong frame.
         sts_builder.append_spacetimestamp(
-            target_frame_id,
+            target,
             target_unit,
             ts,
             source_id,
-            est,
+            est_out,
             [pos_out.x, pos_out.y, pos_out.z],
             [quat_target.w, quat_target.i, quat_target.j, quat_target.k],
             centuries,
@@ -437,7 +578,7 @@ mod tests {
             placements
                 .iter()
                 .find(|(id, _, _)| *id == frame)
-                .map(|(_, root, iso)| (*root, *iso))
+                .map(|(_, root, iso)| ResolvedFrame::new(*root, *iso, EstimateType::MEASURED))
         }
     }
 
