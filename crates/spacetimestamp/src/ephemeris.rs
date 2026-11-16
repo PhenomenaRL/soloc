@@ -204,8 +204,9 @@ pub fn registrable_frame_names() -> impl Iterator<Item = &'static str> {
 
 /// Resolves a bare astronomical frame name to an anise [`Frame`].
 ///
-/// Thin wrapper over [`frame_pair`]. Kept for the name-based `transform_batch` target path
-/// until frame resolution moves to ids.
+/// Thin wrapper over [`frame_pair`]. Test-only: production code resolves frames from the
+/// `(ephemeris_id, orientation_id)` pair embedded in a [`PrescribedId`](crate::PrescribedId).
+#[cfg(test)]
 pub(crate) fn resolve_astronomical_frame(name: &str) -> Option<Frame> {
     frame_pair(name).map(|(e, o)| Frame::new(e, o))
 }

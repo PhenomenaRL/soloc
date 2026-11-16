@@ -168,7 +168,7 @@ fn build_validate_derive_topology_and_transform_without_a_ledger() {
     //       to transform into another reference frame.
     let result = transform_batch(
         &batch,
-        "Earth",
+        earth(),
         &Almanac::default(),
         LengthUnit::km,
         Some(&resolve),

@@ -12,7 +12,7 @@
 //! schemas::entity::EntityBuilder   build a batch in native frames and units
 //!   -> validation::validate_spacetimestamp_batch   check frames and timescales
 //!   -> topology::TransformTree::ingest_batch       derive who is parented to whom
-//!   -> transforms::transform_batch_to              reproject into any frame in the topology
+//!   -> transforms::transform_batch                 reproject into any frame in the topology
 //!   -> query::filter_batch                         filter in space and time
 //! ```
 //!

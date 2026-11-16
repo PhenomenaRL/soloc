@@ -108,7 +108,7 @@ impl ResolvedFrame {
 }
 
 /// Resolves a [`KIND_SOLOC`](crate::identity::KIND_SOLOC) frame id at a given epoch to its
-/// chain root: see [`transform_batch_to`].
+/// chain root: see [`transform_batch`].
 pub type DynamicFrameResolver<'a> = &'a dyn Fn(PrescribedId, Epoch) -> Option<ResolvedFrame>;
 
 /// Resolves an astronomical root id to the `anise` [`Frame`] it embeds.
@@ -170,32 +170,6 @@ fn resolve_cached(
         .or_insert_with(|| resolve(frame, epoch))
 }
 
-/// Reprojects the `spacetimestamp` struct column of a batch into the astronomical frame
-/// named `target_frame_name`.
-///
-/// Name-based convenience over [`transform_batch_to`], which also accepts entity targets.
-/// Errors if the name is not a recognised astronomical frame.
-pub fn transform_batch(
-    batch: &RecordBatch,
-    target_frame_name: &str,
-    almanac: &Almanac,
-    target_unit: LengthUnit,
-    resolve_dynamic_frame: Option<DynamicFrameResolver<'_>>,
-) -> Result<RecordBatch, String> {
-    // Also handles "IAU_BODY" strings (e.g. "IAU_EARTH") by mapping to the corresponding anise
-    // body-fixed frame.
-    let target_frame =
-        crate::ephemeris::resolve_astronomical_frame(target_frame_name).ok_or_else(|| {
-            format!(
-                "Invalid target_frame_name '{}': not recognized by anise",
-                target_frame_name
-            )
-        })?;
-    let target =
-        PrescribedId::astronomical(target_frame.ephemeris_id, target_frame.orientation_id)?;
-    transform_batch_to(batch, target, almanac, target_unit, resolve_dynamic_frame)
-}
-
 /// Reprojects the `spacetimestamp` struct column of a batch into `target`: an astronomical
 /// frame, or any [`KIND_SOLOC`](crate::identity::KIND_SOLOC) entity the resolver can place.
 ///
@@ -217,7 +191,7 @@ pub fn transform_batch(
 /// The whole batch fails if `target` is an abstract id, if `target` is an entity and either
 /// no resolver is given or it cannot place `target` at some row's epoch, or if any row's
 /// chain cannot be carried to the target's root.
-pub fn transform_batch_to(
+pub fn transform_batch(
     batch: &RecordBatch,
     target: PrescribedId,
     almanac: &Almanac,
@@ -413,7 +387,7 @@ pub fn transform_batch_to(
         // Convert position back to the requested output unit
         let pos_out = pos_target.map(|v| target_unit.from_km(v));
 
-        // TODO(covariance): transform_batch_to does not currently propagate
+        // TODO(covariance): transform_batch does not currently propagate
         // position_covariance or orientation_covariance. Transforming covariance requires
         // applying the rotation Jacobian: C' = R·C·Rᵀ, plus each composed pose's covariance.
         // Until implemented, covariance is set to null in the output to avoid silently
@@ -634,7 +608,7 @@ mod tests {
         )]);
         let result = transform_batch(
             &batch,
-            "Earth",
+            PrescribedId::astronomical_from_name("Earth").unwrap(),
             &Almanac::default(),
             LengthUnit::km,
             Some(&resolver),
@@ -678,7 +652,7 @@ mod tests {
         )]);
         let result = transform_batch(
             &batch,
-            "Earth",
+            PrescribedId::astronomical_from_name("Earth").unwrap(),
             &Almanac::default(),
             LengthUnit::km,
             Some(&resolver),
@@ -730,7 +704,7 @@ mod tests {
         )]);
         let result = transform_batch(
             &batch,
-            "Earth",
+            PrescribedId::astronomical_from_name("Earth").unwrap(),
             &Almanac::default(),
             LengthUnit::km,
             Some(&resolver),
@@ -802,7 +776,7 @@ mod tests {
         )]);
         let result = transform_batch(
             &batch,
-            "Earth",
+            PrescribedId::astronomical_from_name("Earth").unwrap(),
             &Almanac::default(),
             LengthUnit::km,
             Some(&resolver),
@@ -836,8 +810,14 @@ mod tests {
         );
 
         let batch = make_sts_batch(&mut builder);
-        let result =
-            transform_batch(&batch, "Earth", &Almanac::default(), LengthUnit::km, None).unwrap();
+        let result = transform_batch(
+            &batch,
+            PrescribedId::astronomical_from_name("Earth").unwrap(),
+            &Almanac::default(),
+            LengthUnit::km,
+            None,
+        )
+        .unwrap();
 
         let pos = read_output_pos(&result, 0);
         assert!(
@@ -885,8 +865,14 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(sts)]).unwrap();
 
-        let result = transform_batch(&batch, "Earth", &Almanac::default(), LengthUnit::km, None)
-            .expect("metadata alone must not fail the rebuild");
+        let result = transform_batch(
+            &batch,
+            PrescribedId::astronomical_from_name("Earth").unwrap(),
+            &Almanac::default(),
+            LengthUnit::km,
+            None,
+        )
+        .expect("metadata alone must not fail the rebuild");
         assert_eq!(read_output_pos(&result, 0), [1.0, 0.0, 0.0]);
     }
 
@@ -1118,7 +1104,8 @@ mod tests {
             None,
         );
         let batch = make_sts_batch(&mut builder);
-        let result = transform_batch(&batch, target, almanac, LengthUnit::km, None).unwrap();
+        let target_id = PrescribedId::astronomical_from_name(target).unwrap();
+        let result = transform_batch(&batch, target_id, almanac, LengthUnit::km, None).unwrap();
         let got = read_output_pos(&result, 0);
 
         let state = CartesianState::new(
