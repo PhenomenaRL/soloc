@@ -119,6 +119,10 @@ export function buildTreePanel(
       (children.get(key) ?? children.set(key, []).get(key)!).push(id);
 
       const vis = nodes.get(id)!;
+      const available = !vis.isEntity || viewer.isAvailable(id);
+      vis.g.style.opacity = available ? "1" : "0.45";
+      vis.text.textContent = `${label(id)}${available ? "" : " (gap)"}`;
+      vis.edge.style.visibility = available ? "visible" : "hidden";
       if (vis.parent !== key) {
         if (vis.parent !== null) {
           // Restart the flash animation on a genuine re-parent (not first layout).

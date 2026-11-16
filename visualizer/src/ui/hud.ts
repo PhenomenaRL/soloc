@@ -75,7 +75,9 @@ export function buildHud(
   return (t: bigint) => {
     for (const [id, span] of parentSpans) {
       const parent = topo.parentAt(id, t);
-      const text = `← ${parent === undefined ? "—" : displayInfo(parent, names).label}`;
+      const text = viewer.isAvailable(id)
+        ? `← ${parent === undefined ? "—" : displayInfo(parent, names).label}`
+        : "no observation";
       if (span.textContent !== text) {
         span.textContent = text;
         span.classList.remove("changed");

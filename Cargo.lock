@@ -3172,10 +3172,12 @@ version = "0.1.0"
 dependencies = [
  "anise",
  "arrow",
+ "chrono",
  "criterion",
  "hifitime",
  "log",
  "nalgebra",
+ "quick-xml",
  "sha2 0.11.1",
  "test-log",
 ]

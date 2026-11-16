@@ -100,6 +100,7 @@ const ASTRO_FRAMES: ReadonlyArray<readonly [string, number, number]> = [
   ["SSB", 0, 1],
   ["GCRF", 399, 1],
   ["EME2000", 399, 1],
+  ["ITRF93", 399, 3000],
   ["EMB", 3, 1],
   ["MERCURY_BARYCENTER", 1, 1],
   ["VENUS_BARYCENTER", 2, 1],

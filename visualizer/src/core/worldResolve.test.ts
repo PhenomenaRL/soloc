@@ -85,6 +85,18 @@ describe("WorldResolver.worldPoseAt", () => {
     expect(r.worldPoseAt("ICRF", 0n)).toEqual({ p: [0, 0, 0], q: [1, 0, 0, 0] });
   });
 
+  it("refuses to resolve an unavailable GPX frame or its child as a held pose", () => {
+    const r = new WorldResolver(timelines({
+      gps: [
+        { epochNs: 0n, rowIndex: 0, gpx: { source: "x", object: "track:1", segment: 1n, point: 1n } },
+        { epochNs: 10n, rowIndex: 1, gpx: { source: "x", object: "track:1", segment: 2n, point: 1n } },
+      ],
+      child: [{ epochNs: 0n, frameId: "gps" }],
+    }));
+    expect(() => r.worldPoseAt("gps", 5n)).toThrow("no observation");
+    expect(() => r.worldPoseAt("child", 5n)).toThrow("no observation");
+  });
+
   it("applies parent orientation to child offsets", () => {
     const yaw90: [number, number, number, number] = [Math.SQRT1_2, 0, 0, Math.SQRT1_2];
     const r = new WorldResolver(

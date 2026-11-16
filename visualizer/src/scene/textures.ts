@@ -57,6 +57,37 @@ export function bodySphereGeometry(radiusKm: number, widthSegments = 48): Sphere
   return geom;
 }
 
+export const WGS84_A_KM = 6_378.137;
+export const WGS84_B_KM = WGS84_A_KM * (1 - 1 / 298.257223563);
+
+/**
+ * WGS84 surface with geographic (geodetic) latitude in the texture's V axis.
+ * Scaling a sphere's Z axis alone assigns reduced latitude to the texture and
+ * misplaces midlatitude points by kilometres. Use the same ellipsoid equations
+ * as the GPS adapter; stored observations are never moved to fit the mesh.
+ * As with every finite mesh, triangles approximate the curved surface.
+ */
+export function earthEllipsoidGeometry(widthSegments = 512): SphereGeometry {
+  const geometry = bodySphereGeometry(1, widthSegments);
+  const positions = geometry.getAttribute("position");
+  const normals = geometry.getAttribute("normal");
+  const uv = geometry.getAttribute("uv");
+  const e2 = 1 - (WGS84_B_KM / WGS84_A_KM) ** 2;
+  for (let i = 0; i < positions.count; i++) {
+    const latitude = (uv.getY(i) - 0.5) * Math.PI;
+    const longitude = (uv.getX(i) - 0.5) * Math.PI * 2;
+    const sinLat = Math.sin(latitude);
+    const cosLat = Math.cos(latitude);
+    const nx = cosLat * Math.cos(longitude);
+    const ny = cosLat * Math.sin(longitude);
+    const n = WGS84_A_KM / Math.sqrt(1 - e2 * sinLat ** 2);
+    positions.setXYZ(i, n * nx, n * ny, n * (1 - e2) * sinLat);
+    normals.setXYZ(i, nx, ny, sinLat);
+  }
+  geometry.computeBoundingSphere();
+  return geometry;
+}
+
 /**
  * Candidate files for one texture slot, **best first**.
  *
@@ -159,10 +190,8 @@ async function candidateUrls(files: Candidates): Promise<string[]> {
  *
  * Existing is not the same as *working*: a half-finished download is a file of
  * the right name that decodes to nothing, and trusting the filename there costs
- * the whole body its texture — the colour map and the bump map are awaited
- * together, so one bad file blanks both. Trying each in turn and taking the
- * first that actually decodes means a broken drop-in degrades to the CDN map
- * rather than to a flat grey sphere.
+ * the body that texture slot. Trying each in turn and taking the first that
+ * actually decodes means a broken drop-in can still use the CDN copy.
  */
 export async function loadTexture(files: Candidates | string, srgb = true): Promise<Texture> {
   const urls = await candidateUrls(typeof files === "string" ? [files] : files);
@@ -207,26 +236,25 @@ export function setMaxAnisotropy(n: number): void {
  */
 const BUMP_SCALE = 0.5;
 
-/** Swaps a body's flat-color material for its texture set once loaded. */
+/** Apply each texture independently; unavailable relief must not hide a map. */
 export async function applyBodyTextures(mesh: Mesh, bodyKey: string): Promise<void> {
   const entry = BODY_TEXTURES[bodyKey];
   if (!entry) return;
   const mat = mesh.material as MeshStandardMaterial | MeshBasicMaterial;
-  try {
-    const [map, bump] = await Promise.all([
-      loadTexture(entry.map),
-      entry.bump ? loadTexture(entry.bump, false) : Promise.resolve(null),
-    ]);
-    mat.map = map;
-    mat.color.set(0xffffff);
-    if (bump && "bumpMap" in mat) {
-      mat.bumpMap = bump;
-      mat.bumpScale = BUMP_SCALE;
-    }
-    mat.needsUpdate = true;
-  } catch {
-    /* offline / CDN blocked: keep the flat color */
-  }
+  await Promise.allSettled([
+    loadTexture(entry.map).then((map) => {
+      mat.map = map;
+      mat.color.set(0xffffff);
+      mat.needsUpdate = true;
+    }),
+    entry.bump && "bumpMap" in mat
+      ? loadTexture(entry.bump, false).then((bump) => {
+          mat.bumpMap = bump;
+          mat.bumpScale = BUMP_SCALE;
+          mat.needsUpdate = true;
+        })
+      : Promise.resolve(),
+  ]);
 }
 
 /** Saturn's rings: real proportions, radial UVs, alpha from the ring pattern. */

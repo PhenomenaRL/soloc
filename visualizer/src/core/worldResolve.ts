@@ -31,7 +31,8 @@ export class WorldResolver {
     if (depth > 16) return IDENTITY; // cycle guard; validated data never hits it
     const tl = this.timelines.get(id);
     if (!tl) return IDENTITY;
-    const st = tl.at(epoch); // hand-offs resolve to the held pose — fine here
+    const st = tl.sampleAt(epoch); // hand-offs resolve to the held pose — fine here
+    if (!st) throw new Error(`frame ${id} has no observation at this epoch`);
     const parent = this.worldPoseAt(st.frame, epoch, depth + 1);
     return {
       p: add(parent.p, rotateVec(parent.q, st.positionKm)),

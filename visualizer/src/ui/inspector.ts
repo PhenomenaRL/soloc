@@ -44,6 +44,11 @@ export function buildInspector(container: HTMLElement, viewer: Viewer): Inspecto
       lastKey = "";
       return;
     }
+    if (!viewer.isAvailable(node.id)) {
+      body.textContent = "No observation in this interval (GPX segment gap or outside coverage).";
+      lastKey = "";
+      return;
+    }
     const row = node.row;
     const key = `${id}:${row.rowIndex}`;
     if (key === lastKey) return; // same driving row — no DOM churn during playback
@@ -75,6 +80,14 @@ export function buildInspector(container: HTMLElement, viewer: Viewer): Inspecto
       ["state_cov", row.stateCovariance ? `21 values, σ_pos ≈ ${fmt(Math.sqrt(Math.abs(row.stateCovariance[0] ?? 0)))} ${row.unitsPos}` : null],
       ["row #", String(row.rowIndex)],
     ];
+    if (row.gpx) {
+      kv.push(
+        ["GPX source", row.gpx.source],
+        ["GPX object", row.gpx.object],
+        ["GPX segment", row.gpx.segment?.toString() ?? null],
+        ["GPX point", row.gpx.point.toString()],
+      );
+    }
 
     body.textContent = "";
     const head = document.createElement("div");

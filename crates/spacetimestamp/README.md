@@ -25,15 +25,17 @@ the two covariance columns.
 | `estimate_type` | `UInt8` · `soloc.estimate_type` | how the row was arrived at |
 | `position` | `FixedSizeList(3, f64)` | `[x, y, z]` translation |
 | `quaternion` | `FixedSizeList(4, f64)` | `[w, x, y, z]` orientation |
-| `duration_centuries` | `Int16` | whole-centuries half of the epoch offset from J2000 TAI |
-| `duration_ns` | `UInt64` | sub-century nanosecond remainder of the offset |
+| `duration_centuries` | `Int16` | whole-centuries half of the epoch offset from the tagged timescale's J2000 reference |
+| `duration_ns` | `UInt64` | sub-century nanosecond remainder of that offset |
 | `position_covariance` | `FixedSizeList(6, f64)` *(nullable)* | upper triangle of the 3×3 position covariance |
 | `orientation_covariance` | `FixedSizeList(6, f64)` *(nullable)* | upper triangle of the 3×3 orientation covariance (axis-angle) |
 
-Epochs are a two-part offset from the **J2000 TAI** reference (`2000-01-01T12:00:00 TAI`): whole
-centuries in `duration_centuries`, the remainder in `duration_ns`, reconstructed with the row's own
-`timescale_id`. Rows are built with `SpaceTimestampBuilder` and read back with `StsColumns`, which
-accepts both the nested (struct-column) and flat layouts.
+Epochs are two-part offsets from `2000-01-01T12:00:00` in the declared `timescale_id`:
+whole centuries in `duration_centuries`, the remainder in `duration_ns`. New normalized
+rows use **J2000 TAI**, so both parts represent continuous elapsed time. Legacy UTC rows
+advance the UTC clock and omit inserted leap seconds; normalization applies the UTC
+offset at the observation date. Rows are built with `SpaceTimestampBuilder` and read
+back with `StsColumns`, which accepts both nested (struct-column) and flat layouts.
 
 ### The reference `entity` schema
 
@@ -105,6 +107,7 @@ let robot  = PrescribedId::new("acme.com", "radar_boresight")?;
 
 // Astronomical id: embeds anise's (ephemeris_id, orientation_id) pair directly — not a hash.
 let earth  = PrescribedId::astronomical(399, 399)?;   // Earth == IAU_EARTH
+let itrf93 = PrescribedId::astronomical(399, 3000)?;  // ITRF93, distinct Earth-fixed axes
 let icrf   = PrescribedId::astronomical(0, 1)?;        // ICRF == J2000 == SSB
 let (e, o) = earth.astro_frame().unwrap();             // (399, 399) — read straight back out
 
@@ -168,6 +171,389 @@ and the name registry. Both are **idempotent, all-or-nothing, and replayable**:
 The pose *data* itself, `current_state`, spatiotemporal queries, and `entity_id` subsetting, 
 federates one level up in [`soloc-ledger`](../soloc-ledger/). A peer that receives an exported log
 gets **structure only**; poses stay with their owner.
+
+## ITRF93 Earth frame
+
+`PrescribedId::astronomical_from_name("ITRF93")` resolves to `(399, 3000)` and UUID
+`0000018f-0000-8000-8000-000bb8000000`. `Earth` and `IAU_EARTH` retain `(399, 399)`.
+Use ANISE's orientation ID `3000`, not the SPICE frame code `13000`.
+
+Already-correct Cartesian ITRF93 observations can be validated, stored, queried, and
+converted between length units without kernels. `transform_batch` supports ITRF93 as
+either source or target, including entity frames rooted in it. The necessary loaded data
+depends on the requested transformation:
+
+| Transformation | Required data |
+|---|---|
+| ITRF93 → ITRF93 (including unit changes) | None |
+| ITRF93 ↔ GCRF | Earth high-precision binary PCK (`.bpc`) |
+| ITRF93 ↔ Earth / IAU_EARTH | Earth BPC plus ANISE planetary constants (`pck11.pca`) |
+| ITRF93 ↔ ICRF | Earth BPC plus SPK ephemerides connecting Earth to the solar-system barycenter (e.g. `de440s.bsp`) |
+
+Each row's observation epoch must be covered by a usable BPC segment and, when needed,
+the SPK data. Unknown target names produce a catalog error; absent Earth BPC data and
+uncovered epochs produce distinct errors with the row index (zero-based), epoch, and
+frames. Other ANISE failures retain their underlying explanation. No alternative frame
+is substituted. See [server kernel configuration](../soloc-server/README.md#itrf93-kernel-configuration).
+
+The required integration tests use explicit local PCA/BPC files covering January 1, 2020
+and January 1, 2025, through 12:00 UTC. They are ignored in the default suite and never download data;
+an explicit invocation fails if its files or coverage are missing:
+
+```bash
+SOLOC_KERNEL_PATHS=/path/pck11.pca:/path/earth_high_prec_snapshot.bpc \
+  cargo test -p spacetimestamp --test itrf93_transforms -- --ignored
+```
+
+The suite includes eight frozen **CSPICE** rotation matrices covering both directions
+of ITRF93 ↔ IAU_EARTH and ITRF93 ↔ GCRF at two epochs, checking positions and every
+attitude axis. The [reference provenance and regeneration instructions](tests/fixtures/earth_orientation/README.md)
+record tool versions, kernel hashes, time conventions and tolerances. CSPICE evaluates
+the shared Earth data independently of ANISE; this checks implementation agreement,
+not independent physical measurements or datum accuracy. The remaining integration
+checks compare Soloc composition against direct ANISE rotations, including missing
+data and coverage failures. See the [full acceptance commands](../soloc-ledger/README.md#gpsgpx-acceptance-checks)
+for ledger/export and browser checks as well.
+
+## GPS coordinate and time conversion
+
+`gps::wgs84_to_ecef_m(latitude_deg, longitude_deg, ellipsoidal_height_m)` converts WGS84
+geodetic coordinates into Earth-centered, Earth-fixed metres without kernels. Latitude
+must be finite and within `[-90, 90]`, longitude within `[-180, 180]`, and height finite.
+Negative height is supported. Height is required and must refer to the WGS84 ellipsoid;
+mean-sea-level height or an unspecified GPX elevation requires an explicit datum decision
+before conversion. Longitude is east-positive and is not automatically wrapped.
+
+`gps::wgs84_to_frame_m(latitude_deg, longitude_deg, ellipsoidal_height_m, epoch, target, almanac)`
+uses an **approximate WGS84 ECEF → ITRF93 mapping for ordinary tracking**, then rotates
+at that observation's epoch if requested. `ITRF93` works with an empty almanac;
+`Earth`/`IAU_EARTH` and `GCRF`/`EME2000` use the data listed above. Other origins such as
+ICRF require the existing batch transform after constructing an Earth-frame observation.
+The approximation applies no realization or epoch-dependent datum correction and offers
+no survey/RTK, sub-metre, or fixed-error guarantee. Numerical test tolerances describe
+calculation error, not measurement or datum accuracy.
+
+Encode observation time using `epoch_to_parts(epoch)` and `TimeScaleCode::TAI`. It converts
+UTC, GPST, and other input epochs to TAI before subtracting J2000, retaining integer
+nanoseconds. `duration_since_j2000_tai(epoch)` provides the equivalent duration for ledger
+comparisons. For example, `2025-01-01T00:00:00 UTC` becomes `00:00:37 TAI` with row parts
+`(0, 788961637000000000)`. Flight's JSON time fields instead use `epoch.to_tai_seconds()`
+from **J1900** (`3944678437` for this instant); row offsets must not be sent directly.
+
+UTC conversion uses the installed hifitime leap-second table. The locked version (4.3.1)
+folds a parsed literal UTC `:60` onto `:59`, so supply inserted-second instants as TAI or
+GPST instead (e.g. `2017-01-01T00:00:36 TAI`). The integer TAI row encoding preserves that
+second and fractional nanoseconds. Text adapters must handle or reject literal `:60`
+explicitly; the optional GPX mapper rejects it before parsing. Existing TAI rows
+produced with the former UTC conversion bug cannot
+be identified or repaired automatically; rebuild affected rows from their original times.
+
+## One GPS observation into the ledger
+
+`gps::gps_observation_to_batch(&fix, &options, &almanac)` converts one fix into a complete
+one-row `EntitySchema` batch, ready for `Ledger::append` or Flight `do_put`. It supplies
+the nested `spacetimestamp`, frame and provenance IDs, metre units, TAI epoch parts,
+position, and quaternion. All optional state and covariances remain null.
+
+```rust
+use anise::prelude::Almanac;
+use soloc_ledger::ledger::Ledger;
+use spacetimestamp::gps::{GpsObservation, GpsOptions, GpsOrientation, gps_observation_to_batch};
+use spacetimestamp::schemas::entity::EntitySchema;
+use spacetimestamp::PrescribedId;
+
+let fix = GpsObservation {
+    latitude_deg: 44.6488,
+    longitude_deg: -63.5752,
+    ellipsoidal_height_m: 12.0,
+    epoch: "2025-01-01T00:00:00 UTC".parse()?,
+    orientation: GpsOrientation::LocalEnu,
+};
+let options = GpsOptions::new(
+    PrescribedId::new("example.org", "vessel-1")?,
+    PrescribedId::abstract_source("example.org", "gps-receiver")?,
+);
+let batch = gps_observation_to_batch(&fix, &options, &Almanac::default())?;
+let mut ledger = Ledger::for_schema::<EntitySchema>()?;
+ledger.append(batch)?;
+let latest = ledger.current_state(None, None)?;
+```
+
+Reuse the same options/entity ID across successive fixes. `GpsOptions::new` selects
+approximate ITRF93 and `ESTIMATED`; its public fields allow another supported Earth
+frame and estimate type. The tracked entity must have a Soloc ID. Its source may be a
+Soloc receiver or abstract provenance ID, including the same Soloc ID for a self-report.
+
+Orientation is always an explicit choice:
+
+| Policy | Meaning |
+|---|---|
+| `GpsOrientation::LocalEnu` | Conventional east/north/up axes at the fix, not vehicle attitude. Requires `ESTIMATED` or `SIMULATED`; `MEASURED` returns an error because the schema's estimate type applies to the whole pose. At a pole, the supplied longitude selects east/north. |
+| `GpsOrientation::QuaternionInEnu([w, x, y, z])` | Caller-supplied rotation from entity axes into local ENU. Requires finite components and norm within `1e-6` of one; roundoff is normalized. `MEASURED` is appropriate only when both position and attitude were measured. |
+
+Both position and orientation use the same Earth rotation at the fix's epoch. A frame
+change never leaves the quaternion expressed in the previous axes. Height and epoch
+are required inputs; unknown elevation, vertical datum, or time must be resolved before
+conversion. The ordinary-tracking approximation and leap-second parsing limits above
+also apply to this API.
+
+For a batch of fixes, `gps::convert_gps_observation` returns a validated
+`ConvertedGpsObservation`. Its accessors expose pose fields for another schema, while
+`append_to(&mut EntityBuilder)` reuses an existing builder and `to_entity_batch()`
+produces a single row. Conversion finishes before any append, so errors cannot insert
+a partial observation. Private result fields preserve validation until it is appended.
+
+`GpsError` distinguishes invalid coordinates, identity, orientation, estimate policy,
+unrepresentable time, invalid frame, and transformation failures. Transform errors carry
+the target frame and epoch. A successful batch submitted to a ledger with a different
+schema receives the ledger's existing recoverable schema-mismatch error.
+
+Typical failures and the caller's next action:
+
+| Input | Result and recovery |
+|---|---|
+| Latitude `91` or a non-finite coordinate | `GpsError::InvalidCoordinates`; fix the source input before submitting. |
+| `LocalEnu` with `MEASURED` | `GpsError::InvalidEstimateType`; declare `ESTIMATED`/`SIMULATED`, or supply an actual measured attitude. |
+| `GCRF` with no Earth BPC | `GpsError::Transform` identifies the target, epoch and missing orientation data; load covering data or deliberately store native ITRF93. No fallback is applied automatically. |
+| Epoch outside the loaded BPC | A coverage error; provide a kernel covering the observation instant. Startup-date coverage is insufficient. |
+| GPX point missing `<ele>` or `<time>` | Contextual `GpxError` under required-field policies; correct the input or select an explicit supported height/scheduling policy. |
+| Flight batch exceeds the configured message cap | Rejected before submission; explicitly reduce the batch size or raise both client/server caps. |
+
+These are recoverable errors. Conversion finishes before any observation is appended;
+an importer may already have submitted earlier batches, so inspect its report before
+retrying. The [complete runnable workflow and acceptance checks](../soloc-ledger/README.md#gpsgpx-workflow)
+exercise the public API through querying and persistence.
+
+### Earth-relative playback frames
+
+`gps::itrf93_frame_snapshot(&almanac, epoch)` returns one ordinary entity row posing
+ITRF93 relative to **GCRF**, with zero translation and the kernel-derived rotation.
+It uses metres, J2000 TAI, `ESTIMATED`, and source `anise:almanac`; optional state stays
+unknown. Append these display frame samples alongside native ITRF93 observations
+to resolve `receiver → ITRF93 → GCRF`. GCRF is an Earth-centred root, not the
+solar-system barycentre. No relabelling or alteration of the observations is needed.
+
+Only an Earth BPC is required. `gps::check_itrf93_interval(&almanac, start, end)`
+checks continuous segment coverage, including internal gaps and actual kernel
+selection; every snapshot still evaluates its selected kernel. Sample both ends
+of the route, observation times, and intermediate epochs at a short cadence.
+Interpolation is a display approximation. The viewer's terrestrial mesh should
+use the ITRF93 anchor; the canonical `Earth` ID continues to mean IAU_EARTH.
+
+## GPX tracks and routes (optional)
+
+Enable `spacetimestamp`'s **`gpx` feature** to use `gps::gpx`. XML/calendar parsing
+dependencies are optional; the basic GPS API does not require this feature.
+
+```toml
+spacetimestamp = { path = "../spacetimestamp", features = ["gpx"] }
+```
+
+`GpxReader::new(reader, source_name, waypoint_policy)` accepts a `BufRead` and yields
+`Result<GpxEvent, GpxError>` incrementally. It supports GPX **1.1** with namespace
+`http://www.topografix.com/GPX/1/1`, required `version="1.1"` and `creator`, and the
+`trk/trkseg/trkpt` and `rte/rtept` hierarchy. Namespace prefixes are resolved; a foreign
+element named `time` or `trkpt` is not mistaken for GPX data. GPX 1.0 and unqualified
+documents are rejected. This is a reader for a supported subset, not a complete XSD
+validator (for example, it does not enforce every optional element's XSD ordering).
+It accepts UTF-8 XML 1.0 and rejects DTDs and custom entity declarations.
+The [official GPX 1.1 schema](https://www.topografix.com/GPX/1/1/) defines the format.
+
+`GpxMapper::new(source_name, mappings)` takes an explicit `GpxMapping` for each object
+used. `GpxObjectId::Track(1)` means the first track; `Route(1)` means the first route.
+These one-based ordinals include empty objects and are counted separately by kind.
+They are file context, **not entity IDs**. Supply stable Soloc entity/source IDs in each
+mapping; names never mint identities, and an unmapped object fails conversion. Several
+objects may deliberately map to the same entity if the caller knows they describe it.
+
+```rust
+use std::{fs::File, io::BufReader};
+use anise::prelude::Almanac;
+use spacetimestamp::{PrescribedId, gps::{GpsOptions, GpsOrientation, gpx::*}};
+
+let source = "journey.gpx";
+let gps = GpsOptions::new(
+    PrescribedId::new("example.org", "vessel-1")?,
+    PrescribedId::abstract_source("example.org", "gpx-receiver")?,
+);
+let mapper = GpxMapper::new(source, [(GpxObjectId::Track(1), GpxMapping {
+    gps,
+    height: GpxHeightPolicy::EllipsoidalElevation, // caller declares the datum
+    time: GpxTimePolicy::RequireTimestamp,
+    orientation: GpsOrientation::LocalEnu,
+})])?;
+let almanac = Almanac::default(); // default ITRF93 conversion needs no kernels
+for event in GpxReader::new(BufReader::new(File::open(source)?), source, WaypointPolicy::Reject) {
+    match event? {
+        GpxEvent::Point(point) => {
+            let mapped = mapper.convert(&point, &almanac)?;
+            let batch = mapped.converted.to_entity_batch();
+            // Ready for an EntitySchema ledger; keep mapped.point's context/metadata.
+        }
+        // An importer must also retain/report the non-point events as appropriate.
+        _ => {}
+    }
+}
+```
+
+Mapping always calls the existing `convert_gps_observation`: frame/epoch coverage,
+orientation, identity, estimate policy and output-schema rules stay shared. The
+converted pose uses metres and J2000 TAI; all optional state/covariance is null.
+`MappedGpxPoint` keeps the original parsed point, the resulting `GpsObservation`, the
+validated conversion, the selected height policy and whether time was recorded or
+scheduled. `converted.append_to(&mut builder)` permits reuse of an existing builder.
+
+### Explicit import policies
+
+| Input or choice | Behavior |
+|---|---|
+| Standalone `<wpt>` | Required choice: `WaypointPolicy::Reject` fails; `Ignore` reports an ignored subtree without converting it into a track observation. |
+| `EllipsoidalElevation` | Requires `<ele>` and declares it WGS84 ellipsoidal height. Negative heights are allowed. |
+| `ElevationPlusGeoidHeight` | Requires both `<ele>` and `<geoidheight>`; caller declares orthometric height H and compatible geoid undulation N, so h = H + N. The field's presence alone never selects this policy. |
+| `ElevationWithGeoidOffset(N)` | Requires `<ele>` and adds an explicit finite constant undulation. No geoid model or datum is inferred. |
+| `FixedEllipsoidalHeight(h)` | Explicitly overrides all elevations, including missing ones. Requires finite h and rejects `MEASURED` because this is an assumption. |
+| `RequireTimestamp` | Missing `<time>` fails; no current time, default time or interpolation is substituted. |
+| `FillMissing(&schedule)` | Calls a caller-provided `Fn(&GpxPoint) -> Result<Epoch, String>` only for absent times. Such points require `SIMULATED`. Existing times still parse normally, including failure on malformed text. |
+| Duplicates and out-of-order times | Retained exactly in file order. There is no sorting, deduplication or monotonic-time requirement. |
+| Disconnected/empty segments | Explicit start/end events preserve boundaries. Point ordinals restart within each track segment; routes have no segment index. |
+
+For an untimed planned route, provide a schedule explicitly and set the entire mapping
+to `SIMULATED`. For example, `GpxTimePolicy::FillMissing(&schedule)` can use this closure:
+
+```rust
+use hifitime::{Duration, Epoch};
+use spacetimestamp::gps::gpx::GpxPoint;
+let start: Epoch = "2025-01-01T00:00:00 UTC".parse()?;
+let schedule = |point: &GpxPoint| -> Result<Epoch, String> {
+    let index = point.context.point.ok_or("missing point ordinal")?;
+    Ok(start + Duration::from_seconds((index - 1) as f64 * 10.0))
+};
+// Set mapping.gps.estimate_type = EstimateType::SIMULATED;
+// mapping.time = GpxTimePolicy::FillMissing(&schedule);
+```
+
+This example declares a 10-second route schedule; it is not measured timing. A track
+schedule must also account for segment context so it does not bridge gaps accidentally.
+
+### Time, metadata and failures
+
+Point timestamps support four-digit years 0001–9999, uppercase `T`/`Z`, an explicit
+`Z` or `±HH:MM` timezone (maximum ±14:00), seconds 00–59 and 1–9 fractional digits.
+Offsets are converted to the UTC calendar before hifitime constructs the physical
+instant, including across leap-second dates. XML `-00:00` is treated as UTC. Missing
+zones, `24:00`, literal `:60`, impossible dates and precision beyond nanoseconds fail
+explicitly; the parser never truncates extra digits or silently folds a leap second.
+For an inserted-second instant, use the single-observation API with a TAI/GPST Epoch.
+
+Names/descriptions and supported scalar metadata are retained as text: object/document
+metadata as `Metadata` events, point names, descriptions and quality fields in
+`GpxPoint::metadata`. Quality is not translated into covariance, velocity or attitude.
+Unsupported outer elements, including extension subtrees, produce `Ignored` events;
+their payloads are not retained or interpreted. Keep the original file if complete
+provenance is needed. Unsupported attributes, XML comments and processing instructions
+are syntax-checked and discarded without reporting. XML nesting is limited to 128
+elements and retained scalar fields to 1 MiB; the XML reader also buffers an individual
+input event, so this is not a strict process-memory limit. The entity schema itself
+does not store GPX segments or metadata,
+so downstream import/export code must retain that context separately and avoid
+presenting disconnected segments as continuous measured motion.
+
+Malformed XML, invalid required fields and unsupported documents stop the reader after
+one contextual error. Errors identify the source label and available object, segment
+and point ordinals. Empty valid documents/objects are accepted and emit their boundary
+events; empty input is an error. `DocumentEnd` is emitted only after successful EOF,
+so trailing malformed input is not reported as a complete file. A point mapping failure
+does not mutate any builder or ledger; the caller may stop or explicitly record it as
+a skipped point. Points emitted before a later parse error are not rolled back.
+
+### Bounded ingestion and import results
+
+`import_gpx` combines a fresh `GpxReader`, an explicit `GpxMapper`, an almanac,
+`GpxImportOptions`, an append callback, and a provenance observer. The asynchronous
+`import_gpx_async` awaits each submission before reading another batch. Both reuse
+the single-observation converter and `EntityBuilder`, preserve file order and stable
+IDs, and hold one output batch plus current XML/point state. Neither requires the
+whole input or all output rows in memory. The sink and observer control their own
+memory use; the parser's individual-event buffering limits still apply.
+
+`GpxImportOptions::new(max_rows, point_errors)` accepts 1–65,536 rows, defaulting to
+1,024 with `GpxPointErrorPolicy::Strict`. This bounds builder allocation; it does not
+guarantee an encoded Flight message will fit. `SkipInvalid` explicitly skips mapping
+failures such as missing elevation/time. Reader failures, including malformed point
+coordinates and invalid XML, always stop because that reader cannot resume safely.
+The final short batch is submitted only after validated EOF. Batches may span GPX
+objects and segments; this does not join those segments into a continuous trajectory.
+
+```rust,ignore
+// With a fresh reader, mapper, almanac and ledger already constructed:
+use spacetimestamp::gps::gpx::*;
+let report = import_gpx(
+    reader, &mapper, &almanac,
+    GpxImportOptions::new(512, GpxPointErrorPolicy::Strict)?,
+    |batch| ledger.append(batch).map_err(GpxSubmitError::rejected),
+    |event| eprintln!("{event:?}"), // stream context/assumptions to a sidecar
+);
+// Inspect the report even after failure: earlier batches remain appended.
+println!("{report:#?}");
+```
+
+The [ledger adapter and runnable example](../soloc-ledger/README.md) wrap that sink;
+enable `soloc-ledger/gpx`. The [Flight helper and CLI example](../soloc-server/README.md)
+use `soloc-server/gpx` and the existing `do_put` endpoint. There is no dedicated GPS
+RPC. Flight submits one unsplit batch per request and checks the exact protobuf size
+of every message, including the schema, against the caller's configured server limit.
+Oversized batches fail before sending; explicitly reduce `max_rows` or raise both
+limits. A successful request confirms its batch. A request/response failure leaves
+that batch uncertain, since the existing protocol has no commit receipt.
+
+`GpxImportReport` keeps bounded summaries and the last skipped error:
+
+| Field | Meaning |
+|---|---|
+| `read` | Complete point events consumed; excludes a malformed point the reader could not emit. |
+| `converted` | Points successfully converted to entity rows. |
+| `submitted` | Rows whose append was acknowledged by the sink. |
+| `skipped` / `failed` | Mapping failures skipped by policy / the fatal strict mapping failure. |
+| `rejected` | Converted rows the sink guarantees it did not accept. |
+| `uncertain` | Converted rows the sink may have accepted. |
+| `unsubmitted` | Converted rows still buffered at an input/mapping failure, never sent. |
+| `last_submitted` / `pending` | Batch ordinal, row count and original first/last source contexts. |
+| `failure` | Terminal reader, mapping or submission error, with source/batch context. |
+| `complete` | Validated EOF and all output batches acknowledged; skips remain explicit. |
+
+The accounting invariants are `read = converted + skipped + failed` and
+`converted = submitted + rejected + uncertain + unsubmitted`. On early failure,
+these describe the consumed prefix; they do not claim a count for the unread file.
+A reader failure is reported even when it produced no complete point to count.
+The observer receives all original input events, mapped points with their explicit
+identity/frame/height/time/orientation/estimate policies, skipped diagnostics and
+batch outcomes. Conversion events precede acknowledgement. Store them separately
+if needed; the report retains endpoints, not an unbounded per-point log. The report
+also records the source label, batching/error policy and waypoint policy.
+Keep the original input and caller mapping configuration alongside the report and
+observer output when complete provenance is required; the report alone is not a
+per-point record of every policy and diagnostic.
+
+There is **no whole-file transaction or automatic retry**. A later failure preserves
+earlier appends and leaves a pending partial batch unsubmitted. Reimporting the same
+file with the same IDs appends duplicate observations; append-only storage is not
+idempotent. Reconcile uncertain Flight batches before a manual retry. A process
+interruption/cancelled async import can lose the in-memory report, so recovery across
+interruptions needs a caller-owned journal.
+
+Acknowledgement does not promise disk durability or historical retention. A ledger
+memory limit can permanently evict older observations even during small-batch imports.
+Use adequate capacity or explicitly disable eviction for complete-route replay, and
+check retained history with `query`, not just `current_state`. The local example
+disables eviction and checks its single fix and five GPX observations survive. Correct
+Earth-relative visualization and segment-gap playback use the separate
+[playback exporter](../soloc-ledger/README.md#earth-relative-gpx-playback-export),
+which adds kernel-derived frame samples and row provenance without changing
+the original observations' frame semantics.
+
+```bash
+cargo test --locked --offline -p spacetimestamp --features gpx
+```
 
 ## License
 

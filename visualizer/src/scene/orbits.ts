@@ -15,6 +15,7 @@
 
 import type { EntityRow } from "../arrow/loader";
 import { posToKm } from "./units";
+import { gpxContinuousRuns } from "../core/timeline";
 
 export interface GuideLine {
   kind: "circle" | "trail";
@@ -34,6 +35,17 @@ export interface GuideLine {
 }
 
 const CIRCLE_SEGMENTS = 192;
+
+/** GPX trails follow source continuity and never imply a fitted orbit. */
+export function guideLines(rows: readonly EntityRow[], parentFrame: string): GuideLine[] {
+  if (!rows.some((row) => row.gpx)) {
+    const guide = guideLine(rows, parentFrame);
+    return guide ? [guide] : [];
+  }
+  return gpxContinuousRuns(rows).filter((run) => run.length >= 2 && run[0]!.frameId === parentFrame)
+    .map((run) => trail(run.map((row) => posToKm(row.position, row.unitsPos)),
+      run.map((row) => row.epochNs), run[0]!.epochNs));
+}
 
 export function guideLine(rows: readonly EntityRow[], parentFrame: string): GuideLine | null {
   // Only samples expressed in the current parent frame — a re-parented entity's
