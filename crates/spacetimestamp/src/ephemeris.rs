@@ -202,15 +202,6 @@ pub fn registrable_frame_names() -> impl Iterator<Item = &'static str> {
     ASTRO_FRAMES.iter().map(|(name, _, _)| *name)
 }
 
-/// Resolves a bare astronomical frame name to an anise [`Frame`].
-///
-/// Thin wrapper over [`frame_pair`]. Test-only: production code resolves frames from the
-/// `(ephemeris_id, orientation_id)` pair embedded in a [`PrescribedId`](crate::PrescribedId).
-#[cfg(test)]
-pub(crate) fn resolve_astronomical_frame(name: &str) -> Option<Frame> {
-    frame_pair(name).map(|(e, o)| Frame::new(e, o))
-}
-
 // ---------------------------------------------------------------------------
 // CelestialBody
 // ---------------------------------------------------------------------------
@@ -764,6 +755,37 @@ mod tests {
         assert_eq!(frame_pair("ICRF"), Some((0, 1)));
         assert_eq!(frame_pair("icrf"), None, "names are byte-exact");
         assert_eq!(frame_pair("NOT_A_FRAME"), None);
+        assert_eq!(frame_pair("IAU_UNKNOWN"), None);
+        assert_eq!(frame_pair("IAU_"), None);
+        assert_eq!(frame_pair("IAU_earth"), None, "names are byte-exact");
+    }
+
+    /// Pins the NAIF ids of the IAU body-fixed frames, planets and major moons alike.
+    #[test]
+    fn test_iau_frames_use_naif_ids() {
+        let cases = [
+            ("IAU_SUN", 10),
+            ("IAU_MERCURY", 199),
+            ("IAU_VENUS", 299),
+            ("IAU_EARTH", 399),
+            ("IAU_MOON", 301),
+            ("IAU_MARS", 499),
+            ("IAU_JUPITER", 599),
+            ("IAU_SATURN", 699),
+            ("IAU_URANUS", 799),
+            ("IAU_NEPTUNE", 899),
+            ("IAU_TITAN", 606),
+            ("IAU_EUROPA", 502),
+            ("IAU_GANYMEDE", 503),
+            ("IAU_CALLISTO", 504),
+            ("IAU_IO", 501),
+            ("IAU_TRITON", 801),
+            ("IAU_PHOBOS", 401),
+            ("IAU_DEIMOS", 402),
+        ];
+        for (name, naif_id) in cases {
+            assert_eq!(frame_pair(name), Some((naif_id, naif_id)), "{name}");
+        }
     }
 
     #[test]
