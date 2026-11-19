@@ -99,8 +99,8 @@ fn root_display(id: PrescribedId) -> String {
 /// ITRF93 rotation needs an Earth BPC segment covering the actual observation epoch.
 /// A kernel's aggregate date range can span gaps, so query individual segments first.
 /// Identity rotations need no orientation data, even outside any loaded coverage.
-
-/// check weather the required orientation data is available.
+///
+/// Check whether the required orientation data is available.
 fn check_itrf93_coverage(
     almanac: &Almanac,
     from: Frame,
@@ -256,7 +256,7 @@ pub fn transform_batch(
             }
         };
 
-        /// check weather the required orientation data is available.
+        // Check whether the required orientation data is available.
         check_itrf93_coverage(almanac, root_frame, target_frame, epoch).map_err(|e| {
             let root = root_display(root_frame_id);
             format!(
