@@ -1164,6 +1164,10 @@ mod tests {
                 "0000018f000080008000000001000000",
             ),
             (
+                PrescribedId::astronomical(399, 3000).unwrap(),
+                "0000018f000080008000000bb8000000",
+            ),
+            (
                 PrescribedId::astronomical(606, 1).unwrap(),
                 "0000025e000080008000000001000000",
             ),
