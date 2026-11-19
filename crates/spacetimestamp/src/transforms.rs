@@ -99,6 +99,8 @@ fn root_display(id: PrescribedId) -> String {
 /// ITRF93 rotation needs an Earth BPC segment covering the actual observation epoch.
 /// A kernel's aggregate date range can span gaps, so query individual segments first.
 /// Identity rotations need no orientation data, even outside any loaded coverage.
+
+/// check weather the required orientation data is available.
 fn check_itrf93_coverage(
     almanac: &Almanac,
     from: Frame,
@@ -254,6 +256,7 @@ pub fn transform_batch(
             }
         };
 
+        /// check weather the required orientation data is available.
         check_itrf93_coverage(almanac, root_frame, target_frame, epoch).map_err(|e| {
             let root = root_display(root_frame_id);
             format!(
@@ -266,9 +269,16 @@ pub fn transform_batch(
         // raw SPK data, unrotated).
         // Same-origin frames need no SPK data. ANISE's translate fast path only checks
         // full frame equality, so bypass it explicitly for different Earth orientations.
+
+        // Calculate the displacement of the root frame's origin relative to the target
+        // frame's origin, expressed in J2000 coordinates (km).
         let pos_root_wrt_target = if root_frame.ephem_origin_match(target_frame) {
+            // Both frames share the same origin, so no translation is necessary.
+            // Their orientations may still differ (e.g., ITRF93 and GCRF).
             Vector3::zeros()
         } else {
+            // Different origins require SPK ephemeris data to determine their
+            // relative positions at the requested epoch.
             almanac
                 .translate(root_frame, target_frame, epoch, None)
                 .map_err(|e| {
@@ -282,13 +292,18 @@ pub fn transform_batch(
                 .radius_km
         };
 
-        // almanac.rotate(from, to) → DCM R such that v_target = R * v_root
+        // Calculate the rotation from the root frame's coordinate axes into the
+        // target frame's coordinate axes at the requested epoch.
+        // The DCM satisfies: v_target = R_root_to_target * v_root.
         let dcm = almanac
             .rotate(root_frame, target_frame, epoch)
             .map_err(|e| {
                 let root = root_display(root_frame_id);
                 format!("Anise rotate error at row {i}, epoch {epoch} ('{root}' → '{target_frame_name}'): {e}")
             })?;
+
+        // Convert the direction cosine matrix (DCM) into a rotation matrix and
+        // quaternion for transforming positions and orientations, respectively.
         let rot_matrix: Rotation3<f64> = Rotation3::from_matrix_unchecked(dcm.rot_mat);
         let rot_quat: UnitQuaternion<f64> = UnitQuaternion::from_rotation_matrix(&rot_matrix);
 
