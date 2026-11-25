@@ -12,6 +12,8 @@ import type { EntityRow } from "../arrow/loader";
 import { posToKm } from "../scene/units";
 
 export interface PoseState {
+  /** False during GPX segment gaps and outside its observed time range. */
+  available: boolean;
   /** Frame the pose is expressed in (drives scene-graph attachment). */
   frame: string;
   positionKm: [number, number, number];
@@ -32,14 +34,16 @@ export interface PoseState {
 }
 
 export class EntityTimeline {
+  private readonly duplicateEpochs: Set<bigint>;
   constructor(private readonly rows: readonly EntityRow[]) {
     if (rows.length === 0) throw new Error("EntityTimeline needs at least one row");
+    this.duplicateEpochs = repeatedEpochs(rows);
   }
 
-  /** Pose at `t` (ns since J2000 TAI), clamped to the sample range. */
+  /** Legacy rows clamp; GPX rows mark unobserved intervals unavailable. */
   at(t: bigint): PoseState {
     const rows = this.rows;
-    if (t <= rows[0]!.epochNs) return hold(rows[0]!);
+    if (t < rows[0]!.epochNs) return hold(rows[0]!, !rows[0]!.gpx);
 
     // Binary search: last index with epochNs <= t.
     let lo = 0;
@@ -52,7 +56,15 @@ export class EntityTimeline {
     const a = rows[lo]!;
     const b = rows[lo + 1];
 
-    if (!b) return hold(a); // end of window
+    // At a duplicate epoch, the last original-file row wins. No interpolation
+    // enters or leaves the duplicate group; all conflicting rows remain stored.
+    if (t === a.epochNs) return hold(a);
+    if (!b) return hold(a, !a.gpx); // end of window
+
+    if ((a.gpx || b.gpx) && (!gpxRowsConnect(a, b) ||
+        this.duplicateEpochs.has(a.epochNs) || this.duplicateEpochs.has(b.epochNs))) {
+      return hold(a, false);
+    }
 
     const span = Number(b.epochNs - a.epochNs);
     const alpha = span <= 0 ? 0 : Math.min(1, Math.max(0, Number(t - a.epochNs) / span));
@@ -71,6 +83,7 @@ export class EntityTimeline {
     const pa = posToKm(a.position, a.unitsPos);
     const pb = posToKm(b.position, b.unitsPos);
     return {
+      available: true,
       frame: a.frameId,
       positionKm: [
         pa[0] + (pb[0] - pa[0]) * alpha,
@@ -82,6 +95,45 @@ export class EntityTimeline {
       alpha,
     };
   }
+
+  /** An observation-backed pose, or null when GPX declares no continuous path. */
+  sampleAt(t: bigint): PoseState | null {
+    const state = this.at(t);
+    return state.available ? state : null;
+  }
+}
+
+/** Adjacent source points only; sorting by time must never invent a GPX edge. */
+export function gpxRowsConnect(a: EntityRow, b: EntityRow): boolean {
+  return Boolean(a.gpx && b.gpx && a.entityId === b.entityId &&
+    a.gpx.source === b.gpx.source && a.gpx.object === b.gpx.object &&
+    a.gpx.segment === b.gpx.segment && a.gpx.point + 1n === b.gpx.point &&
+    a.rowIndex < b.rowIndex && a.epochNs < b.epochNs &&
+    a.frameId === b.frameId && a.unitsPos === b.unitsPos);
+}
+
+function repeatedEpochs(rows: readonly EntityRow[]): Set<bigint> {
+  const seen = new Set<bigint>();
+  const repeated = new Set<bigint>();
+  for (const row of rows) {
+    if (seen.has(row.epochNs)) repeated.add(row.epochNs);
+    seen.add(row.epochNs);
+  }
+  return repeated;
+}
+
+/** Split GPX trails at every discontinuity, including both sides of duplicates. */
+export function gpxContinuousRuns(rows: readonly EntityRow[]): EntityRow[][] {
+  const repeated = repeatedEpochs(rows);
+  const runs: EntityRow[][] = [];
+  for (const row of rows) {
+    const run = runs[runs.length - 1];
+    const previous = run?.[run.length - 1];
+    if (previous && gpxRowsConnect(previous, row) &&
+        !repeated.has(previous.epochNs) && !repeated.has(row.epochNs)) run!.push(row);
+    else runs.push([row]);
+  }
+  return runs;
 }
 
 export function buildTimelines(
@@ -92,8 +144,9 @@ export function buildTimelines(
   return m;
 }
 
-function hold(row: EntityRow): PoseState {
+function hold(row: EntityRow, available = true): PoseState {
   return {
+    available,
     frame: row.frameId,
     positionKm: posToKm(row.position, row.unitsPos),
     quaternion: normalize(row.quaternion),

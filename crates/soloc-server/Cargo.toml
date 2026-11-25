@@ -4,9 +4,17 @@ version = "0.1.0"
 edition = "2021"
 license.workspace = true
 
+[features]
+default = []
+gpx = ["spacetimestamp/gpx"]
+
 [[bin]]
 name = "soloc-server"
 path = "src/main.rs"
+
+[[example]]
+name = "import_gpx"
+required-features = ["gpx"]
 
 [dependencies]
 soloc-ledger = { path = "../soloc-ledger" }

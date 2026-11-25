@@ -37,6 +37,11 @@ describe("idToString", () => {
     // Earth is (399, 399): 0x18f big-endian in bytes 0..4 and 9..13.
     expect(idToString(astroBytes(399, 399))).toBe("0000018f-0000-8000-8000-00018f000000");
   });
+
+  it("preserves ITRF93's canonical id independently of Earth / IAU_EARTH", () => {
+    expect(idToString(astroBytes(399, 3000))).toBe("0000018f-0000-8000-8000-000bb8000000");
+    expect(idToString(astroBytes(399, 3000))).not.toBe(idToString(astroBytes(399, 399)));
+  });
 });
 
 describe("kindOfIdString", () => {
@@ -83,6 +88,16 @@ describe("NameBook", () => {
     expect(book.isAstronomical(mars)).toBe(true);
   });
 
+  it("keeps unregistered ITRF93 and Earth names distinct", () => {
+    const empty = NameBook.empty();
+    const itrf93 = "0000018f-0000-8000-8000-000bb8000000";
+    expect(empty.label(itrf93)).toBe("ITRF93");
+    expect(empty.key(itrf93)).toBe("ITRF93");
+    expect(empty.isAstronomical(itrf93)).toBe(true);
+    expect(empty.label(earth)).toBe("Earth");
+    expect(empty.key(earth)).toBe("Earth");
+  });
+
   it("does not guess a name for a non-astronomical unregistered id", () => {
     // `unknown` is kind SOLOC, so the astro-bytes fallback must not apply.
     expect(book.label(unknown)).toBe(unknown);
@@ -99,6 +114,15 @@ describe("astroFrameOf / astroFrameName", () => {
   it("prefers the bare body name over its IAU_ alias (first match, like Rust's frame_name)", () => {
     expect(astroFrameName(10, 10)).toBe("Sun"); // not "IAU_SUN"
     expect(astroFrameName(301, 301)).toBe("Moon"); // not "IAU_MOON"
+  });
+
+  it("decodes ITRF93 as Earth with orientation 3000", () => {
+    expect(astroFrameOf("0000018f-0000-8000-8000-000bb8000000")).toEqual({
+      ephemerisId: 399,
+      orientationId: 3000,
+    });
+    expect(astroFrameName(399, 3000)).toBe("ITRF93");
+    expect(astroFrameName(399, 399)).toBe("Earth");
   });
 
   it("resolves inertial anchors and barycenters too", () => {

@@ -1,4 +1,6 @@
 pub mod ephemeris;
+#[cfg(feature = "gpx")]
+pub mod gpx;
 pub mod ledger;
 
 pub use spacetimestamp;
