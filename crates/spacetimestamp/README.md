@@ -4,7 +4,7 @@
 
 **The core of the [soloc](../../) ecosystem.** This crate defines the Arrow
 `spacetimestamp` schema. One row = one measurement of *where something is, in what frame, at what
-instant*. The core includes the pipeline that validates, relates, reprojects, and filters those rows 
+instant*. The core includes the pipeline that validates, relates, reprojects, and filters those rows
 as follows:
 
 ```text
@@ -84,11 +84,11 @@ names[code]   # index 0 is "-", the reserved slot
 | `estimate_type` | `soloc.estimate_type` | `MEASURED`=1 `ESTIMATED`=2 `SIMULATED`=3 |
 
 Two rules:
-1. **code `0` is reserved and never valid in data** 
-2. **codes are append-only**. 
+1. **code `0` is reserved and never valid in data**
+2. **codes are append-only**.
 
-`units_pos` governs `position`, `position_covariance`, and the position block of `state_covariance`; 
-every other quantity is fixed SI (`velocity` m/s, `acceleration` m/s², `angular_velocity` rad/s, 
+`units_pos` governs `position`, `position_covariance`, and the position block of `state_covariance`;
+every other quantity is fixed SI (`velocity` m/s, `acceleration` m/s², `angular_velocity` rad/s,
 `dimensions` m, `mass_kg` kg).
 
 ## Identity
@@ -121,7 +121,7 @@ There are three **kinds**, encoded in the low nibble of byte 6:
 | **abstract** | `0x2` | used only in 'source_id' field; never valid as a frame or entity |
 
 **Soloc and abstract** ids hash `(kind, authority, common_name)`; **astronomical** ids embed the
-frame pair, which makes them self-describing. They resolve to an anise `Frame` (by extention a NAIF pair 
+frame pair, which makes them self-describing. They resolve to an anise `Frame` (by extention a NAIF pair
 defined reference frame) with no registry, and a client reads `(ephemeris_id, orientation_id)` straight back:
 
 ```text
@@ -141,12 +141,19 @@ Names are **display only**: `NameRegistry` maps an id to `(authority, common_nam
 presentation; identity, topology, and pose resolution never consult it, so a ledger with no
 registry is fully functional.
 
+### ITRF93
+
+`ITRF93` uses frame pair `(399, 3000)`, distinct from `Earth` / `IAU_EARTH` `(399, 399)`.
+Same-frame operations need no kernels. Rotations require an Earth `.bpc` covering
+the observation epoch; conversion to/from `IAU_EARTH` also needs planetary
+constants (`pck11.pca`). Missing coverage returns an error.
+
 ## Topology
 
-Topology can be thought of as a forest of transformation trees, where the root is an astronomical 
-reference frame defined under NAIF/SPICE. Crucially, it is **derived, not declared.** Every 'row' in a 
-RecordBatch already says "entity X is at this pose relative to `frame_id` as of this epoch," so 
-`TransformTree` infers the parent graph from `(id, frame_id, epoch)` triples alone. 
+Topology can be thought of as a forest of transformation trees, where the root is an astronomical
+reference frame defined under NAIF/SPICE. Crucially, it is **derived, not declared.** Every 'row' in a
+RecordBatch already says "entity X is at this pose relative to `frame_id` as of this epoch," so
+`TransformTree` infers the parent graph from `(id, frame_id, epoch)` triples alone.
 It never reads `position`/`quaternion` or any name.
 
 ```mermaid
@@ -165,7 +172,7 @@ and the name registry. Both are **idempotent, all-or-nothing, and replayable**:
 - **Names** — `NameRegistry::to_batch` / `merge_batch` (each row re-verified against the mint, so a
   peer cannot assert a binding an id does not hash to).
 
-The pose *data* itself, `current_state`, spatiotemporal queries, and `entity_id` subsetting, 
+The pose *data* itself, `current_state`, spatiotemporal queries, and `entity_id` subsetting,
 federates one level up in [`soloc-ledger`](../soloc-ledger/). A peer that receives an exported log
 gets **structure only**; poses stay with their owner.
 
