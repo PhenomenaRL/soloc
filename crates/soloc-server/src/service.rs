@@ -20,6 +20,7 @@ use soloc_ledger::ephemeris::{celestial_orbits, celestial_snapshot};
 use spacetimestamp::identity::PrescribedId;
 use spacetimestamp::ipc;
 use spacetimestamp::query::SpatiotemporalFilter;
+use spacetimestamp::transforms::TransformError;
 use spacetimestamp::vocabulary::{LengthUnit, Vocabulary};
 
 use crate::state::{describe, ServerState};
@@ -162,7 +163,7 @@ struct ExchangeDescriptor {
     /// An astronomical frame name, as accepted by [`PrescribedId::astronomical_from_name`].
     #[serde(default)]
     target_frame: Option<String>,
-    /// Any frame in the topology, as a [`WireId`]: an entity the ledger has rows for, or an
+    /// Any frame in the topology, as a [`WireId`]: an entity in the ledger's topology, or an
     /// astronomical frame by its NAIF ids.
     #[serde(default)]
     target: Option<WireId>,
@@ -322,7 +323,19 @@ fn transform_with_ledger_frames(
     let ledger = read(&state.ledger, "ledger")?;
     ledger
         .transform(batch, target.id, target.units, &almanac)
-        .map_err(|e| Status::internal(format!("transform failed: {e}")))
+        .map_err(transform_status)
+}
+
+/// Maps a transform failure to the status that says who can fix it: the request
+/// (`invalid_argument`), the ledger or loaded kernels (`failed_precondition`), or the
+/// server (`internal`).
+fn transform_status(e: TransformError) -> Status {
+    let msg = format!("transform failed: {e}");
+    match e {
+        TransformError::InvalidInput(_) => Status::invalid_argument(msg),
+        TransformError::Unresolved(_) => Status::failed_precondition(msg),
+        TransformError::Internal(_) => Status::internal(msg),
+    }
 }
 
 #[tonic::async_trait]

@@ -26,7 +26,9 @@ use spacetimestamp::ipc;
 use spacetimestamp::query::{SpatiotemporalFilter, apply_boolean_mask, filter_batch};
 use spacetimestamp::schema::StsColumns;
 use spacetimestamp::topology::TransformTree;
-use spacetimestamp::transforms::{ResolvedFrame, normalize_batch_to_tai, transform_batch};
+use spacetimestamp::transforms::{
+    ResolvedFrame, TransformError, normalize_batch_to_tai, transform_batch,
+};
 use spacetimestamp::validation::{validate_spacetimestamp_batch, validate_sts_schema};
 use spacetimestamp::vocabulary::{EstimateType, LengthUnit, TimeScaleCode};
 
@@ -736,7 +738,8 @@ impl Ledger {
     /// Transforms `batch` into `target`, resolving entity frame chains against this ledger's
     /// current contents. Transformed rows are returned, never appended.
     ///
-    /// `target` is an astronomical frame, or any entity this ledger has rows for. The target
+    /// `target` is an astronomical frame, or any entity in this ledger's topology (see
+    /// [`Ledger::contains_entity`]); one with no pose at a row's epoch fails the batch. The target
     /// is not moved in the topology: each row is expressed relative to it, using its pose at
     /// that row's epoch. Every [`KIND_SOLOC`](spacetimestamp::identity::KIND_SOLOC) frame on
     /// the way, on the rows' side and the target's, is placed the same way: its latest pose at
@@ -755,12 +758,12 @@ impl Ledger {
         target: PrescribedId,
         target_units: LengthUnit,
         almanac: &Almanac,
-    ) -> Result<RecordBatch, String> {
+    ) -> Result<RecordBatch, TransformError> {
         if target.is_soloc() && !self.contains_entity(target) {
-            return Err(format!(
+            return Err(TransformError::InvalidInput(format!(
                 "Target entity '{}' is not in this ledger",
                 self.display(target)
-            ));
+            )));
         }
 
         // Only pay for a resolver if something needs placing: an entity target, or a row
@@ -771,21 +774,6 @@ impl Ledger {
 
         let resolver = |frame: PrescribedId, epoch: Epoch| self.resolve_to_root(frame, epoch);
         transform_batch(batch, target, almanac, target_units, Some(&resolver))
-    }
-
-    /// Resolves one entity frame's chain to its astronomical root at `epoch`.
-    ///
-    /// The single-frame form of [`Ledger::build_dynamic_frame_map`], shaped for use as
-    /// [`spacetimestamp::transforms::transform_batch`]'s resolver.
-    ///
-    /// `None` means "not resolved here", which `transform_batch` reads off the id's kind:
-    /// an astronomical frame is a root and resolves from the almanac, while an entity
-    /// frame with no chain is reported as a frame error.
-    pub fn resolve_to_root(&self, frame: PrescribedId, epoch: Epoch) -> Option<ResolvedFrame> {
-        let mut resolved = HashMap::new();
-        self.accumulate_poses_to_root(frame, epoch, &mut resolved)
-            .ok()?;
-        resolved.remove(&frame)
     }
 
     /// Returns the pose of `entity_id` relative to its parent, from its row with the latest
@@ -847,51 +835,31 @@ impl Ledger {
         best.map(|(_, pose)| pose)
     }
 
-    /// Builds a dynamic frame map for use with [`spacetimestamp::transforms::transform_batch`].
+    /// Composes `frame`'s chain into one isometry to its astronomical root at `epoch`, shaped
+    /// for use as [`spacetimestamp::transforms::transform_batch`]'s resolver.
     ///
-    /// Astronomical ids contribute no entry: they are chain roots, so a lookup miss is the
-    /// signal to resolve them from the almanac. An unresolvable entity id is an error.
-    pub fn build_dynamic_frame_map(
-        &self,
-        entity_ids: &[PrescribedId],
-        epoch: Epoch,
-    ) -> Result<HashMap<PrescribedId, ResolvedFrame>, String> {
-        let mut result = HashMap::new();
-        for &id in entity_ids {
-            // Ancestors get memoised by the walk below, so a later id sharing a chain
-            // with an earlier one costs nothing.
-            if !result.contains_key(&id) {
-                self.accumulate_poses_to_root(id, epoch, &mut result)?;
-            }
-        }
-        Ok(result)
-    }
-
-    /// Resolves one entity's chain to its astronomical root, memoising every hop.
+    /// Each hop is the entity's latest pose at or before `epoch`; the estimate type is the
+    /// worst of them. An astronomical `frame` is its own root: the identity, MEASURED.
     ///
-    /// An astronomical `entity_id` has a single-element chain, so it contributes no hops.
-    fn accumulate_poses_to_root(
+    /// Fails if `frame` is not in the topology, or an entity on its chain has no pose at or
+    /// before `epoch`.
+    pub fn resolve_to_root(
         &self,
-        entity_id: PrescribedId,
+        frame: PrescribedId,
         epoch: Epoch,
-        result: &mut HashMap<PrescribedId, ResolvedFrame>,
-    ) -> Result<(), String> {
+    ) -> Result<ResolvedFrame, String> {
         let chain = self
             .transform_tree
-            .ancestry_at(entity_id, epoch - j2000_tai())?;
+            .ancestry_at(frame, epoch - j2000_tai())?;
 
         // `ancestry_at` never returns an empty chain: the last element is the astronomical
         // root, everything before it is an entity needing a pose lookup.
         let Some((root, hops)) = chain.split_last() else {
-            return Err(format!(
-                "Empty frame chain for '{}'",
-                self.display(entity_id)
-            ));
+            return Err(format!("Empty frame chain for '{}'", self.display(frame)));
         };
 
-        // Walk inward from the root so each hop composes onto its parent's accumulated pose,
-        // and each node's estimate type is the worst of every pose between it and the root.
-        let mut acc = Isometry3::identity();
+        // Walk inward from the root so each hop composes onto its parent's accumulated pose.
+        let mut iso_km = Isometry3::identity();
         let mut estimate = EstimateType::MEASURED;
         for &node in hops.iter().rev() {
             let pose = self.resolve_frame_at(node, epoch).ok_or_else(|| {
@@ -900,11 +868,10 @@ impl Ledger {
                     self.display(node)
                 )
             })?;
-            acc *= pose.iso_km;
+            iso_km *= pose.iso_km;
             estimate = estimate.worst(pose.estimate);
-            result.insert(node, ResolvedFrame::new(*root, acc, estimate));
         }
-        Ok(())
+        Ok(ResolvedFrame::new(*root, iso_km, estimate))
     }
 
     /// Exports this ledger's full topology history as a [`RecordBatch`] for federation.
@@ -1715,7 +1682,7 @@ mod tests {
         assert_eq!(sorted(&loaded), sorted(&ledger));
 
         // ns 0 predates the rover's first row, so both must agree it does not resolve.
-        assert!(ledger.resolve_to_root(rover, j2000()).is_none());
+        assert!(ledger.resolve_to_root(rover, j2000()).is_err());
         for ns in [0, 1, 30, SEGMENT_THRESHOLD as u64 + 5] {
             let at = j2000() + Duration::from_parts(0, ns);
             let before = ledger.resolve_to_root(rover, at);
@@ -2358,7 +2325,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_dynamic_frame_map_single_hop() {
+    fn test_resolve_to_root_single_hop() {
         let mut ledger = make_entity_ledger();
         ledger
             .append(make_entity_batch(
@@ -2379,16 +2346,13 @@ mod tests {
             ))
             .unwrap();
 
-        let epoch = j2000();
-        let map = ledger
-            .build_dynamic_frame_map(&[demo("robot_truck")], epoch)
-            .unwrap();
-
         let ResolvedFrame {
             root, iso_km: iso, ..
-        } = map.get(&demo("robot_truck")).unwrap();
+        } = ledger
+            .resolve_to_root(demo("robot_truck"), j2000())
+            .unwrap();
         assert_eq!(
-            *root,
+            root,
             PrescribedId::astronomical_from_name("IAU_EARTH").unwrap()
         );
 
@@ -2404,7 +2368,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_dynamic_frame_map_two_hop() {
+    fn test_resolve_to_root_two_hop() {
         let mut ledger = make_entity_ledger();
         ledger
             .append(make_entity_batch(
@@ -2425,16 +2389,11 @@ mod tests {
             ))
             .unwrap();
 
-        let epoch = j2000();
-        let map = ledger
-            .build_dynamic_frame_map(&[demo("robot")], epoch)
-            .unwrap();
-
         let ResolvedFrame {
             root, iso_km: iso, ..
-        } = map.get(&demo("robot")).unwrap();
+        } = ledger.resolve_to_root(demo("robot"), j2000()).unwrap();
         assert_eq!(
-            *root,
+            root,
             PrescribedId::astronomical_from_name("IAU_EARTH").unwrap()
         );
 
@@ -2448,12 +2407,10 @@ mod tests {
     }
 
     #[test]
-    fn test_build_dynamic_frame_map_entity_not_found() {
+    fn test_resolve_to_root_unknown_entity_errors() {
         let ledger = make_entity_ledger();
         let epoch = j2000();
-        let err = ledger
-            .build_dynamic_frame_map(&[demo("ghost")], epoch)
-            .unwrap_err();
+        let err = ledger.resolve_to_root(demo("ghost"), epoch).unwrap_err();
         assert!(
             err.contains(&demo("ghost").to_hyphenated()),
             "error should name the missing entity: {err}"
@@ -2606,14 +2563,11 @@ mod tests {
         let bytes = ledger.save_ipc_to_bytes().unwrap();
         let reloaded = Ledger::load_ipc_from_bytes(&bytes, "entity_id").unwrap();
 
-        let map = reloaded
-            .build_dynamic_frame_map(&[demo("robot")], j2000())
-            .unwrap();
         let ResolvedFrame {
             root, iso_km: iso, ..
-        } = map.get(&demo("robot")).unwrap();
+        } = reloaded.resolve_to_root(demo("robot"), j2000()).unwrap();
         assert_eq!(
-            *root,
+            root,
             PrescribedId::astronomical_from_name("IAU_EARTH").unwrap()
         );
         assert!((iso.translation.vector.x - 55.0).abs() < 1e-9);
@@ -2753,9 +2707,7 @@ mod tests {
         let mut peer = make_entity_ledger();
         assert_eq!(peer.merge_topology(&exported).unwrap(), 2);
 
-        let err = peer
-            .build_dynamic_frame_map(&[demo("robot")], j2000())
-            .unwrap_err();
+        let err = peer.resolve_to_root(demo("robot"), j2000()).unwrap_err();
         assert!(
             err.contains("not found in ledger"),
             "expected a missing-pose error, got: {err}"
@@ -2954,7 +2906,7 @@ mod tests {
 
         // Alpha's robot is structurally known to beta now, but beta holds no pose for it.
         let err = beta
-            .build_dynamic_frame_map(&[under("alpha", "robot")], j2000())
+            .resolve_to_root(under("alpha", "robot"), j2000())
             .unwrap_err();
         assert!(
             err.contains("not found in ledger"),
@@ -3204,12 +3156,6 @@ mod tests {
             PrescribedId::astronomical_from_name("IAU_EARTH").unwrap()
         );
         assert!((iso.translation.vector.x - 500.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_resolve_to_root_unknown_entity_returns_none() {
-        let ledger = make_two_hop_ledger();
-        assert!(ledger.resolve_to_root(demo("ghost"), j2000()).is_none());
     }
 
     // -----------------------------------------------------------------------

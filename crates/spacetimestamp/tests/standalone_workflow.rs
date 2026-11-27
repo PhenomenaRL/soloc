@@ -147,15 +147,17 @@ fn build_validate_derive_topology_and_transform_without_a_ledger() {
 
     // 4. Compose per-hop poses into an isometry for each entity frame. This is the caller's
     //    job. The tree supplies structure only, never a pose value.
-    let resolve = |frame: PrescribedId, at: Epoch| -> Option<ResolvedFrame> {
-        let chain = tree.ancestry_at(frame, at - j2000_tai()).ok()?;
-        let (root, hops) = chain.split_last()?;
+    let resolve = |frame: PrescribedId, at: Epoch| -> Result<ResolvedFrame, String> {
+        let chain = tree.ancestry_at(frame, at - j2000_tai())?;
+        let (root, hops) = chain.split_last().ok_or("empty chain")?;
         // Walk inward from the root so each hop composes onto its parent's accumulated pose.
         let mut acc = Isometry3::identity();
         for node in hops.iter().rev() {
-            acc *= poses.get(node)?;
+            acc *= poses
+                .get(node)
+                .ok_or_else(|| format!("no pose for {node}"))?;
         }
-        Some(ResolvedFrame::new(*root, acc, EstimateType::MEASURED))
+        Ok(ResolvedFrame::new(*root, acc, EstimateType::MEASURED))
     };
 
     // 5. Transform every row into the Earth frame in one pass. An empty almanac suffices

@@ -48,7 +48,7 @@
 //! `almanac.translate(from_frame, to_frame, epoch, ...)` returns a `CartesianState` whose
 //! `radius_km` is the position of the `from_frame` origin relative to the `to_frame` origin,
 //! expressed in **J2000 axes** whatever either frame's orientation: anise does not rotate SPK
-//! data. It must be rotated J2000 → target before it is added, which [`root_to_root`] does.
+//! data. It must be rotated J2000 → target before it is added, which `root_to_root` does.
 //! Skipping that rotation is exact only for a J2000-aligned target (ICRF, GCRF), and is off
 //! by up to the origin distance otherwise. anise's own `Almanac::transform` skips it too;
 //! `transform_to` does not.
@@ -110,9 +110,37 @@ impl ResolvedFrame {
     }
 }
 
-/// Resolves a [`KIND_SOLOC`](crate::identity::KIND_SOLOC) frame id at a given epoch to its
-/// chain root: see [`transform_batch`].
-pub type DynamicFrameResolver<'a> = &'a dyn Fn(PrescribedId, Epoch) -> Option<ResolvedFrame>;
+/// Places a [`KIND_SOLOC`](crate::identity::KIND_SOLOC) frame id at a given epoch, as its
+/// chain to an astronomical root: see [`transform_batch`]. An `Err` says why the frame
+/// cannot be placed, and is reported as [`TransformError::Unresolved`].
+pub type DynamicFrameResolver<'a> =
+    &'a dyn Fn(PrescribedId, Epoch) -> Result<ResolvedFrame, String>;
+
+/// Why [`transform_batch`] failed, split by who can fix it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransformError {
+    /// The request is malformed: an abstract target, an entity frame with no resolver to
+    /// place it, or a batch whose spacetimestamp column cannot be read.
+    InvalidInput(String),
+    /// The request is well formed, but a frame cannot be placed at some row's epoch: the
+    /// resolver has no pose chain for it, or the almanac lacks the ephemeris or orientation
+    /// data to cross between roots.
+    Unresolved(String),
+    /// The output batch could not be assembled.
+    Internal(String),
+}
+
+impl std::fmt::Display for TransformError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInput(msg) | Self::Unresolved(msg) | Self::Internal(msg) => {
+                f.write_str(msg)
+            }
+        }
+    }
+}
+
+impl std::error::Error for TransformError {}
 
 /// An instant as TAI `(centuries, nanoseconds)`, used as a cache key.
 ///
@@ -125,8 +153,8 @@ type EpochKey = (i16, u64);
 // key is a structured epoch, which would go through `IdHasher`'s untuned fallback. Hashing
 // cost is negligible next to the work either cache saves.
 
-/// Resolver answers per `(frame, epoch)`. A miss (`None`) is cached too.
-type ResolverCache = HashMap<(PrescribedId, EpochKey), Option<ResolvedFrame>>;
+/// Resolver answers per `(frame, epoch)`. Only successes are kept: a failure ends the call.
+type ResolverCache = HashMap<(PrescribedId, EpochKey), ResolvedFrame>;
 
 /// Root-to-root isometries per `(from_root, to_root, epoch)`: see [`root_to_root`].
 type AlmanacCache = HashMap<(PrescribedId, PrescribedId, EpochKey), Isometry3<f64>>;
@@ -146,8 +174,7 @@ enum TargetPlacement<'a> {
 fn anise_frame(id: PrescribedId, epoch: Epoch) -> Result<Frame, String> {
     if id.is_soloc() {
         return Err(format!(
-            "Failed resolving frame {id}: it is an entity reference, but no pose for it \
-             could be resolved at {epoch}"
+            "Failed resolving frame {id} at {epoch}: an entity is not an astronomical root"
         ));
     }
     let (ephemeris_id, orientation_id) = id.astro_frame().ok_or_else(|| {
@@ -166,17 +193,26 @@ fn frame_display(id: PrescribedId) -> String {
 }
 
 /// Calls `resolve` for `frame` at `epoch`, memoised so a single-epoch batch costs one call
-/// per frame rather than one per row.
+/// per frame rather than one per row. A failure names the frame and epoch around the
+/// resolver's own reason.
 fn resolve_cached(
     cache: &mut ResolverCache,
     resolve: DynamicFrameResolver<'_>,
     frame: PrescribedId,
     epoch: Epoch,
     epoch_key: EpochKey,
-) -> Option<ResolvedFrame> {
-    *cache
-        .entry((frame, epoch_key))
-        .or_insert_with(|| resolve(frame, epoch))
+) -> Result<ResolvedFrame, TransformError> {
+    if let Some(resolved) = cache.get(&(frame, epoch_key)) {
+        return Ok(*resolved);
+    }
+    let resolved = resolve(frame, epoch).map_err(|e| {
+        TransformError::Unresolved(format!(
+            "Frame {} could not be placed at {epoch}: {e}",
+            frame_display(frame)
+        ))
+    })?;
+    cache.insert((frame, epoch_key), resolved);
+    Ok(resolved)
 }
 
 /// The isometry taking coordinates in root `from` into root `to` at `epoch`, built from the
@@ -246,31 +282,35 @@ fn root_to_root(
 ///   astronomical root. Called for each row's `frame_id` and, for an entity `target`, for the
 ///   target, always at **that row's own epoch**: a batch spanning several timesteps sees the
 ///   poses current at each one, including a moving target's. Answers are memoised per
-///   `(frame, epoch)`. A row frame it does not place is taken to be a root already, which is
-///   the case for every astronomical frame.
+///   `(frame, epoch)`. It is only asked about entity frames; every astronomical frame is a
+///   root already.
 ///
 /// # Errors
-/// The whole batch fails if `target` is an abstract id, if `target` is an entity and either
-/// no resolver is given or it cannot place `target` at some row's epoch, or if any row's
-/// chain cannot be carried to the target's root.
+/// The whole batch fails on the first error, classified by [`TransformError`]:
+/// [`InvalidInput`](TransformError::InvalidInput) for an abstract target or row frame, an
+/// entity frame with no resolver given, or an unreadable spacetimestamp column;
+/// [`Unresolved`](TransformError::Unresolved) when the resolver cannot place a frame at a
+/// row's epoch or the almanac cannot cross between two roots.
 pub fn transform_batch(
     batch: &RecordBatch,
     target: PrescribedId,
     almanac: &Almanac,
     target_unit: LengthUnit,
     resolve_dynamic_frame: Option<DynamicFrameResolver<'_>>,
-) -> Result<RecordBatch, String> {
+) -> Result<RecordBatch, TransformError> {
+    use TransformError::{Internal, InvalidInput, Unresolved};
+
     if target.is_abstract() {
-        return Err(format!(
+        return Err(InvalidInput(format!(
             "Invalid target frame {target}: abstract ids label provenance and are never frames"
-        ));
+        )));
     }
     let placement = if target.is_soloc() {
         let resolve = resolve_dynamic_frame.ok_or_else(|| {
-            format!(
+            InvalidInput(format!(
                 "Target frame {} is an entity, which needs a frame resolver to place it",
                 frame_display(target)
-            )
+            ))
         })?;
         TargetPlacement::PerEpoch(resolve)
     } else {
@@ -280,9 +320,9 @@ pub fn transform_batch(
     let schema = batch.schema();
     let col_idx = schema
         .index_of(STS_COLUMN)
-        .map_err(|_| format!("Column '{}' not found", STS_COLUMN))?;
+        .map_err(|_| InvalidInput(format!("Column '{STS_COLUMN}' not found")))?;
 
-    let cols = StsColumns::try_new(batch)?;
+    let cols = StsColumns::try_new(batch).map_err(InvalidInput)?;
 
     let num_rows = batch.num_rows();
     let mut sts_builder = SpaceTimestampBuilder::new(num_rows);
@@ -292,11 +332,11 @@ pub fn transform_batch(
     let mut almanac_cache: AlmanacCache = HashMap::new();
 
     for i in 0..num_rows {
-        let row_frame = cols.frame_at(i)?;
-        let source_id = cols.source_at(i)?;
-        let row_unit = cols.units_at(i)?;
-        let ts = cols.timescale_at(i)?;
-        let est = cols.estimate_at(i)?;
+        let row_frame = cols.frame_at(i).map_err(InvalidInput)?;
+        let source_id = cols.source_at(i).map_err(InvalidInput)?;
+        let row_unit = cols.units_at(i).map_err(InvalidInput)?;
+        let ts = cols.timescale_at(i).map_err(InvalidInput)?;
+        let est = cols.estimate_at(i).map_err(InvalidInput)?;
         let [px, py, pz] = cols.position_at(i);
         let [qw, qx, qy, qz] = cols.quaternion_at(i);
         let (centuries, ns) = cols.epoch_parts_at(i);
@@ -314,25 +354,30 @@ pub fn transform_batch(
             // the units change below, and the row keeps its estimate type.
             (pos_km, quat, est)
         } else {
-            // Row frame → its root (rootA).
-            let source = resolve_dynamic_frame
-                .and_then(|resolve| {
-                    resolve_cached(&mut resolver_cache, resolve, row_frame, epoch, epoch_key)
-                })
-                .unwrap_or_else(|| ResolvedFrame::identity(row_frame));
+            // Row frame → its root (rootA). Only entity frames go to the resolver: an
+            // astronomical frame is a root already.
+            let source = if row_frame.is_abstract() {
+                return Err(InvalidInput(format!(
+                    "Row {i} has frame {row_frame}: abstract ids label provenance and are \
+                     never frames"
+                )));
+            } else if row_frame.is_soloc() {
+                let resolve = resolve_dynamic_frame.ok_or_else(|| {
+                    InvalidInput(format!(
+                        "Row {i} is in entity frame {row_frame}, which needs a frame \
+                         resolver to place it"
+                    ))
+                })?;
+                resolve_cached(&mut resolver_cache, resolve, row_frame, epoch, epoch_key)?
+            } else {
+                ResolvedFrame::identity(row_frame)
+            };
 
             // Target → its root (rootB).
             let target_chain = match placement {
                 TargetPlacement::Fixed(chain) => chain,
                 TargetPlacement::PerEpoch(resolve) => {
-                    resolve_cached(&mut resolver_cache, resolve, target, epoch, epoch_key)
-                        .ok_or_else(|| {
-                            format!(
-                                "Target frame {} could not be resolved at {epoch}: no pose \
-                                 chain to an astronomical root",
-                                frame_display(target)
-                            )
-                        })?
+                    resolve_cached(&mut resolver_cache, resolve, target, epoch, epoch_key)?
                 }
             };
 
@@ -345,7 +390,8 @@ pub fn transform_batch(
                 match almanac_cache.get(&key) {
                     Some(iso) => *iso,
                     None => {
-                        let iso = root_to_root(almanac, source.root, target_chain.root, epoch)?;
+                        let iso = root_to_root(almanac, source.root, target_chain.root, epoch)
+                            .map_err(Unresolved)?;
                         almanac_cache.insert(key, iso);
                         iso
                     }
@@ -404,7 +450,8 @@ pub fn transform_batch(
     let mut final_columns = batch.columns().to_vec();
     final_columns[col_idx] = Arc::new(sts);
 
-    RecordBatch::try_new(schema, final_columns).map_err(|e| format!("Batch rebuild error: {e}"))
+    RecordBatch::try_new(schema, final_columns)
+        .map_err(|e| Internal(format!("Batch rebuild error: {e}")))
 }
 
 /// Rewrites the time fields in the named spacetimestamp struct column so every row is stored
@@ -524,12 +571,13 @@ mod tests {
     /// are in km, per the resolver contract.
     fn fixed_resolver(
         placements: Vec<(PrescribedId, PrescribedId, Isometry3<f64>)>,
-    ) -> impl Fn(PrescribedId, Epoch) -> Option<ResolvedFrame> {
+    ) -> impl Fn(PrescribedId, Epoch) -> Result<ResolvedFrame, String> {
         move |frame: PrescribedId, _epoch: Epoch| {
             placements
                 .iter()
                 .find(|(id, _, _)| *id == frame)
                 .map(|(_, root, iso)| ResolvedFrame::new(*root, *iso, EstimateType::MEASURED))
+                .ok_or_else(|| format!("no placement for {frame}"))
         }
     }
 
