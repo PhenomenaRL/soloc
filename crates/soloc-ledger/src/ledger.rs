@@ -644,6 +644,12 @@ impl Ledger {
         self.segments.extend(sealed);
     }
 
+    /// Returns `true` if `entity_id` has a place in this ledger's topology, i.e. some
+    /// appended row (or merged topology event) gave it a parent frame.
+    pub fn contains_entity(&self, entity_id: PrescribedId) -> bool {
+        self.transform_tree.current_parent(entity_id).is_some()
+    }
+
     /// Returns the number of batches currently stored.
     pub fn len(&self) -> usize {
         self.all_segments().count()
@@ -750,7 +756,7 @@ impl Ledger {
         target_units: LengthUnit,
         almanac: &Almanac,
     ) -> Result<RecordBatch, String> {
-        if target.is_soloc() && self.transform_tree.current_parent(target).is_none() {
+        if target.is_soloc() && !self.contains_entity(target) {
             return Err(format!(
                 "Target entity '{}' is not in this ledger",
                 self.display(target)

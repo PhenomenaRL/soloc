@@ -107,6 +107,11 @@ writer.done_writing()
 transformed = next(reader).data
 ```
 
+To express the rows relative to an entity instead, pass `target` (any id form the server
+accepts) in place of `target_frame`, e.g. `{"target": {"authority": "acme.com", "name": "truck_A"}}`.
+The entity must already have rows in the ledger. Transformed rows come back `ESTIMATED`
+(`SIMULATED` if any input was), except rows that were already in the target frame.
+
 ## Roadmap
 
 - [x] **Proof-of-concept demo complete** — Flight `do_get` / `do_put` / `do_exchange` plus the

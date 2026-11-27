@@ -149,11 +149,43 @@ fn default_orbit_samples() -> usize {
     361
 }
 
+/// The DoExchange command: where to transform the streamed rows to. Exactly one of
+/// `target_frame` and `target` must be set.
+///
+/// ```jsonc
+/// {"target_frame": "IAU_EARTH"}                                // astronomical, by name
+/// {"target": {"authority": "acme.com", "name": "truck_A"}}     // any entity in the ledger
+/// {"target": {"id": "018f2a...c41d"}, "target_units": 1}       // any WireId form
+/// ```
 #[derive(Deserialize)]
 struct ExchangeDescriptor {
-    target_frame: String,
+    /// An astronomical frame name, as accepted by [`PrescribedId::astronomical_from_name`].
+    #[serde(default)]
+    target_frame: Option<String>,
+    /// Any frame in the topology, as a [`WireId`]: an entity the ledger has rows for, or an
+    /// astronomical frame by its NAIF ids.
+    #[serde(default)]
+    target: Option<WireId>,
     #[serde(default = "default_km")]
     target_units: u8,
+}
+
+impl ExchangeDescriptor {
+    /// Mints the target id. Fails if neither or both target fields are set, or if the one
+    /// given does not name a valid frame.
+    fn target_id(&self) -> Result<PrescribedId, Status> {
+        match (&self.target_frame, &self.target) {
+            (Some(name), None) => PrescribedId::astronomical_from_name(name)
+                .map_err(|e| Status::invalid_argument(format!("target_frame: {e}"))),
+            (None, Some(wire)) => mint_one(wire, "target"),
+            (None, None) => Err(Status::invalid_argument(
+                "descriptor needs one of target_frame or target",
+            )),
+            (Some(_), Some(_)) => Err(Status::invalid_argument(
+                "descriptor takes target_frame or target, not both",
+            )),
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -247,25 +279,49 @@ fn write<'a, T>(lock: &'a RwLock<T>, what: &str) -> Result<RwLockWriteGuard<'a, 
         .map_err(|_| Status::internal(format!("{what} lock poisoned")))
 }
 
-/// Transforms a batch into the descriptor's target frame. Frame IDs that name another entity
-/// are resolved through the ledger's transform tree
+/// The descriptor, validated once before any batch is read.
+struct ExchangeTarget {
+    id: PrescribedId,
+    units: LengthUnit,
+}
+
+/// Validates the descriptor against the current ledger. Everything wrong here is the
+/// client's mistake, so all of it is `invalid_argument`.
+fn exchange_target(
+    state: &ServerState,
+    desc: &ExchangeDescriptor,
+) -> Result<ExchangeTarget, Status> {
+    // An unknown unit is a client error, not a silent km.
+    let units = LengthUnit::from_code(desc.target_units)
+        .map_err(|e| Status::invalid_argument(format!("target_units: {e}")))?;
+    let id = desc.target_id()?;
+
+    if id.is_abstract() {
+        return Err(Status::invalid_argument(format!(
+            "target {} is an abstract id, which names no frame",
+            id.to_hyphenated()
+        )));
+    }
+    if id.is_soloc() && !read(&state.ledger, "ledger")?.contains_entity(id) {
+        return Err(Status::invalid_argument(format!(
+            "target entity {} is not in the ledger",
+            id.to_hyphenated()
+        )));
+    }
+    Ok(ExchangeTarget { id, units })
+}
+
+/// Transforms a batch into the target frame. Entity frames, on the rows' side and the
+/// target's, are placed through the ledger's transform tree.
 fn transform_with_ledger_frames(
     state: &ServerState,
     batch: &RecordBatch,
-    desc: &ExchangeDescriptor,
+    target: &ExchangeTarget,
 ) -> Result<RecordBatch, Status> {
     let almanac = read(&state.almanac, "almanac")?;
     let ledger = read(&state.ledger, "ledger")?;
-
-    // An unknown unit is a client error, not a silent km.
-    let target_units = LengthUnit::from_code(desc.target_units)
-        .map_err(|e| Status::invalid_argument(format!("target_units: {e}")))?;
-
-    let target = PrescribedId::astronomical_from_name(&desc.target_frame)
-        .map_err(|e| Status::invalid_argument(format!("target_frame: {e}")))?;
-
     ledger
-        .transform(batch, target, target_units, &almanac)
+        .transform(batch, target.id, target.units, &almanac)
         .map_err(|e| Status::internal(format!("transform failed: {e}")))
 }
 
@@ -428,6 +484,7 @@ impl FlightService for SolocFlightService {
         })?;
         let desc: ExchangeDescriptor = serde_json::from_slice(&descriptor.cmd)
             .map_err(|e| Status::invalid_argument(format!("invalid descriptor JSON: {e}")))?;
+        let target = exchange_target(&state, &desc)?;
 
         // Prepend the first message back when it also carries the schema; a client may send
         // the descriptor alone (pyarrow does), which the decoder would reject.
@@ -442,7 +499,7 @@ impl FlightService for SolocFlightService {
         let mut transformed: Vec<RecordBatch> = Vec::new();
         while let Some(batch) = batch_stream.next().await {
             let batch = batch.map_err(|e| Status::internal(e.to_string()))?;
-            transformed.push(transform_with_ledger_frames(&state, &batch, &desc)?);
+            transformed.push(transform_with_ledger_frames(&state, &batch, &target)?);
         }
 
         let out_stream = FlightDataEncoderBuilder::new()

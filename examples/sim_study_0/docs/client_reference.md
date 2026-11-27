@@ -117,7 +117,7 @@ Any Arrow Flight client in any language can do the same. The wire contract is:
 | `get_schema` | any descriptor; returns the ledger's schema |
 | `do_put` | batches in that schema |
 | `do_get` | a JSON ticket: `{"query_type": "filter"}` with optional `time_range_tai_s: [start, end]`, or `{"query_type": "current_state"}` with optional `entity_ids` and `not_before_tai_s` |
-| `do_exchange` | a command descriptor `{"target_frame": "GCRF", "target_units": 1}`, then batches; `target_units` is the unit's code |
+| `do_exchange` | a command descriptor `{"target_frame": "GCRF", "target_units": 1}`, then batches; `target_units` is the unit's code. In place of `target_frame`, `target` takes an id (any form below), so rows can be expressed relative to an entity the ledger has rows for |
 | `do_action` | the actions above |
 
 JSON epochs (`epoch_tai_s`, `time_range_tai_s`, `not_before_tai_s`) are TAI seconds since
