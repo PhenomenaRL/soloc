@@ -49,9 +49,9 @@
 //! `radius_km` is the position of the `from_frame` origin relative to the `to_frame` origin,
 //! expressed in **J2000 axes** whatever either frame's orientation: anise does not rotate SPK
 //! data. It must be rotated J2000 → target before it is added, which [`root_to_root`] does.
-//! Skipping that rotation is
-//! exact only for a J2000-aligned target (ICRF, GCRF), and is off by up to the origin
-//! distance otherwise. anise's own `Almanac::transform` skips it too; `transform_to` does not.
+//! Skipping that rotation is exact only for a J2000-aligned target (ICRF, GCRF), and is off
+//! by up to the origin distance otherwise. anise's own `Almanac::transform` skips it too;
+//! `transform_to` does not.
 //!
 //! # Timescale Note
 //!

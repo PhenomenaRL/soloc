@@ -28,7 +28,7 @@ use spacetimestamp::schema::StsColumns;
 use spacetimestamp::topology::TransformTree;
 use spacetimestamp::transforms::{ResolvedFrame, normalize_batch_to_tai, transform_batch};
 use spacetimestamp::validation::{validate_spacetimestamp_batch, validate_sts_schema};
-use spacetimestamp::vocabulary::{LengthUnit, TimeScaleCode};
+use spacetimestamp::vocabulary::{EstimateType, LengthUnit, TimeScaleCode};
 
 use spacetimestamp::schemas::SpaceTimestampSchema;
 
@@ -240,6 +240,20 @@ fn split_oversized(
         .collect()
 }
 
+/// One entity's pose relative to its parent frame, as stored in a single row.
+///
+/// A single hop of a chain, as opposed to a [`ResolvedFrame`], which is a whole chain
+/// composed down to its astronomical root.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParentPose {
+    /// The `frame_id` the pose is expressed in: another entity, or an astronomical frame.
+    pub parent: PrescribedId,
+    /// Takes coordinates in the entity's frame into `parent`'s. Always kilometres.
+    pub iso_km: Isometry3<f64>,
+    /// The row's `estimate_type`.
+    pub estimate: EstimateType,
+}
+
 /// The most recent pose ingested for one entity. This is the pose cache for
 /// [`Ledger::resolve_frame_at`]'s fast path.
 ///
@@ -249,11 +263,8 @@ fn split_oversized(
 /// makes the fast path sound: a query at or after `epoch` cannot have a newer row to find.
 #[derive(Debug, Clone)]
 struct LatestPose {
-    /// The `frame_id` the pose is expressed in: another entity, or an astronomical frame.
-    parent_frame_id: PrescribedId,
     /// The pose itself, normalised to kilometres.
-    /// This currently makes the system very rigid to having latest pose in km only...
-    isometry_km: Isometry3<f64>,
+    pose: ParentPose,
     /// Offset from the J2000 TAI epoch.
     epoch: Duration,
 }
@@ -431,17 +442,10 @@ impl Ledger {
             {
                 continue;
             }
-            let Some((parent_frame_id, isometry_km)) = cols.pose_at(row) else {
+            let Some(pose) = cols.pose_at(row) else {
                 continue;
             };
-            self.latest_pose.insert(
-                id,
-                LatestPose {
-                    parent_frame_id,
-                    isometry_km,
-                    epoch,
-                },
-            );
+            self.latest_pose.insert(id, LatestPose { pose, epoch });
         }
     }
 
@@ -723,39 +727,47 @@ impl Ledger {
         apply_boolean_mask(last, &mask.finish()).ok()
     }
 
-    /// Transforms `batch` into `target_frame`, resolving any entity frame chains against
-    /// this ledger's current contents.
+    /// Transforms `batch` into `target`, resolving entity frame chains against this ledger's
+    /// current contents. Transformed rows are returned, never appended.
     ///
-    /// [`KIND_SOLOC`](spacetimestamp::identity::KIND_SOLOC) `frame_id` values are resolved by
-    /// looking up the parent entity's latest pose in the ledger at each row's epoch and
-    /// composing the isometry chain, following the topology derived from the appended rows.
+    /// `target` is an astronomical frame, or any entity this ledger has rows for. The target
+    /// is not moved in the topology: each row is expressed relative to it, using its pose at
+    /// that row's epoch. Every [`KIND_SOLOC`](spacetimestamp::identity::KIND_SOLOC) frame on
+    /// the way, on the rows' side and the target's, is placed the same way: its latest pose at
+    /// or before the row's epoch, composed along the topology derived from appended rows.
     ///
-    /// Every astronomical frame a chain terminates in resolves directly from its embedded
-    /// `(ephemeris_id, orientation_id)` pair.
+    /// See [`transform_batch`] for the output's frame, units and estimate type.
     ///
     /// Not compiled. This needs a populated `Almanac`, which means a kernel download.
     /// ```rust,ignore
-    /// let result = ledger.transform(&my_batch, "ICRF", LengthUnit::km, &almanac)?;
+    /// let icrf = PrescribedId::astronomical_from_name("ICRF")?;
+    /// let result = ledger.transform(&my_batch, icrf, LengthUnit::km, &almanac)?;
     /// ```
     pub fn transform(
         &self,
         batch: &RecordBatch,
-        target_frame: &str,
+        target: PrescribedId,
         target_units: LengthUnit,
         almanac: &Almanac,
     ) -> Result<RecordBatch, String> {
-        // Only pay for a resolver if the batch actually references entity frames.
-        if !batch_references_entity_frames(batch) {
-            return transform_batch(batch, target_frame, almanac, target_units, None);
+        if target.is_soloc() && self.transform_tree.current_parent(target).is_none() {
+            return Err(format!(
+                "Target entity '{}' is not in this ledger",
+                self.display(target)
+            ));
         }
 
-        // Each row resolves against its own epoch rather than one epoch for the whole
-        // batch, so a batch spanning several timesteps is projected correctly.
+        // Only pay for a resolver if something needs placing: an entity target, or a row
+        // expressed relative to an entity.
+        if !target.is_soloc() && !batch_references_entity_frames(batch) {
+            return transform_batch(batch, target, almanac, target_units, None);
+        }
+
         let resolver = |frame: PrescribedId, epoch: Epoch| self.resolve_to_root(frame, epoch);
-        transform_batch(batch, target_frame, almanac, target_units, Some(&resolver))
+        transform_batch(batch, target, almanac, target_units, Some(&resolver))
     }
 
-    /// Resolves one entity frame to `(astronomical_root, isometry_km)` at `epoch`.
+    /// Resolves one entity frame's chain to its astronomical root at `epoch`.
     ///
     /// The single-frame form of [`Ledger::build_dynamic_frame_map`], shaped for use as
     /// [`spacetimestamp::transforms::transform_batch`]'s resolver.
@@ -770,12 +782,12 @@ impl Ledger {
         resolved.remove(&frame)
     }
 
-    /// Returns the pose of `entity_id` at the latest timestamp ≤ `epoch` as an
-    /// `(parent_frame_id, isometry_km)` pair.
+    /// Returns the pose of `entity_id` relative to its parent, from its row with the latest
+    /// timestamp ≤ `epoch`.
     ///
     /// Returns `None` if this ledger has no `id_column`, or if the entity has no entry
     /// at or before `epoch`.
-    pub fn resolve_frame_at(&self, entity_id: PrescribedId, epoch: Epoch) -> Option<ResolvedFrame> {
+    pub fn resolve_frame_at(&self, entity_id: PrescribedId, epoch: Epoch) -> Option<ParentPose> {
         if self.id_column.is_empty() {
             return None;
         }
@@ -788,14 +800,14 @@ impl Ledger {
         if let Some(cached) = self.latest_pose.get(&entity_id)
             && cached.epoch <= target_dur
         {
-            return Some((cached.parent_frame_id, cached.isometry_km));
+            return Some(cached.pose);
         }
 
         // Slow path: the query predates the entity's latest row. Each segment's index gives
         // the entity's last decodable row at or before the query. Segments go in insertion
         // order and only a strictly later epoch replaces `best`, so an equal-epoch tie keeps
         // the first row stored.
-        let mut best: Option<(Duration, ResolvedFrame)> = None;
+        let mut best: Option<(Duration, ParentPose)> = None;
 
         for segment in self.all_segments() {
             let Some(rows) = segment.index.get(&entity_id) else {
@@ -871,17 +883,20 @@ impl Ledger {
             ));
         };
 
-        // Walk inward from the root so each hop composes onto its parent's accumulated pose.
+        // Walk inward from the root so each hop composes onto its parent's accumulated pose,
+        // and each node's estimate type is the worst of every pose between it and the root.
         let mut acc = Isometry3::identity();
+        let mut estimate = EstimateType::MEASURED;
         for &node in hops.iter().rev() {
-            let (_, iso) = self.resolve_frame_at(node, epoch).ok_or_else(|| {
+            let pose = self.resolve_frame_at(node, epoch).ok_or_else(|| {
                 format!(
                     "Entity '{}' not found in ledger at or before {epoch}",
                     self.display(node)
                 )
             })?;
-            acc *= iso;
-            result.insert(node, (*root, acc));
+            acc *= pose.iso_km;
+            estimate = estimate.worst(pose.estimate);
+            result.insert(node, ResolvedFrame::new(*root, acc, estimate));
         }
         Ok(())
     }
@@ -1303,8 +1318,9 @@ impl<'a> PoseColumns<'a> {
         Duration::from_parts(centuries, nanos)
     }
 
-    /// The `(parent_frame_id, isometry)` at `row`, with the translation converted to km.
-    fn pose_at(&self, row: usize) -> Option<ResolvedFrame> {
+    /// The pose at `row`, with the translation converted to km, or `None` if any of its
+    /// fields fails to decode.
+    fn pose_at(&self, row: usize) -> Option<ParentPose> {
         let unit = self.sts.units_at(row).ok()?;
 
         let [px, py, pz] = self.sts.position_at(row);
@@ -1313,9 +1329,11 @@ impl<'a> PoseColumns<'a> {
         let [qw, qx, qy, qz] = self.sts.quaternion_at(row);
         let rotation = UnitQuaternion::from_quaternion(Quaternion::new(qw, qx, qy, qz));
 
-        let frame_id = self.sts.frame_at(row).ok()?;
-
-        Some((frame_id, Isometry3::from_parts(translation, rotation)))
+        Some(ParentPose {
+            parent: self.sts.frame_at(row).ok()?,
+            iso_km: Isometry3::from_parts(translation, rotation),
+            estimate: self.sts.estimate_at(row).ok()?,
+        })
     }
 }
 
@@ -1342,6 +1360,11 @@ mod tests {
 
     fn j2000() -> Epoch {
         j2000_tai()
+    }
+
+    /// The Earth body-fixed frame, as a transform target.
+    fn earth_frame() -> PrescribedId {
+        PrescribedId::astronomical_from_name("Earth").unwrap()
     }
 
     /// An entity this module owns. `"demo"` is the authority.
@@ -1694,7 +1717,7 @@ mod tests {
             assert_eq!(before, after, "at ns {ns}");
         }
         let latest = j2000() + Duration::from_parts(0, SEGMENT_THRESHOLD as u64 + 5);
-        let (_, iso) = loaded.resolve_to_root(rover, latest).unwrap();
+        let ResolvedFrame { iso_km: iso, .. } = loaded.resolve_to_root(rover, latest).unwrap();
         assert_eq!(iso.translation.x, 10.0 + (SEGMENT_THRESHOLD + 5) as f64);
     }
 
@@ -1910,7 +1933,7 @@ mod tests {
         assert!(ledger.window_start().unwrap() > Duration::from_parts(0, 0));
         let state = ledger.current_state(None, Some(j2000())).unwrap();
         assert_eq!(state.num_rows(), 2);
-        let (_, iso) = ledger.resolve_frame_at(a, at_ns(steps)).unwrap();
+        let ParentPose { iso_km: iso, .. } = ledger.resolve_frame_at(a, at_ns(steps)).unwrap();
         assert_eq!(iso.translation.x, (steps - 1) as f64);
     }
 
@@ -1943,7 +1966,9 @@ mod tests {
 
         let state = ledger.current_state(None, Some(j2000())).unwrap();
         assert_eq!(state.num_rows(), 2, "beacon and rover");
-        let (root, iso) = ledger.resolve_to_root(rover, at_ns(steps)).unwrap();
+        let ResolvedFrame {
+            root, iso_km: iso, ..
+        } = ledger.resolve_to_root(rover, at_ns(steps)).unwrap();
         assert_eq!(root, earth);
         assert_eq!(iso.translation.x, 100.0 + steps as f64);
     }
@@ -2353,7 +2378,9 @@ mod tests {
             .build_dynamic_frame_map(&[demo("robot_truck")], epoch)
             .unwrap();
 
-        let (root, iso) = map.get(&demo("robot_truck")).unwrap();
+        let ResolvedFrame {
+            root, iso_km: iso, ..
+        } = map.get(&demo("robot_truck")).unwrap();
         assert_eq!(
             *root,
             PrescribedId::astronomical_from_name("IAU_EARTH").unwrap()
@@ -2397,7 +2424,9 @@ mod tests {
             .build_dynamic_frame_map(&[demo("robot")], epoch)
             .unwrap();
 
-        let (root, iso) = map.get(&demo("robot")).unwrap();
+        let ResolvedFrame {
+            root, iso_km: iso, ..
+        } = map.get(&demo("robot")).unwrap();
         assert_eq!(
             *root,
             PrescribedId::astronomical_from_name("IAU_EARTH").unwrap()
@@ -2574,7 +2603,9 @@ mod tests {
         let map = reloaded
             .build_dynamic_frame_map(&[demo("robot")], j2000())
             .unwrap();
-        let (root, iso) = map.get(&demo("robot")).unwrap();
+        let ResolvedFrame {
+            root, iso_km: iso, ..
+        } = map.get(&demo("robot")).unwrap();
         assert_eq!(
             *root,
             PrescribedId::astronomical_from_name("IAU_EARTH").unwrap()
@@ -2679,15 +2710,19 @@ mod tests {
         let cached = reloaded
             .resolve_frame_at(demo("robot"), j2000())
             .expect("the reloaded pose cache should answer this");
-        assert_eq!(cached.0, before.0);
-        assert!((cached.1.translation.vector.x - before.1.translation.vector.x).abs() < 1e-9);
+        assert_eq!(cached.parent, before.parent);
+        assert!(
+            (cached.iso_km.translation.vector.x - before.iso_km.translation.vector.x).abs() < 1e-9
+        );
 
         // Drop the cache and make the index answer instead: the fast path and the fallback
         // read the same columns, so they must not be able to disagree.
         reloaded.clear_pose_cache();
         let indexed = reloaded.resolve_frame_at(demo("robot"), j2000()).unwrap();
-        assert_eq!(indexed.0, cached.0);
-        assert!((indexed.1.translation.vector.x - cached.1.translation.vector.x).abs() < 1e-9);
+        assert_eq!(indexed.parent, cached.parent);
+        assert!(
+            (indexed.iso_km.translation.vector.x - cached.iso_km.translation.vector.x).abs() < 1e-9
+        );
     }
 
     #[test]
@@ -2763,7 +2798,9 @@ mod tests {
         assert!(loaded.names().is_empty());
 
         // The chain still resolves to the same root and the same offset.
-        let (root, iso) = loaded.resolve_to_root(demo("robot"), j2000()).unwrap();
+        let ResolvedFrame {
+            root, iso_km: iso, ..
+        } = loaded.resolve_to_root(demo("robot"), j2000()).unwrap();
         assert_eq!(
             root,
             PrescribedId::astronomical_from_name("IAU_EARTH").unwrap()
@@ -2894,7 +2931,9 @@ mod tests {
         assert_eq!(beta.merge_names_from_ipc_bytes(&names).unwrap(), 2);
 
         // Beta's own robot still resolves to beta's own pose, nothing was remapped.
-        let (root, iso) = beta
+        let ResolvedFrame {
+            root, iso_km: iso, ..
+        } = beta
             .resolve_to_root(under("beta", "robot"), j2000())
             .unwrap();
         assert_eq!(
@@ -2975,7 +3014,12 @@ mod tests {
         );
 
         let result = ledger
-            .transform(&observation, "Earth", LengthUnit::km, &Almanac::default())
+            .transform(
+                &observation,
+                earth_frame(),
+                LengthUnit::km,
+                &Almanac::default(),
+            )
             .expect("transform should resolve the full derived chain");
 
         let sts = result
@@ -3044,7 +3088,7 @@ mod tests {
 
         let x_of = |batch: &RecordBatch, row: usize| -> f64 {
             let result = ledger
-                .transform(batch, "Earth", LengthUnit::km, &Almanac::default())
+                .transform(batch, earth_frame(), LengthUnit::km, &Almanac::default())
                 .expect("an astronomical frame needs no kernels to reach itself");
             let sts = result
                 .column_by_name(STS_COLUMN)
@@ -3089,7 +3133,12 @@ mod tests {
         );
 
         let result = ledger
-            .transform(&observation, "Earth", LengthUnit::km, &Almanac::default())
+            .transform(
+                &observation,
+                earth_frame(),
+                LengthUnit::km,
+                &Almanac::default(),
+            )
             .expect("astronomical-only batch needs no ledger topology");
         assert_eq!(result.num_rows(), 1);
     }
@@ -3130,7 +3179,9 @@ mod tests {
             .unwrap();
 
         // Before the re-parenting: through the hangar, so 10 + 1.
-        let (root, iso) = ledger.resolve_to_root(demo("drone"), j2000()).unwrap();
+        let ResolvedFrame {
+            root, iso_km: iso, ..
+        } = ledger.resolve_to_root(demo("drone"), j2000()).unwrap();
         assert_eq!(
             root,
             PrescribedId::astronomical_from_name("IAU_EARTH").unwrap()
@@ -3139,7 +3190,9 @@ mod tests {
 
         // After: direct, so just 500.
         let after = j2000() + Duration::from_parts(0, 1_000);
-        let (root, iso) = ledger.resolve_to_root(demo("drone"), after).unwrap();
+        let ResolvedFrame {
+            root, iso_km: iso, ..
+        } = ledger.resolve_to_root(demo("drone"), after).unwrap();
         assert_eq!(
             root,
             PrescribedId::astronomical_from_name("IAU_EARTH").unwrap()
@@ -3168,8 +3221,12 @@ mod tests {
             let cached = ledger.resolve_frame_at(entity_id, epoch);
             let indexed = indexed.resolve_frame_at(entity_id, epoch);
             assert_eq!(
-                cached.as_ref().map(|(f, i)| (f, i.translation.vector)),
-                indexed.as_ref().map(|(f, i)| (f, i.translation.vector)),
+                cached
+                    .as_ref()
+                    .map(|p| (p.parent, p.iso_km.translation.vector)),
+                indexed
+                    .as_ref()
+                    .map(|p| (p.parent, p.iso_km.translation.vector)),
                 "cache and index disagree for {entity_id} at {epoch}"
             );
         }
@@ -3191,13 +3248,18 @@ mod tests {
         }
 
         let at_latest = j2000() + Duration::from_parts(0, 2_000);
-        let (frame, iso) = ledger.resolve_frame_at(demo("A"), at_latest).unwrap();
+        let ParentPose {
+            parent: frame,
+            iso_km: iso,
+            ..
+        } = ledger.resolve_frame_at(demo("A"), at_latest).unwrap();
         assert_eq!(frame, PrescribedId::astronomical_from_name("ICRF").unwrap());
         assert_eq!(iso.translation.vector.x, 3.0);
 
         // Well past the last row — still the last row, served from the cache.
         let far_future = j2000() + Duration::from_parts(0, 999_999);
-        let (_, iso) = ledger.resolve_frame_at(demo("A"), far_future).unwrap();
+        let ParentPose { iso_km: iso, .. } =
+            ledger.resolve_frame_at(demo("A"), far_future).unwrap();
         assert_eq!(iso.translation.vector.x, 3.0);
 
         assert_cache_agrees_with_index(&ledger, demo("A"), &[at_latest, far_future]);
@@ -3221,7 +3283,7 @@ mod tests {
         // Between rows: the cached epoch (2000) is after the query, so this must fall back
         // to the index and find the row at 1000 rather than returning the cached pose.
         let midpoint = j2000() + Duration::from_parts(0, 1_500);
-        let (_, iso) = ledger.resolve_frame_at(demo("A"), midpoint).unwrap();
+        let ParentPose { iso_km: iso, .. } = ledger.resolve_frame_at(demo("A"), midpoint).unwrap();
         assert_eq!(iso.translation.vector.x, 2.0);
 
         // Before every row: no answer exists.
@@ -3262,14 +3324,14 @@ mod tests {
             .unwrap();
 
         let latest = j2000() + Duration::from_parts(0, 5_000);
-        let (_, iso) = ledger.resolve_frame_at(demo("A"), latest).unwrap();
+        let ParentPose { iso_km: iso, .. } = ledger.resolve_frame_at(demo("A"), latest).unwrap();
         assert_eq!(
             iso.translation.vector.x, 9.0,
             "backfilled older row must not overwrite the cached newer pose"
         );
 
         // The backfilled row is still findable at its own epoch, via the indexed path.
-        let (_, iso) = ledger.resolve_frame_at(demo("A"), j2000()).unwrap();
+        let ParentPose { iso_km: iso, .. } = ledger.resolve_frame_at(demo("A"), j2000()).unwrap();
         assert_eq!(iso.translation.vector.x, 1.0);
 
         assert_cache_agrees_with_index(&ledger, demo("A"), &[j2000(), latest]);
@@ -3291,7 +3353,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (_, iso) = ledger.resolve_frame_at(demo("A"), j2000()).unwrap();
+        let ParentPose { iso_km: iso, .. } = ledger.resolve_frame_at(demo("A"), j2000()).unwrap();
         assert_eq!(iso.translation.vector.x, 1.0);
 
         assert_cache_agrees_with_index(&ledger, demo("A"), &[j2000()]);
@@ -3324,7 +3386,7 @@ mod tests {
         );
         ledger.append(b.flush()).unwrap();
 
-        let (_, iso) = ledger.resolve_frame_at(demo("A"), j2000()).unwrap();
+        let ParentPose { iso_km: iso, .. } = ledger.resolve_frame_at(demo("A"), j2000()).unwrap();
         assert_eq!(iso.translation.vector.x, 2.0);
 
         assert_cache_agrees_with_index(&ledger, demo("A"), &[j2000()]);
@@ -3358,7 +3420,7 @@ mod tests {
             ledger
                 .resolve_frame_at(demo("A"), at_b)
                 .unwrap()
-                .1
+                .iso_km
                 .translation
                 .vector
                 .x,
@@ -3368,7 +3430,7 @@ mod tests {
             ledger
                 .resolve_frame_at(demo("B"), at_b)
                 .unwrap()
-                .1
+                .iso_km
                 .translation
                 .vector
                 .x,
@@ -3388,7 +3450,7 @@ mod tests {
     fn x_at(ledger: &Ledger, entity: PrescribedId, ns: u64) -> Option<f64> {
         ledger
             .resolve_frame_at(entity, at_ns(ns))
-            .map(|(_, iso)| iso.translation.x)
+            .map(|p| p.iso_km.translation.x)
     }
 
     /// Interleaved entities with older batches appended after newer ones.

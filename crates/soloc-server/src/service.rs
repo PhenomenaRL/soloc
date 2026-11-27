@@ -261,8 +261,11 @@ fn transform_with_ledger_frames(
     let target_units = LengthUnit::from_code(desc.target_units)
         .map_err(|e| Status::invalid_argument(format!("target_units: {e}")))?;
 
+    let target = PrescribedId::astronomical_from_name(&desc.target_frame)
+        .map_err(|e| Status::invalid_argument(format!("target_frame: {e}")))?;
+
     ledger
-        .transform(batch, &desc.target_frame, target_units, &almanac)
+        .transform(batch, target, target_units, &almanac)
         .map_err(|e| Status::internal(format!("transform failed: {e}")))
 }
 
